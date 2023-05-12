@@ -54,13 +54,12 @@ class Package:
             sha1 = hashlib.sha1(f.read()).hexdigest()
             if sha1 != self.sha1:
                 raise RuntimeError(
-                    "hash mismatch for package " + self.path + ": " +
-                    sha1 + " vs " + self.sha1 + " (known good)"
+                    f"hash mismatch for package {self.path}: {sha1} vs {self.sha1} (known good)"
                 )
         return file
 
     def __repr__(self):
-        return "<Package "+self.path+" at "+self.url+" (sha1="+self.sha1+")"
+        return f"<Package {self.path} at {self.url} (sha1={self.sha1})"
 
 def fetch_url(url):
     page = urllib.request.urlopen(url)
@@ -85,9 +84,7 @@ def fetch_repository(base, repo_url):
             deps = []
             dependencies = package.find("dependencies")
             if dependencies is not None:
-                for dep in dependencies:
-                    deps.append(dep.attrib["path"])
-
+                deps.extend(dep.attrib["path"] for dep in dependencies)
             packages[path] = Package(path, url, sha1, deps)
             break
 
@@ -96,7 +93,7 @@ def fetch_repository(base, repo_url):
 def fetch_repositories():
     packages = {}
     for repo in REPOSITORIES:
-        packages.update(fetch_repository(BASE_REPOSITORY, repo))
+        packages |= fetch_repository(BASE_REPOSITORY, repo)
     return packages
 
 class Lockfile:
@@ -111,7 +108,7 @@ class Lockfile:
 
     def add(self, packages, name, *, update=True):
         if name not in packages:
-            raise NameError("package not found: " + name)
+            raise NameError(f"package not found: {name}")
         if not update and name in self.packages:
             return
         self.packages[name] = packages[name]
@@ -122,7 +119,7 @@ class Lockfile:
         packages = list(sorted(self.packages.values(), key=lambda p: p.path))
         with open(self.path, "w") as f:
             for package in packages:
-                f.write(package.path + " " + package.url + " " + package.sha1 + "\n")
+                f.write(f"{package.path} {package.url} {package.sha1}" + "\n")
 
 def cli_add_to_lockfile(args):
     lockfile = Lockfile(args.lockfile)
@@ -135,18 +132,23 @@ def cli_update_mirror(args):
     lockfile = Lockfile(args.lockfile)
     for package in lockfile.packages.values():
         path = package.download(BASE_REPOSITORY)
-        subprocess.run([
-            "aws", "s3", "mv", path,
-            "s3://" + MIRROR_BUCKET + "/" + MIRROR_BASE_DIR + package.url,
-            "--profile=" + args.awscli_profile,
-        ], check=True)
+        subprocess.run(
+            [
+                "aws",
+                "s3",
+                "mv",
+                path,
+                f"s3://{MIRROR_BUCKET}/{MIRROR_BASE_DIR}{package.url}",
+                f"--profile={args.awscli_profile}",
+            ],
+            check=True,
+        )
 
 def cli_install(args):
     lockfile = Lockfile(args.lockfile)
     for package in lockfile.packages.values():
         # Download the file from the mirror into a temp file
-        url = "https://" + MIRROR_BUCKET + ".s3-" + MIRROR_BUCKET_REGION + \
-              ".amazonaws.com/" + MIRROR_BASE_DIR
+        url = f"https://{MIRROR_BUCKET}.s3-{MIRROR_BUCKET_REGION}.amazonaws.com/{MIRROR_BASE_DIR}"
         downloaded = package.download(url)
         # Extract the file in a temporary directory
         extract_dir = tempfile.mkdtemp()

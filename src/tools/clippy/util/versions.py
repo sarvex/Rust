@@ -17,11 +17,7 @@ def key(v):
 
     v = v.replace('v', '').replace('rust-', '')
 
-    s = 0
-    for i, val in enumerate(v.split('.')[::-1]):
-        s += int(val) * 100**i
-
-    return s
+    return sum(int(val) * 100**i for i, val in enumerate(v.split('.')[::-1]))
 
 
 def main():

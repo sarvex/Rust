@@ -290,14 +290,13 @@ def flatten(node):
 
 
 def make_xml(text):
-    xml = ET.XML('<xml>%s</xml>' % text)
-    return xml
+    return ET.XML(f'<xml>{text}</xml>')
 
 
 def normalize_xpath(path):
     path = path.replace("{{channel}}", channel)
     if path.startswith('//'):
-        return '.' + path  # avoid warnings
+        return f'.{path}'
     elif path.startswith('.//'):
         return path
     else:
@@ -402,7 +401,7 @@ def check_tree_text(tree, path, pat, regexp, stop_at_first):
                     if stop_at_first:
                         break
     except Exception:
-        print('Failed to get path "{}"'.format(path))
+        print(f'Failed to get path "{path}"')
         raise
     return match_count
 
@@ -414,7 +413,7 @@ def get_tree_count(tree, path):
 
 def check_snapshot(snapshot_name, actual_tree, normalize_to_text):
     assert rust_test_path.endswith('.rs')
-    snapshot_path = '{}.{}.{}'.format(rust_test_path[:-3], snapshot_name, 'html')
+    snapshot_path = f'{rust_test_path[:-3]}.{snapshot_name}.html'
     try:
         with open(snapshot_path, 'r') as snapshot_file:
             expected_str = snapshot_file.read().replace("{{channel}}", channel)
@@ -455,7 +454,7 @@ def check_snapshot(snapshot_name, actual_tree, normalize_to_text):
 def compare_tree(x1, x2, reporter=None):
     if x1.tag != x2.tag:
         if reporter:
-            reporter('Tags do not match: %s and %s' % (x1.tag, x2.tag))
+            reporter(f'Tags do not match: {x1.tag} and {x2.tag}')
         return False
     for name, value in x1.attrib.items():
         if x2.attrib.get(name) != value:
@@ -466,8 +465,7 @@ def compare_tree(x1, x2, reporter=None):
     for name in x2.attrib:
         if name not in x1.attrib:
             if reporter:
-                reporter('x2 has an attribute x1 is missing: %s'
-                         % name)
+                reporter(f'x2 has an attribute x1 is missing: {name}')
             return False
     if not text_compare(x1.text, x2.text):
         if reporter:
@@ -484,9 +482,7 @@ def compare_tree(x1, x2, reporter=None):
             reporter('children length differs, %i != %i'
                      % (len(cl1), len(cl2)))
         return False
-    i = 0
-    for c1, c2 in zip(cl1, cl2):
-        i += 1
+    for i, (c1, c2) in enumerate(zip(cl1, cl2), start=1):
         if not compare_tree(c1, c2, reporter=reporter):
             if reporter:
                 reporter('children %i do not match: %s'
@@ -496,11 +492,14 @@ def compare_tree(x1, x2, reporter=None):
 
 
 def text_compare(t1, t2):
-    if not t1 and not t2:
+    if t1 or t2:
+        return (
+            True
+            if t1 == '*' or t2 == '*'
+            else (t1 or '').strip() == (t2 or '').strip()
+        )
+    else:
         return True
-    if t1 == '*' or t2 == '*':
-        return True
-    return (t1 or '').strip() == (t2 or '').strip()
 
 
 def stderr(*args):
@@ -515,12 +514,12 @@ def stderr(*args):
 def print_err(lineno, context, err, message=None):
     global ERR_COUNT
     ERR_COUNT += 1
-    stderr("{}: {}".format(lineno, message or err))
+    stderr(f"{lineno}: {message or err}")
     if message and err:
-        stderr("\t{}".format(err))
+        stderr(f"\t{err}")
 
     if context:
-        stderr("\t{}".format(context))
+        stderr(f"\t{context}")
 
 
 def get_nb_matching_elements(cache, c, regexp, stop_at_first):
@@ -553,68 +552,64 @@ def check_command(c, cache):
                 except FailedCheck as err:
                     cerr = str(err)
                     ret = False
-            # @hasraw/matchesraw <path> <pat> = string test
             elif len(c.args) == 2 and 'raw' in c.cmd:
                 cerr = "`PATTERN` did not match"
                 ret = check_string(cache.get_file(c.args[0]), c.args[1], regexp)
-            # @has/matches <path> <pat> <match> = XML tree test
             elif len(c.args) == 3 and 'raw' not in c.cmd:
                 cerr = "`XPATH PATTERN` did not match"
                 ret = get_nb_matching_elements(cache, c, regexp, True) != 0
             else:
-                raise InvalidCheck('Invalid number of @{} arguments'.format(c.cmd))
+                raise InvalidCheck(f'Invalid number of @{c.cmd} arguments')
 
         elif c.cmd == 'count':  # count test
             if len(c.args) == 3:  # @count <path> <pat> <count> = count test
                 expected = int(c.args[2])
                 found = get_tree_count(cache.get_tree(c.args[0]), c.args[1])
-                cerr = "Expected {} occurrences but found {}".format(expected, found)
+                cerr = f"Expected {expected} occurrences but found {found}"
                 ret = expected == found
             elif len(c.args) == 4:  # @count <path> <pat> <text> <count> = count test
                 expected = int(c.args[3])
                 found = get_nb_matching_elements(cache, c, False, False)
-                cerr = "Expected {} occurrences but found {}".format(expected, found)
+                cerr = f"Expected {expected} occurrences but found {found}"
                 ret = found == expected
             else:
-                raise InvalidCheck('Invalid number of @{} arguments'.format(c.cmd))
+                raise InvalidCheck(f'Invalid number of @{c.cmd} arguments')
 
         elif c.cmd == 'snapshot':  # snapshot test
-            if len(c.args) == 3:  # @snapshot <snapshot-name> <html-path> <xpath>
-                [snapshot_name, html_path, pattern] = c.args
-                tree = cache.get_tree(html_path)
-                xpath = normalize_xpath(pattern)
-                normalize_to_text = False
-                if xpath.endswith('/text()'):
-                    xpath = xpath[:-7]
-                    normalize_to_text = True
+            if len(c.args) != 3:
+                raise InvalidCheck(f'Invalid number of @{c.cmd} arguments')
 
-                subtrees = tree.findall(xpath)
-                if len(subtrees) == 1:
-                    [subtree] = subtrees
-                    try:
-                        check_snapshot(snapshot_name, subtree, normalize_to_text)
-                        ret = True
-                    except FailedCheck as err:
-                        cerr = str(err)
-                        ret = False
-                elif len(subtrees) == 0:
-                    raise FailedCheck('XPATH did not match')
-                else:
-                    raise FailedCheck('Expected 1 match, but found {}'.format(len(subtrees)))
-            else:
-                raise InvalidCheck('Invalid number of @{} arguments'.format(c.cmd))
+            [snapshot_name, html_path, pattern] = c.args
+            tree = cache.get_tree(html_path)
+            xpath = normalize_xpath(pattern)
+            normalize_to_text = False
+            if xpath.endswith('/text()'):
+                xpath = xpath[:-7]
+                normalize_to_text = True
 
-        elif c.cmd == 'has-dir':  # has-dir test
-            if len(c.args) == 1:  # @has-dir <path> = has-dir test
+            subtrees = tree.findall(xpath)
+            if len(subtrees) == 1:
+                [subtree] = subtrees
                 try:
-                    cache.get_dir(c.args[0])
+                    check_snapshot(snapshot_name, subtree, normalize_to_text)
                     ret = True
                 except FailedCheck as err:
                     cerr = str(err)
                     ret = False
+            elif len(subtrees) == 0:
+                raise FailedCheck('XPATH did not match')
             else:
-                raise InvalidCheck('Invalid number of @{} arguments'.format(c.cmd))
+                raise FailedCheck(f'Expected 1 match, but found {len(subtrees)}')
+        elif c.cmd == 'has-dir':  # has-dir test
+            if len(c.args) != 1:
+                raise InvalidCheck(f'Invalid number of @{c.cmd} arguments')
 
+            try:
+                cache.get_dir(c.args[0])
+                ret = True
+            except FailedCheck as err:
+                cerr = str(err)
+                ret = False
         elif c.cmd == 'valid-html':
             raise InvalidCheck('Unimplemented @valid-html')
 
@@ -622,13 +617,13 @@ def check_command(c, cache):
             raise InvalidCheck('Unimplemented @valid-links')
 
         else:
-            raise InvalidCheck('Unrecognized @{}'.format(c.cmd))
+            raise InvalidCheck(f'Unrecognized @{c.cmd}')
 
         if ret == c.negated:
             raise FailedCheck(cerr)
 
     except FailedCheck as err:
-        message = '@{}{} check failed'.format('!' if c.negated else '', c.cmd)
+        message = f"@{'!' if c.negated else ''}{c.cmd} check failed"
         print_err(c.lineno, c.context, str(err), message)
     except InvalidCheck as err:
         print_err(c.lineno, c.context, str(err))
@@ -642,7 +637,7 @@ def check(target, commands):
 
 if __name__ == '__main__':
     if len(sys.argv) not in [3, 4]:
-        stderr('Usage: {} <doc dir> <template> [--bless]'.format(sys.argv[0]))
+        stderr(f'Usage: {sys.argv[0]} <doc dir> <template> [--bless]')
         raise SystemExit(1)
 
     rust_test_path = sys.argv[2]
@@ -655,5 +650,5 @@ if __name__ == '__main__':
         bless = False
     check(sys.argv[1], get_commands(rust_test_path))
     if ERR_COUNT:
-        stderr("\nEncountered {} errors".format(ERR_COUNT))
+        stderr(f"\nEncountered {ERR_COUNT} errors")
         raise SystemExit(1)

@@ -65,7 +65,7 @@ def load_json_from_response(resp):
     if isinstance(content, bytes):
         content_str = content.decode('utf-8')
     else:
-        print("Refusing to decode " + str(type(content)) + " to str")
+        print(f"Refusing to decode {str(type(content))} to str")
     return json.loads(content_str)
 
 
@@ -108,31 +108,42 @@ def issue(
         status_description = 'has failing tests'
     else:
         status_description = 'no longer builds'
-    request = json.dumps({
-        'body': maybe_remove_mention(textwrap.dedent('''\
+    request = json.dumps(
+        {
+            'body': maybe_remove_mention(
+                textwrap.dedent(
+                    '''\
         Hello, this is your friendly neighborhood mergebot.
         After merging PR {}, I observed that the tool {} {}.
         A follow-up PR to the repository {} is needed to fix the fallout.
 
         cc @{}, do you think you would have time to do the follow-up work?
         If so, that would be great!
-        ''').format(
-            relevant_pr_number, tool, status_description,
-            REPOS.get(tool), relevant_pr_user
-        )),
-        'title': '`{}` no longer builds after {}'.format(tool, relevant_pr_number),
-        'assignees': list(assignees),
-        'labels': labels,
-    })
-    print("Creating issue:\n{}".format(request))
-    response = urllib2.urlopen(urllib2.Request(
-        gh_url(),
-        request.encode(),
-        {
-            'Authorization': 'token ' + github_token,
-            'Content-Type': 'application/json',
+        '''
+                ).format(
+                    relevant_pr_number,
+                    tool,
+                    status_description,
+                    REPOS.get(tool),
+                    relevant_pr_user,
+                )
+            ),
+            'title': f'`{tool}` no longer builds after {relevant_pr_number}',
+            'assignees': list(assignees),
+            'labels': labels,
         }
-    ))
+    )
+    print(f"Creating issue:\n{request}")
+    response = urllib2.urlopen(
+        urllib2.Request(
+            gh_url(),
+            request.encode(),
+            {
+                'Authorization': f'token {github_token}',
+                'Content-Type': 'application/json',
+            },
+        )
+    )
     response.read()
 
 
@@ -152,7 +163,7 @@ def update_latest(
         latest = json.load(f, object_pairs_hook=collections.OrderedDict)
 
         current_status = {
-            os: read_current_status(current_commit, 'history/' + os + '.tsv')
+            os: read_current_status(current_commit, f'history/{os}.tsv')
             for os in ['windows', 'linux']
         }
 
@@ -174,21 +185,18 @@ def update_latest(
                 old = status[os]
                 new = s.get(tool, old)
                 status[os] = new
-                maintainers = ' '.join('@'+name for name in MAINTAINERS.get(tool, ()))
+                maintainers = ' '.join(f'@{name}' for name in MAINTAINERS.get(tool, ()))
                 # comparing the strings, but they are ordered appropriately:
                 # "test-pass" > "test-fail" > "build-fail"
                 if new > old:
                     # things got fixed or at least the status quo improved
                     changed = True
-                    message += '🎉 {} on {}: {} → {} (cc {}).\n' \
-                        .format(tool, os, old, new, maintainers)
+                    message += f'🎉 {tool} on {os}: {old} → {new} (cc {maintainers}).\n'
                 elif new < old:
                     # tests or builds are failing and were not failing before
                     changed = True
-                    title = '💔 {} on {}: {} → {}' \
-                        .format(tool, os, old, new)
-                    message += '{} (cc {}).\n' \
-                        .format(title, maintainers)
+                    title = f'💔 {tool} on {os}: {old} → {new}'
+                    message += f'{title} (cc {maintainers}).\n'
                     # See if we need to create an issue.
                     # Create issue if things no longer build.
                     # (No issue for mere test failures to avoid spurious issues.)
@@ -241,17 +249,15 @@ try:
     save_message_to_path = sys.argv[3]
     github_token = sys.argv[4]
 
-    # assume that PR authors are also owners of the repo where the branch lives
-    relevant_pr_match = re.search(
+    if relevant_pr_match := re.search(
         r'Auto merge of #([0-9]+) - ([^:]+):[^,]+, r=(\S+)',
         cur_commit_msg,
-    )
-    if relevant_pr_match:
-        number = relevant_pr_match.group(1)
-        relevant_pr_user = relevant_pr_match.group(2)
-        relevant_pr_number = 'rust-lang/rust#' + number
-        relevant_pr_url = 'https://github.com/rust-lang/rust/pull/' + number
-        pr_reviewer = relevant_pr_match.group(3)
+    ):
+        number = relevant_pr_match[1]
+        relevant_pr_user = relevant_pr_match[2]
+        relevant_pr_number = f'rust-lang/rust#{number}'
+        relevant_pr_url = f'https://github.com/rust-lang/rust/pull/{number}'
+        pr_reviewer = relevant_pr_match[3]
     else:
         number = '-1'
         relevant_pr_user = 'ghost'
@@ -282,15 +288,17 @@ try:
         f.write(message)
 
     # Write the toolstate comment on the PR as well.
-    issue_url = gh_url() + '/{}/comments'.format(number)
-    response = urllib2.urlopen(urllib2.Request(
-        issue_url,
-        json.dumps({'body': maybe_remove_mention(message)}).encode(),
-        {
-            'Authorization': 'token ' + github_token,
-            'Content-Type': 'application/json',
-        }
-    ))
+    issue_url = f'{gh_url()}/{number}/comments'
+    response = urllib2.urlopen(
+        urllib2.Request(
+            issue_url,
+            json.dumps({'body': maybe_remove_mention(message)}).encode(),
+            {
+                'Authorization': f'token {github_token}',
+                'Content-Type': 'application/json',
+            },
+        )
+    )
     response.read()
 except HTTPError as e:
     print("HTTPError: %s\n%r" % (e, e.read()))

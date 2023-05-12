@@ -9,6 +9,7 @@ Test for https://github.com/rust-lang/rust/issues/2275
 sample usage: src/etc/generate-keyword-tests.py as break
 """
 
+
 import sys
 import os
 import stat
@@ -27,7 +28,7 @@ test_dir = os.path.abspath(
 )
 
 for kw in sys.argv[1:]:
-    test_file = os.path.join(test_dir, 'keyword-%s-as-identifier.rs' % kw)
+    test_file = os.path.join(test_dir, f'keyword-{kw}-as-identifier.rs')
 
     # set write permission if file exists, so it can be changed
     if os.path.exists(test_file):

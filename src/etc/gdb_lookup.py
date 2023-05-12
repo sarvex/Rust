@@ -41,11 +41,14 @@ def check_enum_discriminant(valobj):
 def lookup(valobj):
     rust_type = classify_rust_type(valobj.type)
 
-    if rust_type == RustType.ENUM:
-        # use enum provider only for GDB <7.12
-        if gdb_version[0] < 7 or (gdb_version[0] == 7 and gdb_version[1] < 12):
-            if check_enum_discriminant(valobj):
-                return EnumProvider(valobj)
+    if (
+        rust_type == RustType.ENUM
+        and (
+            gdb_version[0] < 7 or (gdb_version[0] == 7 and gdb_version[1] < 12)
+        )
+        and check_enum_discriminant(valobj)
+    ):
+        return EnumProvider(valobj)
 
     if rust_type == RustType.STD_STRING:
         return StdStringProvider(valobj)

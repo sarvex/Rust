@@ -20,10 +20,10 @@ def check_duplicates():
             continue
         intrinsics_map[parts[1]] = parts[3]
 
-    if len(intrinsics_map) == 0:
+    if not intrinsics_map:
         print("No intrinsics found in auto code... Aborting.")
         return 1
-    print("Found {} intrinsics in auto code".format(len(intrinsics_map)))
+    print(f"Found {len(intrinsics_map)} intrinsics in auto code")
     errors = []
     lines = manual_content.splitlines()
     pos = 0
@@ -42,22 +42,23 @@ def check_duplicates():
                             "marker... Aborting...")
                         return 1
                     for error in errors:
-                        print("ERROR => {}".format(error))
-                    return 1 if len(errors) != 0 else 0
+                        print(f"ERROR => {error}")
+                    return 1 if errors else 0
                 parts = line.split('"')
                 if len(parts) != 5:
                     continue
                 found += 1
                 if parts[1] in intrinsics_map:
                     if parts[3] != intrinsics_map[parts[1]]:
-                        print("Same intrinsics (`{}` at line {}) but different GCC "
-                            "translations: `{}` != `{}`".format(
-                                parts[1], pos, intrinsics_map[parts[1]], parts[3]))
+                        print(
+                            f"Same intrinsics (`{parts[1]}` at line {pos}) but different GCC translations: `{intrinsics_map[parts[1]]}` != `{parts[3]}`"
+                        )
                     else:
-                        errors.append("Duplicated intrinsics: `{}` at line {}. Please remove it "
-                            " from manual code".format(parts[1], pos))
+                        errors.append(
+                            f"Duplicated intrinsics: `{parts[1]}` at line {pos}. Please remove it  from manual code"
+                        )
             # Weird but whatever...
-            return 1 if len(errors) != 0 else 0
+            return 1 if errors else 0
         pos += 1
     print("No intrinsics found in manual code... Aborting")
     return 1

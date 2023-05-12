@@ -16,13 +16,13 @@ def find_redirect_map_file(folder, errors):
                 expected = json.load(f)
             for key in expected:
                 if expected[key] != data.get(key):
-                    errors.append("Expected `{}` for key `{}`, found: `{}`".format(
-                        expected[key], key, data.get(key)))
+                    errors.append(
+                        f"Expected `{expected[key]}` for key `{key}`, found: `{data.get(key)}`"
+                    )
                 else:
                     del data[key]
             for key in data:
-                errors.append("Extra data not expected: key: `{}`, data: `{}`".format(
-                    key, data[key]))
+                errors.append(f"Extra data not expected: key: `{key}`, data: `{data[key]}`")
             return True
     return False
 
@@ -33,9 +33,9 @@ if len(sys.argv) != 2:
 
 errors = []
 if not find_redirect_map_file(sys.argv[1], errors):
-    print("Didn't find the map file in `{}`...".format(sys.argv[1]))
+    print(f"Didn't find the map file in `{sys.argv[1]}`...")
     sys.exit(1)
 for err in errors:
-    print("=> {}".format(err))
-if len(errors) != 0:
+    print(f"=> {err}")
+if errors:
     sys.exit(1)

@@ -35,7 +35,7 @@ def print_debug(s):
     """Print something if DEBUG_OUTPUT is True"""
     global DEBUG_OUTPUT
     if DEBUG_OUTPUT:
-        print("DEBUG: " + str(s))
+        print(f"DEBUG: {str(s)}")
 
 
 def normalize_whitespace(s):
@@ -49,7 +49,7 @@ def breakpoint_callback(frame, bp_loc, dict):
 
     # HACK(eddyb) print a newline to avoid continuing an unfinished line.
     print("")
-    print("Hit breakpoint " + str(bp_loc))
+    print(f"Hit breakpoint {str(bp_loc)}")
 
     # Select the frame and the thread containing it
     frame.thread.process.SetSelectedThread(frame.thread)
@@ -89,10 +89,11 @@ def execute_command(command_interpreter, command):
             breakpoint_id = new_breakpoints.pop()
 
             if breakpoint_id in registered_breakpoints:
-                print_debug("breakpoint with id %s is already registered. Ignoring." %
-                            str(breakpoint_id))
+                print_debug(
+                    f"breakpoint with id {str(breakpoint_id)} is already registered. Ignoring."
+                )
             else:
-                print_debug("registering breakpoint callback, id = " + str(breakpoint_id))
+                print_debug(f"registering breakpoint callback, id = {str(breakpoint_id)}")
                 callback_command = ("breakpoint command add -F breakpoint_callback " +
                                     str(breakpoint_id))
                 command_interpreter.HandleCommand(callback_command, res)
@@ -116,14 +117,18 @@ def start_breakpoint_listener(target):
         event = lldb.SBEvent()
         try:
             while True:
-                if listener.WaitForEvent(120, event):
-                    if lldb.SBBreakpoint.EventIsBreakpointEvent(event) and \
-                            lldb.SBBreakpoint.GetBreakpointEventTypeFromEvent(event) == \
-                            lldb.eBreakpointEventTypeAdded:
-                        global new_breakpoints
-                        breakpoint = lldb.SBBreakpoint.GetBreakpointFromEvent(event)
-                        print_debug("breakpoint added, id = " + str(breakpoint.id))
-                        new_breakpoints.append(breakpoint.id)
+                if (
+                    listener.WaitForEvent(120, event)
+                    and lldb.SBBreakpoint.EventIsBreakpointEvent(event)
+                    and lldb.SBBreakpoint.GetBreakpointEventTypeFromEvent(
+                        event
+                    )
+                    == lldb.eBreakpointEventTypeAdded
+                ):
+                    global new_breakpoints
+                    breakpoint = lldb.SBBreakpoint.GetBreakpointFromEvent(event)
+                    print_debug(f"breakpoint added, id = {str(breakpoint.id)}")
+                    new_breakpoints.append(breakpoint.id)
         except:
             print_debug("breakpoint listener shutting down")
 
@@ -173,9 +178,9 @@ script_path = sys.argv[2]
 
 print("LLDB batch-mode script")
 print("----------------------")
-print("Debugger commands script is '%s'." % script_path)
-print("Target executable is '%s'." % target_path)
-print("Current working directory is '%s'" % os.getcwd())
+print(f"Debugger commands script is '{script_path}'.")
+print(f"Target executable is '{target_path}'.")
+print(f"Current working directory is '{os.getcwd()}'")
 
 # Start the timeout watchdog
 start_watchdog()
@@ -188,13 +193,15 @@ debugger = lldb.SBDebugger.Create()
 debugger.SetAsync(False)
 
 # Create a target from a file and arch
-print("Creating a target for '%s'" % target_path)
+print(f"Creating a target for '{target_path}'")
 target_error = lldb.SBError()
 target = debugger.CreateTarget(target_path, None, None, True, target_error)
 
 if not target:
-    print("Could not create debugging target '" + target_path + "': " +
-          str(target_error) + ". Aborting.", file=sys.stderr)
+    print(
+        f"Could not create debugging target '{target_path}': {str(target_error)}. Aborting.",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 
@@ -216,7 +223,7 @@ try:
             execute_command(command_interpreter, command)
 
 except IOError as e:
-    print("Could not read debugging script '%s'." % script_path, file=sys.stderr)
+    print(f"Could not read debugging script '{script_path}'.", file=sys.stderr)
     print(e, file=sys.stderr)
     print("Aborting.", file=sys.stderr)
     sys.exit(1)

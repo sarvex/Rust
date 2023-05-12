@@ -58,7 +58,7 @@ def build_and_run(tmp_dir, target):
     stage2 = host_artifacts / 'stage2/bin'
 
     env = dict(os.environ)
-    env['PATH'] = '{}:{}:{}'.format(stage2, stage0, env['PATH'])
+    env['PATH'] = f"{stage2}:{stage0}:{env['PATH']}"
 
     # Copy the test create into `tmp_dir`.
     test_crate = Path(tmp_dir) / 'uefi_qemu_test'

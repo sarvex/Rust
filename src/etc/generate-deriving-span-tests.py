@@ -59,15 +59,15 @@ def create_test_case(type, trait, super_traits, error_count):
     string = [ENUM_STRING, ENUM_STRUCT_VARIANT_STRING, STRUCT_STRING, STRUCT_TUPLE_STRING][type]
     all_traits = ','.join([trait] + super_traits)
     super_traits = ','.join(super_traits)
-    error_deriving = '#[derive(%s)]' % super_traits if super_traits else ''
+    error_deriving = f'#[derive({super_traits})]' if super_traits else ''
 
-    errors = '\n'.join('//~%s ERROR' % ('^' * n) for n in range(error_count))
+    errors = '\n'.join(f"//~{'^' * n} ERROR" for n in range(error_count))
     code = string.format(traits=all_traits, errors=errors)
     return TEMPLATE.format(error_deriving=error_deriving, code=code)
 
 
 def write_file(name, string):
-    test_file = os.path.join(TEST_DIR, 'derives-span-%s.rs' % name)
+    test_file = os.path.join(TEST_DIR, f'derives-span-{name}.rs')
 
     # set write permission if file exists, so it can be changed
     if os.path.exists(test_file):
@@ -104,8 +104,8 @@ for (trait, supers, errs) in [('Clone', [], 1),
 for (trait, (types, super_traits, error_count)) in traits.items():
     mk = lambda ty: create_test_case(ty, trait, super_traits, error_count)
     if types & ENUM:
-        write_file(trait + '-enum', mk(ENUM_TUPLE))
-        write_file(trait + '-enum-struct-variant', mk(ENUM_STRUCT))
+        write_file(f'{trait}-enum', mk(ENUM_TUPLE))
+        write_file(f'{trait}-enum-struct-variant', mk(ENUM_STRUCT))
     if types & STRUCT:
-        write_file(trait + '-struct', mk(STRUCT_FIELDS))
-        write_file(trait + '-tuple-struct', mk(STRUCT_TUPLE))
+        write_file(f'{trait}-struct', mk(STRUCT_FIELDS))
+        write_file(f'{trait}-tuple-struct', mk(STRUCT_TUPLE))

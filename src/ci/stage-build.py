@@ -371,10 +371,8 @@ def change_cwd(dir: Path):
 
 def humantime(time_s: float) -> str:
     hours = time_s // 3600
-    time_s = time_s % 3600
-    minutes = time_s // 60
-    seconds = time_s % 60
-
+    time_s %= 3600
+    minutes, seconds = divmod(time_s, 60)
     result = ""
     if hours > 0:
         result += f"{int(hours)}h "
@@ -433,7 +431,7 @@ def cmd(
 
     cmd_str = ""
     if env is not None:
-        environment.update(env)
+        environment |= env
         cmd_str += " ".join(f"{k}={v}" for (k, v) in (env or {}).items())
         cmd_str += " "
     cmd_str += " ".join(args)
@@ -728,11 +726,11 @@ def record_metrics(pipeline: Pipeline, timer: Timer):
     if metrics is None:
         return
     llvm_steps = tuple(metrics.find_all_by_type("bootstrap::llvm::Llvm"))
-    assert len(llvm_steps) > 0
+    assert llvm_steps
     llvm_duration = sum(step.duration for step in llvm_steps)
 
     rustc_steps = tuple(metrics.find_all_by_type("bootstrap::compile::Rustc"))
-    assert len(rustc_steps) > 0
+    assert rustc_steps
     rustc_duration = sum(step.duration for step in rustc_steps)
 
     # The LLVM step is part of the Rustc step

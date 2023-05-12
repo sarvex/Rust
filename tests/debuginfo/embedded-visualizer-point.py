@@ -9,13 +9,13 @@ class PointPrinter:
         self.y = int(val["y"])
 
     def to_string(self):
-        return "({}, {})".format(self.x, self.y)
+        return f"({self.x}, {self.y})"
 
 def lookup(val):
     lookup_tag = val.type.tag
     if lookup_tag is None:
         return None
-    if "embedded_visualizer::point::Point" == lookup_tag:
+    if lookup_tag == "embedded_visualizer::point::Point":
         return PointPrinter(val)
 
     return None

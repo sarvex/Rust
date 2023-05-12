@@ -12,17 +12,14 @@ STABLE_CRATES = ['std', 'alloc', 'core', 'proc_macro',
 
 
 def convert_to_string(s):
-    if s.__class__.__name__ == 'bytes':
-        return s.decode('utf-8')
-    return s
+    return s.decode('utf-8') if s.__class__.__name__ == 'bytes' else s
 
 
 def set_ld_lib_path():
     var = os.environ.get("LD_LIB_PATH_ENVVAR")
     rpath = os.environ.get("HOST_RPATH_DIR")
     if var and rpath:
-        path = os.environ.get(var)
-        if path:
+        if path := os.environ.get(var):
             os.environ[var] = rpath + os.pathsep + path
         else:
             os.environ[var] = rpath
@@ -41,14 +38,23 @@ def exec_command(command, to_input=None):
 def check_lib(lib):
     if lib['name'] in STABLE_CRATES:
         return True
-    print('verifying if {} is an unstable crate'.format(lib['name']))
-    stdout, stderr = exec_command([os.environ['RUSTC'], '-', '--crate-type', 'rlib',
-                                   '--target', os.environ['TARGET'],
-                                   '--extern', '{}={}'.format(lib['name'], lib['path'])],
-                                  to_input=('extern crate {};'.format(lib['name'])).encode('utf-8'))
-    if not 'use of unstable library feature' in '{}{}'.format(stdout, stderr):
-        print('crate {} "{}" is not unstable'.format(lib['name'], lib['path']))
-        print('{}{}'.format(stdout, stderr))
+    print(f"verifying if {lib['name']} is an unstable crate")
+    stdout, stderr = exec_command(
+        [
+            os.environ['RUSTC'],
+            '-',
+            '--crate-type',
+            'rlib',
+            '--target',
+            os.environ['TARGET'],
+            '--extern',
+            f"{lib['name']}={lib['path']}",
+        ],
+        to_input=f"extern crate {lib['name']};".encode('utf-8'),
+    )
+    if 'use of unstable library feature' not in f'{stdout}{stderr}':
+        print(f"""crate {lib['name']} "{lib['path']}" is not unstable""")
+        print(f'{stdout}{stderr}')
         print('')
         return False
     return True
@@ -65,7 +71,7 @@ def get_all_libs(dir_path):
 set_ld_lib_path()
 sysroot = exec_command([os.environ['RUSTC'], '--print', 'sysroot'])[0].replace('\n', '')
 assert sysroot, "Could not read the rustc sysroot!"
-libs = get_all_libs(join(sysroot, 'lib/rustlib/{}/lib'.format(os.environ['TARGET'])))
+libs = get_all_libs(join(sysroot, f"lib/rustlib/{os.environ['TARGET']}/lib"))
 
 ret = 0
 for lib in libs:

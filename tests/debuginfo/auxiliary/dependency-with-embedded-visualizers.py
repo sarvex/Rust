@@ -9,13 +9,13 @@ class PersonPrinter:
         self.age = int(val["age"])
 
     def to_string(self):
-        return "{} is {} years old.".format(self.name, self.age)
+        return f"{self.name} is {self.age} years old."
 
 def lookup(val):
     lookup_tag = val.type.tag
     if lookup_tag is None:
         return None
-    if "dependency_with_embedded_visualizers::Person" == lookup_tag:
+    if lookup_tag == "dependency_with_embedded_visualizers::Person":
         return PersonPrinter(val)
 
     return None

@@ -109,7 +109,7 @@ exit_status = 0
 
 def msg(*args):
     with STDOUT_LOCK:
-        print("[" + test_name + "]", *args)
+        print(f"[{test_name}]", *args)
         sys.stdout.flush()
 
 
@@ -149,9 +149,11 @@ def run(test):
     queue = multiprocessing.Queue(maxsize=5)#(maxsize=1024)
     workers = []
     for n in range(NUM_WORKERS):
-        worker = multiprocessing.Process(name='Worker-' + str(n + 1),
-                                         target=init_worker,
-                                         args=[test, MAILBOX, queue, done])
+        worker = multiprocessing.Process(
+            name=f'Worker-{str(n + 1)}',
+            target=init_worker,
+            args=[test, MAILBOX, queue, done],
+        )
         workers.append(worker)
         child_processes.append(worker)
     for worker in workers:
@@ -174,11 +176,11 @@ def interact(proc, queue):
         line = proc.stdout.readline()
         if not line:
             continue
-        assert line.endswith(b'\n'), "incomplete line: " + repr(line)
+        assert line.endswith(b'\n'), f"incomplete line: {repr(line)}"
         queue.put(line)
         n += 1
         if n % UPDATE_EVERY_N == 0:
-            msg("got", str(n // 1000) + "k", "records")
+            msg("got", f"{str(n // 1000)}k", "records")
     msg("rust is done. exit code:", proc.returncode)
     rest, stderr = proc.communicate()
     if stderr:
@@ -194,8 +196,7 @@ def main():
     files = glob('src/bin/*.rs')
     basenames = [os.path.basename(i) for i in files]
     all_tests = [os.path.splitext(f)[0] for f in basenames if not f.startswith('_')]
-    args = sys.argv[1:]
-    if args:
+    if args := sys.argv[1:]:
         tests = [test for test in all_tests if test in args]
     else:
         tests = all_tests
@@ -274,10 +275,7 @@ def decode_binary64(x):
             return ZERO
     elif exponent == 0x7FF:
         assert low_bits == 0, "NaN"
-        if negative:
-            return NEG_INF
-        else:
-            return INF
+        return NEG_INF if negative else INF
     else:
         mantissa = low_bits | (1 << 52)
     exponent -= 1023 + 52
@@ -306,10 +304,7 @@ def decode_binary32(x):
         if mantissa == 0:
             return ZERO
     elif exponent == 0xFF:
-        if negative:
-            return NEG_INF
-        else:
-            return INF
+        return NEG_INF if negative else INF
     else:
         mantissa = low_bits | (1 << 23)
     exponent -= 127 + 23
@@ -387,7 +382,7 @@ def record_normal_error(text, error, k, kind):
         err_repr = float(relative_error)
     except ValueError:
         err_repr = str(err_repr).replace('/', ' / ')
-    send_error_to_supervisor(err_repr, "ULP error on", text, "(" + kind + ")")
+    send_error_to_supervisor(err_repr, "ULP error on", text, f"({kind})")
 
 
 if __name__ == '__main__':

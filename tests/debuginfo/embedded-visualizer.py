@@ -9,15 +9,12 @@ class LinePrinter:
         self.b = val["b"]
 
     def to_string(self):
-        return "({}, {})".format(self.a, self.b)
+        return f"({self.a}, {self.b})"
 
 def lookup(val):
     lookup_tag = val.type.tag
     if lookup_tag is None:
         return None
-    if "embedded_visualizer::Line" == lookup_tag:
-        return LinePrinter(val)
-
-    return None
+    return LinePrinter(val) if lookup_tag == "embedded_visualizer::Line" else None
 
 gdb.current_objfile().pretty_printers.append(lookup)

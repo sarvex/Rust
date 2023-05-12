@@ -149,7 +149,7 @@ elif sys.platform == 'darwin':
 
 else:
     print('unknown platform', sys.platform)
-    sys.exit(1)
+sys.exit(1)
 
 cur_state = State()
 print("Time,Idle")
@@ -158,6 +158,6 @@ while True:
     next_state = State()
     now = datetime.datetime.utcnow().isoformat()
     idle = next_state.idle_since(cur_state)
-    print("%s,%s" % (now, idle))
+    print(f"{now},{idle}")
     sys.stdout.flush()
     cur_state = next_state

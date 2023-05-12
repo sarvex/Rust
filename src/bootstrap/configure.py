@@ -174,18 +174,18 @@ v("set", None, "set arbitrary key/value pairs in TOML configuration")
 
 
 def p(msg):
-    print("configure: " + msg)
+    print(f"configure: {msg}")
 
 
 def err(msg):
-    print("configure: error: " + msg)
+    print(f"configure: error: {msg}")
     sys.exit(1)
 
 def is_value_list(key):
-    for option in options:
-        if option.name == key and option.desc.startswith('List of'):
-            return True
-    return False
+    return any(
+        option.name == key and option.desc.startswith('List of')
+        for option in options
+    )
 
 if '--help' in sys.argv or '-h' in sys.argv:
     print('Usage: ./configure [options]')
@@ -196,9 +196,9 @@ if '--help' in sys.argv or '-h' in sys.argv:
             # no one needs to know about these obscure options
             continue
         if option.value:
-            print('\t{:30} {}'.format('--{}=VAL'.format(option.name), option.desc))
+            print('\t{:30} {}'.format(f'--{option.name}=VAL', option.desc))
         else:
-            print('\t{:30} {}'.format('--enable-{}'.format(option.name), option.desc))
+            print('\t{:30} {}'.format(f'--enable-{option.name}', option.desc))
     print('')
     print('This configure script is a thin configuration shim over the true')
     print('configuration system, `config.toml`. You can explore the comments')
@@ -243,13 +243,12 @@ def parse_args(args):
                 else:
                     need_value_args.append(arg)
                     continue
+            elif arg[2:] == f'enable-{option.name}':
+                value = True
+            elif arg[2:] == f'disable-{option.name}':
+                value = False
             else:
-                if arg[2:] == 'enable-' + option.name:
-                    value = True
-                elif arg[2:] == 'disable-' + option.name:
-                    value = False
-                else:
-                    continue
+                continue
 
             found = True
             if option.name not in known_args:
@@ -266,9 +265,9 @@ def parse_args(args):
     option_checking = ('option-checking' not in known_args
                     or known_args['option-checking'][-1][1])
     if option_checking:
-        if len(unknown_args) > 0:
-            err("Option '" + unknown_args[0] + "' is not recognized")
-        if len(need_value_args) > 0:
+        if unknown_args:
+            err(f"Option '{unknown_args[0]}' is not recognized")
+        if need_value_args:
             err("Option '{0}' needs a value ({0}=val)".format(need_value_args[0]))
 
     config = {}
@@ -293,7 +292,7 @@ def set(key, value, config):
     if len(s) < 70:
         p(s)
     else:
-        p(s[:70] + " ...")
+        p(f"{s[:70]} ...")
 
     arr = config
     parts = key.split('.')
@@ -326,7 +325,7 @@ def apply_args(known_args, option_checking, config):
         # Ensure each option is only passed once
         arr = known_args[key]
         if option_checking and len(arr) > 1:
-            err("Option '{}' provided more than once".format(key))
+            err(f"Option '{key}' provided more than once")
         option, value = arr[-1]
 
         # If we have a clear avenue to set our value in rustbuild, do so
@@ -342,22 +341,22 @@ def apply_args(known_args, option_checking, config):
             set('llvm.ccache', 'sccache', config)
         elif option.name == 'local-rust':
             for path in os.environ['PATH'].split(os.pathsep):
-                if os.path.exists(path + '/rustc'):
-                    set('build.rustc', path + '/rustc', config)
+                if os.path.exists(f'{path}/rustc'):
+                    set('build.rustc', f'{path}/rustc', config)
                     break
             for path in os.environ['PATH'].split(os.pathsep):
-                if os.path.exists(path + '/cargo'):
-                    set('build.cargo', path + '/cargo', config)
+                if os.path.exists(f'{path}/cargo'):
+                    set('build.cargo', f'{path}/cargo', config)
                     break
         elif option.name == 'local-rust-root':
-            set('build.rustc', value + '/bin/rustc', config)
-            set('build.cargo', value + '/bin/cargo', config)
+            set('build.rustc', f'{value}/bin/rustc', config)
+            set('build.cargo', f'{value}/bin/cargo', config)
         elif option.name == 'llvm-root':
-            set('target.{}.llvm-config'.format(build_triple), value + '/bin/llvm-config', config)
+            set(f'target.{build_triple}.llvm-config', f'{value}/bin/llvm-config', config)
         elif option.name == 'llvm-config':
-            set('target.{}.llvm-config'.format(build_triple), value, config)
+            set(f'target.{build_triple}.llvm-config', value, config)
         elif option.name == 'llvm-filecheck':
-            set('target.{}.llvm-filecheck'.format(build_triple), value, config)
+            set(f'target.{build_triple}.llvm-filecheck', value, config)
         elif option.name == 'tools':
             set('build.tools', value.split(','), config)
         elif option.name == 'codegen-backends':
@@ -377,7 +376,7 @@ def apply_args(known_args, option_checking, config):
         elif option.name == 'dist-compression-formats':
             set('dist.compression-formats', value.split(','), config)
         else:
-            raise RuntimeError("unhandled option {}".format(option.name))
+            raise RuntimeError(f"unhandled option {option.name}")
 
 # "Parse" the `config.example.toml` file into the various sections, and we'll
 # use this as a template of a `config.toml` to write out which preserves
@@ -386,25 +385,23 @@ def apply_args(known_args, option_checking, config):
 # Note that the `target` section is handled separately as we'll duplicate it
 # per configured target, so there's a bit of special handling for that here.
 def parse_example_config(known_args, config):
-    sections = {}
     cur_section = None
-    sections[None] = []
+    sections = {None: []}
     section_order = [None]
     targets = {}
     top_level_keys = []
 
-    for line in open(rust_dir + '/config.example.toml').read().split("\n"):
-        if cur_section == None:
-            if line.count('=') == 1:
-                top_level_key = line.split('=')[0]
-                top_level_key = top_level_key.strip(' #')
-                top_level_keys.append(top_level_key)
+    for line in open(f'{rust_dir}/config.example.toml').read().split("\n"):
+        if cur_section is None and line.count('=') == 1:
+            top_level_key = line.split('=')[0]
+            top_level_key = top_level_key.strip(' #')
+            top_level_keys.append(top_level_key)
         if line.startswith('['):
             cur_section = line[1:-1]
             if cur_section.startswith('target'):
                 cur_section = 'target'
             elif '.' in cur_section:
-                raise RuntimeError("don't know how to deal with section: {}".format(cur_section))
+                raise RuntimeError(f"don't know how to deal with section: {cur_section}")
             sections[cur_section] = [line]
             section_order.append(cur_section)
         else:
@@ -425,7 +422,10 @@ def parse_example_config(known_args, config):
         targets[target] = sections['target'][:]
         # For `.` to be valid TOML, it needs to be quoted. But `bootstrap.py` doesn't use a proper TOML parser and fails to parse the target.
         # Avoid using quotes unless it's necessary.
-        targets[target][0] = targets[target][0].replace("x86_64-unknown-linux-gnu", "'{}'".format(target) if "." in target else target)
+        targets[target][0] = targets[target][0].replace(
+            "x86_64-unknown-linux-gnu",
+            f"'{target}'" if "." in target else target,
+        )
 
     if 'profile' not in config:
         set('profile', 'user', config)
@@ -447,20 +447,23 @@ def is_number(value):
 # we've got configure.
 def to_toml(value):
     if isinstance(value, bool):
-        if value:
-            return "true"
-        else:
-            return "false"
+        return "true" if value else "false"
     elif isinstance(value, list):
         return '[' + ', '.join(map(to_toml, value)) + ']'
     elif isinstance(value, str):
         # Don't put quotes around numeric values
-        if is_number(value):
-            return value
-        else:
-            return "'" + value + "'"
+        return value if is_number(value) else f"'{value}'"
     elif isinstance(value, dict):
-        return "{" + ", ".join(map(lambda a: "{} = {}".format(to_toml(a[0]), to_toml(a[1])), value.items())) + "}"
+        return (
+            "{"
+            + ", ".join(
+                map(
+                    lambda a: f"{to_toml(a[0])} = {to_toml(a[1])}",
+                    value.items(),
+                )
+            )
+            + "}"
+        )
     else:
         raise RuntimeError('no toml')
 
@@ -470,34 +473,36 @@ def configure_section(lines, config):
         value = config[key]
         found = False
         for i, line in enumerate(lines):
-            if not line.startswith('#' + key + ' = '):
+            if not line.startswith(f'#{key} = '):
                 continue
             found = True
-            lines[i] = "{} = {}".format(key, to_toml(value))
+            lines[i] = f"{key} = {to_toml(value)}"
             break
         if not found:
-            # These are used by rpm, but aren't accepted by x.py.
-            # Give a warning that they're ignored, but not a hard error.
             if key in ["infodir", "localstatedir"]:
-                print("warning: {} will be ignored".format(key))
+                print(f"warning: {key} will be ignored")
             else:
-                raise RuntimeError("failed to find config line for {}".format(key))
+                raise RuntimeError(f"failed to find config line for {key}")
 
 
 def configure_top_level_key(lines, top_level_key, value):
     for i, line in enumerate(lines):
-        if line.startswith('#' + top_level_key + ' = ') or line.startswith(top_level_key + ' = '):
-            lines[i] = "{} = {}".format(top_level_key, to_toml(value))
+        if line.startswith(f'#{top_level_key} = ') or line.startswith(
+            f'{top_level_key} = '
+        ):
+            lines[i] = f"{top_level_key} = {to_toml(value)}"
             return
 
-    raise RuntimeError("failed to find config line for {}".format(top_level_key))
+    raise RuntimeError(f"failed to find config line for {top_level_key}")
 
 
 # Modify `sections` to reflect the parsed arguments and example configs.
 def configure_file(sections, top_level_keys, targets, config):
     for section_key, section_config in config.items():
         if section_key not in sections and section_key not in top_level_keys:
-            raise RuntimeError("config key {} not in sections or top_level_keys".format(section_key))
+            raise RuntimeError(
+                f"config key {section_key} not in sections or top_level_keys"
+            )
         if section_key in top_level_keys:
             configure_top_level_key(sections[None], section_key, section_config)
 
@@ -535,7 +540,7 @@ def write_config_toml(writer, section_order, targets, sections):
 
 def quit_if_file_exists(file):
     if os.path.isfile(file):
-        err("Existing '" + file + "' detected.")
+        err(f"Existing '{file}' detected.")
 
 if __name__ == "__main__":
     # If 'config.toml' already exists, exit the script at this point
@@ -557,9 +562,9 @@ if __name__ == "__main__":
     with bootstrap.output('Makefile') as f:
         contents = os.path.join(rust_dir, 'src', 'bootstrap', 'mk', 'Makefile.in')
         contents = open(contents).read()
-        contents = contents.replace("$(CFG_SRC_DIR)", rust_dir + '/')
+        contents = contents.replace("$(CFG_SRC_DIR)", f'{rust_dir}/')
         contents = contents.replace("$(CFG_PYTHON)", sys.executable)
         f.write(contents)
 
     p("")
-    p("run `python {}/x.py --help`".format(rust_dir))
+    p(f"run `python {rust_dir}/x.py --help`")

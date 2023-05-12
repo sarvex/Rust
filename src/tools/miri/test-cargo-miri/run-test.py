@@ -12,7 +12,7 @@ CBOLD   = '\33[1m'
 CEND    = '\33[0m'
 
 def fail(msg):
-    print("\nTEST FAIL: {}".format(msg))
+    print(f"\nTEST FAIL: {msg}")
     sys.exit(1)
 
 def cargo_miri(cmd, quiet = True):
@@ -29,8 +29,11 @@ def normalize_stdout(str):
     return str
 
 def normalize_stderr(str):
-    str = re.sub("Preparing a sysroot for Miri \(target: [a-z0-9_-]+\)\.\.\. done\n", "", str) # remove leading cargo-miri setup output
-    return str
+    return re.sub(
+        "Preparing a sysroot for Miri \(target: [a-z0-9_-]+\)\.\.\. done\n",
+        "",
+        str,
+    )
 
 def check_output(actual, path, name):
     if 'MIRI_BLESS' in os.environ:
@@ -47,10 +50,10 @@ def check_output(actual, path, name):
     return False
 
 def test(name, cmd, stdout_ref, stderr_ref, stdin=b'', env={}):
-    print("Testing {}...".format(name))
+    print(f"Testing {name}...")
     ## Call `cargo miri`, capture all output
     p_env = os.environ.copy()
-    p_env.update(env)
+    p_env |= env
     p = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -64,16 +67,16 @@ def test(name, cmd, stdout_ref, stderr_ref, stdin=b'', env={}):
 
     stdout_matches = check_output(stdout, stdout_ref, "stdout")
     stderr_matches = check_output(stderr, stderr_ref, "stderr")
-    
+
     if p.returncode == 0 and stdout_matches and stderr_matches:
         # All good!
         return
-    fail("exit code was {}".format(p.returncode))
+    fail(f"exit code was {p.returncode}")
 
 def test_no_rebuild(name, cmd, env={}):
-    print("Testing {}...".format(name))
+    print(f"Testing {name}...")
     p_env = os.environ.copy()
-    p_env.update(env)
+    p_env |= env
     p = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -179,8 +182,12 @@ os.environ["CARGO_TARGET_DIR"] = "target" # this affects the location of the tar
 os.environ["RUST_TEST_NOCAPTURE"] = "0" # this affects test output, so make sure it is not set
 os.environ["RUST_TEST_THREADS"] = "1" # avoid non-deterministic output due to concurrent test runs
 
-target_str = " for target {}".format(os.environ['MIRI_TEST_TARGET']) if 'MIRI_TEST_TARGET' in os.environ else ""
-print(CGREEN + CBOLD + "## Running `cargo miri` tests{}".format(target_str) + CEND)
+target_str = (
+    f" for target {os.environ['MIRI_TEST_TARGET']}"
+    if 'MIRI_TEST_TARGET' in os.environ
+    else ""
+)
+print(CGREEN + CBOLD + f"## Running `cargo miri` tests{target_str}" + CEND)
 
 test_cargo_miri_run()
 test_cargo_miri_test()
