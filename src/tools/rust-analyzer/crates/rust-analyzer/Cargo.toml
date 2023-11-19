@@ -41,7 +41,7 @@ tracing-log = "0.2.0"
 tracing-tree.workspace = true
 triomphe.workspace = true
 nohash-hasher.workspace = true
-always-assert = "0.1.2"
+always-assert = "0.1.3"
 
 # These 3 deps are not used by r-a directly, but we list them here to lock in their versions
 # in our transitive deps to prevent them from pulling in windows-sys 0.45.0
