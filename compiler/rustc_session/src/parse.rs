@@ -1,15 +1,17 @@
 //! Contains `ParseSess` which holds state living beyond what one `Parser` might.
 //! It also serves as an input to the parser itself.
 
-use crate::config::CheckCfg;
-use crate::errors::{FeatureDiagnosticForIssue, FeatureDiagnosticHelp, FeatureGateError};
+use crate::config::{Cfg, CheckCfg};
+use crate::errors::{
+    CliFeatureDiagnosticHelp, FeatureDiagnosticForIssue, FeatureDiagnosticHelp, FeatureGateError,
+};
 use crate::lint::{
     builtin::UNSTABLE_SYNTAX_PRE_EXPANSION, BufferedEarlyLint, BuiltinLintDiagnostics, Lint, LintId,
 };
 use rustc_ast::node_id::NodeId;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
-use rustc_data_structures::sync::{AppendOnlyVec, AtomicBool, Lock, Lrc};
-use rustc_errors::{emitter::SilentEmitter, ColorConfig, Handler};
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::sync::{AppendOnlyVec, Lock, Lrc};
+use rustc_errors::{emitter::SilentEmitter, Handler};
 use rustc_errors::{
     fallback_fluent_bundle, Diagnostic, DiagnosticBuilder, DiagnosticId, DiagnosticMessage,
     EmissionGuarantee, ErrorGuaranteed, IntoDiagnostic, MultiSpan, Noted, StashKey,
@@ -23,11 +25,6 @@ use rustc_span::{Span, Symbol};
 use rustc_ast::attr::AttrIdGenerator;
 use std::str;
 
-/// The set of keys (and, optionally, values) that define the compilation
-/// environment of the crate, used to drive conditional compilation.
-pub type CrateConfig = FxIndexSet<(Symbol, Option<Symbol>)>;
-pub type CrateCheckConfig = CheckCfg<Symbol>;
-
 /// Collected spans during parsing for places where a certain feature was
 /// used and should be feature gated accordingly in `check_crate`.
 #[derive(Default)]
@@ -37,7 +34,7 @@ pub struct GatedSpans {
 
 impl GatedSpans {
     /// Feature gate the given `span` under the given `feature`
-    /// which is same `Symbol` used in `active.rs`.
+    /// which is same `Symbol` used in `unstable.rs`.
     pub fn gate(&self, feature: Symbol, span: Span) {
         self.spans.borrow_mut().entry(feature).or_default().push(span);
     }
@@ -49,13 +46,6 @@ impl GatedSpans {
     pub fn ungate_last(&self, feature: Symbol, span: Span) {
         let removed_span = self.spans.borrow_mut().entry(feature).or_default().pop().unwrap();
         debug_assert_eq!(span, removed_span);
-    }
-
-    /// Is the provided `feature` gate ungated currently?
-    ///
-    /// Using this is discouraged unless you have a really good reason to.
-    pub fn is_ungated(&self, feature: Symbol) -> bool {
-        self.spans.borrow().get(&feature).map_or(true, |spans| spans.is_empty())
     }
 
     /// Prepend the given set of `spans` onto the set in `self`.
@@ -83,7 +73,8 @@ impl SymbolGallery {
 }
 
 /// Construct a diagnostic for a language feature error due to the given `span`.
-/// The `feature`'s `Symbol` is the one you used in `active.rs` and `rustc_span::symbols`.
+/// The `feature`'s `Symbol` is the one you used in `unstable.rs` and `rustc_span::symbols`.
+#[track_caller]
 pub fn feature_err(
     sess: &ParseSess,
     feature: Symbol,
@@ -116,14 +107,15 @@ pub fn feature_err_issue(
     }
 
     let mut err = sess.create_err(FeatureGateError { span, explain: explain.into() });
-    add_feature_diagnostics_for_issue(&mut err, sess, feature, issue);
+    add_feature_diagnostics_for_issue(&mut err, sess, feature, issue, false);
     err
 }
 
 /// Construct a future incompatibility diagnostic for a feature gate.
 ///
 /// This diagnostic is only a warning and *does not cause compilation to fail*.
-pub fn feature_warn(sess: &ParseSess, feature: Symbol, span: Span, explain: &str) {
+#[track_caller]
+pub fn feature_warn(sess: &ParseSess, feature: Symbol, span: Span, explain: &'static str) {
     feature_warn_issue(sess, feature, span, GateIssue::Language, explain);
 }
 
@@ -135,15 +127,16 @@ pub fn feature_warn(sess: &ParseSess, feature: Symbol, span: Span, explain: &str
 /// Almost always, you want to use this for a language feature. If so, prefer `feature_warn`.
 #[allow(rustc::diagnostic_outside_of_impl)]
 #[allow(rustc::untranslatable_diagnostic)]
+#[track_caller]
 pub fn feature_warn_issue(
     sess: &ParseSess,
     feature: Symbol,
     span: Span,
     issue: GateIssue,
-    explain: &str,
+    explain: &'static str,
 ) {
     let mut err = sess.span_diagnostic.struct_span_warn(span, explain);
-    add_feature_diagnostics_for_issue(&mut err, sess, feature, issue);
+    add_feature_diagnostics_for_issue(&mut err, sess, feature, issue, false);
 
     // Decorate this as a future-incompatibility lint as in rustc_middle::lint::struct_lint_level
     let lint = UNSTABLE_SYNTAX_PRE_EXPANSION;
@@ -162,7 +155,7 @@ pub fn feature_warn_issue(
 
 /// Adds the diagnostics for a feature to an existing error.
 pub fn add_feature_diagnostics(err: &mut Diagnostic, sess: &ParseSess, feature: Symbol) {
-    add_feature_diagnostics_for_issue(err, sess, feature, GateIssue::Language);
+    add_feature_diagnostics_for_issue(err, sess, feature, GateIssue::Language, false);
 }
 
 /// Adds the diagnostics for a feature to an existing error.
@@ -175,6 +168,7 @@ pub fn add_feature_diagnostics_for_issue(
     sess: &ParseSess,
     feature: Symbol,
     issue: GateIssue,
+    feature_from_cli: bool,
 ) {
     if let Some(n) = find_feature_issue(feature, issue) {
         err.subdiagnostic(FeatureDiagnosticForIssue { n });
@@ -182,7 +176,11 @@ pub fn add_feature_diagnostics_for_issue(
 
     // #23973: do not suggest `#![feature(...)]` if we are in beta/stable
     if sess.unstable_features.is_nightly_build() {
-        err.subdiagnostic(FeatureDiagnosticHelp { feature });
+        if feature_from_cli {
+            err.subdiagnostic(CliFeatureDiagnosticHelp { feature });
+        } else {
+            err.subdiagnostic(FeatureDiagnosticHelp { feature });
+        }
     }
 }
 
@@ -190,8 +188,8 @@ pub fn add_feature_diagnostics_for_issue(
 pub struct ParseSess {
     pub span_diagnostic: Handler,
     pub unstable_features: UnstableFeatures,
-    pub config: CrateConfig,
-    pub check_config: CrateCheckConfig,
+    pub config: Cfg,
+    pub check_config: CheckCfg,
     pub edition: Edition,
     /// Places where raw identifiers were used. This is used to avoid complaining about idents
     /// clashing with keywords in new editions.
@@ -208,8 +206,6 @@ pub struct ParseSess {
     pub ambiguous_block_expr_parse: Lock<FxHashMap<Span, Span>>,
     pub gated_spans: GatedSpans,
     pub symbol_gallery: SymbolGallery,
-    /// The parser has reached `Eof` due to an unclosed brace. Used to silence unnecessary errors.
-    pub reached_eof: AtomicBool,
     /// Environment variables accessed during the build and their values when they exist.
     pub env_depinfo: Lock<FxHashSet<(Symbol, Option<Symbol>)>>,
     /// File paths accessed during the build.
@@ -228,14 +224,7 @@ impl ParseSess {
     pub fn new(locale_resources: Vec<&'static str>, file_path_mapping: FilePathMapping) -> Self {
         let fallback_bundle = fallback_fluent_bundle(locale_resources, false);
         let sm = Lrc::new(SourceMap::new(file_path_mapping));
-        let handler = Handler::with_tty_emitter(
-            ColorConfig::Auto,
-            true,
-            None,
-            Some(sm.clone()),
-            None,
-            fallback_bundle,
-        );
+        let handler = Handler::with_tty_emitter(Some(sm.clone()), fallback_bundle);
         ParseSess::with_span_handler(handler, sm)
     }
 
@@ -243,8 +232,8 @@ impl ParseSess {
         Self {
             span_diagnostic: handler,
             unstable_features: UnstableFeatures::from_environment(None),
-            config: FxIndexSet::default(),
-            check_config: CrateCheckConfig::default(),
+            config: Cfg::default(),
+            check_config: CheckCfg::default(),
             edition: ExpnId::root().expn_data().edition,
             raw_identifier_spans: Default::default(),
             bad_unicode_identifiers: Lock::new(Default::default()),
@@ -253,7 +242,6 @@ impl ParseSess {
             ambiguous_block_expr_parse: Lock::new(FxHashMap::default()),
             gated_spans: GatedSpans::default(),
             symbol_gallery: SymbolGallery::default(),
-            reached_eof: AtomicBool::new(false),
             env_depinfo: Default::default(),
             file_depinfo: Default::default(),
             assume_incomplete_release: false,
@@ -265,13 +253,9 @@ impl ParseSess {
     pub fn with_silent_emitter(fatal_note: Option<String>) -> Self {
         let fallback_bundle = fallback_fluent_bundle(Vec::new(), false);
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
-        let fatal_handler =
-            Handler::with_tty_emitter(ColorConfig::Auto, false, None, None, None, fallback_bundle);
-        let handler = Handler::with_emitter(
-            false,
-            None,
-            Box::new(SilentEmitter { fatal_handler, fatal_note }),
-        );
+        let fatal_handler = Handler::with_tty_emitter(None, fallback_bundle).disable_warnings();
+        let handler = Handler::with_emitter(Box::new(SilentEmitter { fatal_handler, fatal_note }))
+            .disable_warnings();
         ParseSess::with_span_handler(handler, sm)
     }
 
@@ -289,7 +273,7 @@ impl ParseSess {
         lint: &'static Lint,
         span: impl Into<MultiSpan>,
         node_id: NodeId,
-        msg: &str,
+        msg: impl Into<DiagnosticMessage>,
     ) {
         self.buffered_lints.with_lock(|buffered_lints| {
             buffered_lints.push(BufferedEarlyLint {
@@ -307,7 +291,7 @@ impl ParseSess {
         lint: &'static Lint,
         span: impl Into<MultiSpan>,
         node_id: NodeId,
-        msg: &str,
+        msg: impl Into<DiagnosticMessage>,
         diagnostic: BuiltinLintDiagnostics,
     ) {
         self.buffered_lints.with_lock(|buffered_lints| {
@@ -357,6 +341,7 @@ impl ParseSess {
         self.create_warning(warning).emit()
     }
 
+    #[track_caller]
     pub fn create_note<'a>(
         &'a self,
         note: impl IntoDiagnostic<'a, Noted>,
@@ -364,10 +349,12 @@ impl ParseSess {
         note.into_diagnostic(&self.span_diagnostic)
     }
 
+    #[track_caller]
     pub fn emit_note<'a>(&'a self, note: impl IntoDiagnostic<'a, Noted>) -> Noted {
         self.create_note(note).emit()
     }
 
+    #[track_caller]
     pub fn create_fatal<'a>(
         &'a self,
         fatal: impl IntoDiagnostic<'a, !>,
@@ -375,6 +362,7 @@ impl ParseSess {
         fatal.into_diagnostic(&self.span_diagnostic)
     }
 
+    #[track_caller]
     pub fn emit_fatal<'a>(&'a self, fatal: impl IntoDiagnostic<'a, !>) -> ! {
         self.create_fatal(fatal).emit()
     }
@@ -389,16 +377,19 @@ impl ParseSess {
     }
 
     #[rustc_lint_diagnostics]
+    #[track_caller]
     pub fn struct_warn(&self, msg: impl Into<DiagnosticMessage>) -> DiagnosticBuilder<'_, ()> {
         self.span_diagnostic.struct_warn(msg)
     }
 
     #[rustc_lint_diagnostics]
+    #[track_caller]
     pub fn struct_fatal(&self, msg: impl Into<DiagnosticMessage>) -> DiagnosticBuilder<'_, !> {
         self.span_diagnostic.struct_fatal(msg)
     }
 
     #[rustc_lint_diagnostics]
+    #[track_caller]
     pub fn struct_diagnostic<G: EmissionGuarantee>(
         &self,
         msg: impl Into<DiagnosticMessage>,

@@ -274,6 +274,7 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     // These are used by everyone except msvc
     fn cleanup_landing_pad(&mut self, pers_fn: Self::Value) -> (Self::Value, Self::Value);
+    fn filter_landing_pad(&mut self, pers_fn: Self::Value) -> (Self::Value, Self::Value);
     fn resume(&mut self, exn0: Self::Value, exn1: Self::Value);
 
     // These are used only by msvc
@@ -331,5 +332,5 @@ pub trait BuilderMethods<'a, 'tcx>:
     ) -> Self::Value;
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
 
-    fn do_not_inline(&mut self, llret: Self::Value);
+    fn apply_attrs_to_cleanup_callsite(&mut self, llret: Self::Value);
 }

@@ -31,7 +31,24 @@ pub struct InvalidAbi {
     pub abi: Symbol,
     pub command: String,
     #[subdiagnostic]
+    pub explain: Option<InvalidAbiReason>,
+    #[subdiagnostic]
     pub suggestion: Option<InvalidAbiSuggestion>,
+}
+
+pub struct InvalidAbiReason(pub &'static str);
+
+impl rustc_errors::AddToDiagnostic for InvalidAbiReason {
+    fn add_to_diagnostic_with<F>(self, diag: &mut rustc_errors::Diagnostic, _: F)
+    where
+        F: Fn(
+            &mut rustc_errors::Diagnostic,
+            rustc_errors::SubdiagnosticMessage,
+        ) -> rustc_errors::SubdiagnosticMessage,
+    {
+        #[allow(rustc::untranslatable_diagnostic)]
+        diag.note(self.0);
+    }
 }
 
 #[derive(Subdiagnostic)]
@@ -114,8 +131,8 @@ pub struct AwaitOnlyInAsyncFnAndBlocks {
 }
 
 #[derive(Diagnostic, Clone, Copy)]
-#[diag(ast_lowering_generator_too_many_parameters, code = "E0628")]
-pub struct GeneratorTooManyParameters {
+#[diag(ast_lowering_coroutine_too_many_parameters, code = "E0628")]
+pub struct CoroutineTooManyParameters {
     #[primary_span]
     pub fn_decl_span: Span,
 }
@@ -144,8 +161,8 @@ pub struct FunctionalRecordUpdateDestructuringAssignment {
 }
 
 #[derive(Diagnostic, Clone, Copy)]
-#[diag(ast_lowering_async_generators_not_supported, code = "E0727")]
-pub struct AsyncGeneratorsNotSupported {
+#[diag(ast_lowering_async_coroutines_not_supported, code = "E0727")]
+pub struct AsyncCoroutinesNotSupported {
     #[primary_span]
     pub span: Span,
 }
@@ -334,17 +351,6 @@ pub struct ArbitraryExpressionInPattern {
 #[diag(ast_lowering_inclusive_range_with_no_end)]
 pub struct InclusiveRangeWithNoEnd {
     #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic, Clone, Copy)]
-#[diag(ast_lowering_trait_fn_async, code = "E0706")]
-#[note]
-#[note(ast_lowering_note2)]
-pub struct TraitFnAsync {
-    #[primary_span]
-    pub fn_span: Span,
-    #[label]
     pub span: Span,
 }
 

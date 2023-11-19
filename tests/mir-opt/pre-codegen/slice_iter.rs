@@ -1,6 +1,8 @@
+// skip-filecheck
 // compile-flags: -O -C debuginfo=0 -Zmir-opt-level=2
 // only-64bit
-// ignore-debug
+// ignore-debug the standard library debug assertions leak into this test
+// EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 
 #![crate_type = "lib"]
 
@@ -34,5 +36,20 @@ pub fn forward_loop<'a, T>(slice: &'a [T], f: impl Fn(&T)) {
 pub fn reverse_loop<'a, T>(slice: &'a [T], f: impl Fn(&T)) {
     for x in slice.iter().rev() {
         f(x)
+    }
+}
+
+// EMIT_MIR slice_iter.enumerated_loop.PreCodegen.after.mir
+pub fn enumerated_loop<'a, T>(slice: &'a [T], f: impl Fn(usize, &T)) {
+    for (i, x) in slice.iter().enumerate() {
+        f(i, x)
+    }
+}
+
+// EMIT_MIR slice_iter.range_loop.PreCodegen.after.mir
+pub fn range_loop<'a, T>(slice: &'a [T], f: impl Fn(usize, &T)) {
+    for i in 0..slice.len() {
+        let x = &slice[i];
+        f(i, x)
     }
 }

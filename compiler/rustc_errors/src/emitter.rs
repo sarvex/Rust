@@ -7,10 +7,8 @@
 //!
 //! The output types are defined in `rustc_session::config::ErrorOutputType`.
 
-use Destination::*;
-
 use rustc_span::source_map::SourceMap;
-use rustc_span::{FileLines, SourceFile, Span};
+use rustc_span::{FileLines, FileName, SourceFile, Span};
 
 use crate::snippet::{
     Annotation, AnnotationColumn, AnnotationType, Line, MultilineAnnotation, Style, StyledString,
@@ -24,8 +22,9 @@ use crate::{
 };
 use rustc_lint_defs::pluralize;
 
-use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
-use rustc_data_structures::sync::Lrc;
+use derive_setters::Setters;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
+use rustc_data_structures::sync::{DynSend, IntoDynSyncSend, Lrc};
 use rustc_error_messages::{FluentArgs, SpanLabel};
 use rustc_span::hygiene::{ExpnKind, MacroKind};
 use std::borrow::Cow;
@@ -35,8 +34,8 @@ use std::io::prelude::*;
 use std::io::{self, IsTerminal};
 use std::iter;
 use std::path::Path;
-use termcolor::{Ansi, BufferWriter, ColorChoice, ColorSpec, StandardStream};
-use termcolor::{Buffer, Color, WriteColor};
+use termcolor::{Ansi, Buffer, BufferWriter, ColorChoice, ColorSpec, StandardStream};
+use termcolor::{Color, WriteColor};
 
 /// Default column width, used in tests and when terminal dimensions cannot be determined.
 const DEFAULT_COLUMN_WIDTH: usize = 140;
@@ -60,31 +59,15 @@ impl HumanReadableErrorType {
     }
     pub fn new_emitter(
         self,
-        dst: Box<dyn Write + Send>,
-        source_map: Option<Lrc<SourceMap>>,
-        bundle: Option<Lrc<FluentBundle>>,
+        mut dst: Box<dyn WriteColor + Send>,
         fallback_bundle: LazyFallbackBundle,
-        teach: bool,
-        diagnostic_width: Option<usize>,
-        macro_backtrace: bool,
-        track_diagnostics: bool,
-        terminal_url: TerminalUrl,
     ) -> EmitterWriter {
         let (short, color_config) = self.unzip();
         let color = color_config.suggests_using_colors();
-        EmitterWriter::new(
-            dst,
-            source_map,
-            bundle,
-            fallback_bundle,
-            short,
-            teach,
-            color,
-            diagnostic_width,
-            macro_backtrace,
-            track_diagnostics,
-            terminal_url,
-        )
+        if !dst.supports_color() && color {
+            dst = Box::new(Ansi::new(dst));
+        }
+        EmitterWriter::new(dst, fallback_bundle).short_message(short)
     }
 }
 
@@ -205,6 +188,8 @@ impl Margin {
 
 const ANONYMIZED_LINE_NUM: &str = "LL";
 
+pub type DynEmitter = dyn Emitter + DynSend;
+
 /// Emitter trait for emitting errors.
 pub trait Emitter: Translate {
     /// Emit a structured diagnostic.
@@ -279,21 +264,17 @@ pub trait Emitter: Translate {
                 let msg = if substitution.is_empty() || sugg.style.hide_inline() {
                     // This substitution is only removal OR we explicitly don't want to show the
                     // code inline (`hide_inline`). Therefore, we don't show the substitution.
-                    format!("help: {}", &msg)
+                    format!("help: {msg}")
                 } else {
                     // Show the default suggestion text with the substitution
                     format!(
                         "help: {}{}: `{}`",
-                        &msg,
-                        if self
-                            .source_map()
-                            .map(|sm| is_case_difference(
-                                sm,
-                                substitution,
-                                sugg.substitutions[0].parts[0].span,
-                            ))
-                            .unwrap_or(false)
-                        {
+                        msg,
+                        if self.source_map().is_some_and(|sm| is_case_difference(
+                            sm,
+                            substitution,
+                            sugg.substitutions[0].parts[0].span,
+                        )) {
                             " (notice the capitalization)"
                         } else {
                             ""
@@ -336,7 +317,7 @@ pub trait Emitter: Translate {
 
                     // Skip past non-macro entries, just in case there
                     // are some which do actually involve macros.
-                    ExpnKind::Inlined | ExpnKind::Desugaring(..) | ExpnKind::AstPass(..) => None,
+                    ExpnKind::Desugaring(..) | ExpnKind::AstPass(..) => None,
 
                     ExpnKind::Macro(macro_kind, name) => Some((macro_kind, name)),
                 }
@@ -356,9 +337,7 @@ pub trait Emitter: Translate {
                     && last_name != name
                 {
                     let descr = macro_kind.descr();
-                    format!(
-                        " which comes from the expansion of the {descr} `{last_name}`",
-                    )
+                    format!(" which comes from the expansion of the {descr} `{last_name}`",)
                 } else {
                     "".to_string()
                 };
@@ -371,7 +350,7 @@ pub trait Emitter: Translate {
 
                 children.push(SubDiagnostic {
                     level: Level::Note,
-                    message: vec![(DiagnosticMessage::Str(msg), Style::NoStyle)],
+                    message: vec![(DiagnosticMessage::from(msg), Style::NoStyle)],
                     span: MultiSpan::new(),
                     render_span: None,
                 });
@@ -391,7 +370,7 @@ pub trait Emitter: Translate {
     }
 
     fn render_multispan_macro_backtrace(&self, span: &mut MultiSpan, always_backtrace: bool) {
-        let mut new_labels: Vec<(Span, String)> = vec![];
+        let mut new_labels = FxIndexSet::default();
 
         for &sp in span.primary_spans() {
             if sp.is_dummy() {
@@ -407,8 +386,8 @@ pub trait Emitter: Translate {
                     continue;
                 }
 
-                if always_backtrace && !matches!(trace.kind, ExpnKind::Inlined) {
-                    new_labels.push((
+                if always_backtrace {
+                    new_labels.insert((
                         trace.def_site,
                         format!(
                             "in this expansion of `{}`{}",
@@ -446,14 +425,13 @@ pub trait Emitter: Translate {
                             "this derive macro expansion".into()
                         }
                         ExpnKind::Macro(MacroKind::Bang, _) => "this macro invocation".into(),
-                        ExpnKind::Inlined => "this inlined function call".into(),
                         ExpnKind::Root => "the crate root".into(),
                         ExpnKind::AstPass(kind) => kind.descr().into(),
                         ExpnKind::Desugaring(kind) => {
                             format!("this {} desugaring", kind.descr()).into()
                         }
                     };
-                    new_labels.push((
+                    new_labels.insert((
                         trace.call_site,
                         format!(
                             "in {}{}",
@@ -621,7 +599,7 @@ pub enum ColorConfig {
 }
 
 impl ColorConfig {
-    fn to_color_choice(self) -> ColorChoice {
+    pub fn to_color_choice(self) -> ColorChoice {
         match self {
             ColorConfig::Always => {
                 if io::stderr().is_terminal() {
@@ -644,14 +622,18 @@ impl ColorConfig {
 }
 
 /// Handles the writing of `HumanReadableErrorType::Default` and `HumanReadableErrorType::Short`
+#[derive(Setters)]
 pub struct EmitterWriter {
-    dst: Destination,
+    #[setters(skip)]
+    dst: IntoDynSyncSend<Destination>,
     sm: Option<Lrc<SourceMap>>,
     fluent_bundle: Option<Lrc<FluentBundle>>,
+    #[setters(skip)]
     fallback_bundle: LazyFallbackBundle,
     short_message: bool,
     teach: bool,
     ui_testing: bool,
+    ignored_directories_in_source_blocks: Vec<String>,
     diagnostic_width: Option<usize>,
 
     macro_backtrace: bool,
@@ -667,65 +649,33 @@ pub struct FileWithAnnotatedLines {
 }
 
 impl EmitterWriter {
-    pub fn stderr(
-        color_config: ColorConfig,
-        source_map: Option<Lrc<SourceMap>>,
-        fluent_bundle: Option<Lrc<FluentBundle>>,
-        fallback_bundle: LazyFallbackBundle,
-        short_message: bool,
-        teach: bool,
-        diagnostic_width: Option<usize>,
-        macro_backtrace: bool,
-        track_diagnostics: bool,
-        terminal_url: TerminalUrl,
-    ) -> EmitterWriter {
-        let dst = Destination::from_stderr(color_config);
+    pub fn stderr(color_config: ColorConfig, fallback_bundle: LazyFallbackBundle) -> EmitterWriter {
+        let dst = from_stderr(color_config);
+        Self::create(dst, fallback_bundle)
+    }
+
+    fn create(dst: Destination, fallback_bundle: LazyFallbackBundle) -> EmitterWriter {
         EmitterWriter {
-            dst,
-            sm: source_map,
-            fluent_bundle,
+            dst: IntoDynSyncSend(dst),
+            sm: None,
+            fluent_bundle: None,
             fallback_bundle,
-            short_message,
-            teach,
+            short_message: false,
+            teach: false,
             ui_testing: false,
-            diagnostic_width,
-            macro_backtrace,
-            track_diagnostics,
-            terminal_url,
+            ignored_directories_in_source_blocks: Vec::new(),
+            diagnostic_width: None,
+            macro_backtrace: false,
+            track_diagnostics: false,
+            terminal_url: TerminalUrl::No,
         }
     }
 
     pub fn new(
-        dst: Box<dyn Write + Send>,
-        source_map: Option<Lrc<SourceMap>>,
-        fluent_bundle: Option<Lrc<FluentBundle>>,
+        dst: Box<dyn WriteColor + Send>,
         fallback_bundle: LazyFallbackBundle,
-        short_message: bool,
-        teach: bool,
-        colored: bool,
-        diagnostic_width: Option<usize>,
-        macro_backtrace: bool,
-        track_diagnostics: bool,
-        terminal_url: TerminalUrl,
     ) -> EmitterWriter {
-        EmitterWriter {
-            dst: Raw(dst, colored),
-            sm: source_map,
-            fluent_bundle,
-            fallback_bundle,
-            short_message,
-            teach,
-            ui_testing: false,
-            diagnostic_width,
-            macro_backtrace,
-            track_diagnostics,
-            terminal_url,
-        }
-    }
-
-    pub fn ui_testing(mut self, ui_testing: bool) -> Self {
-        self.ui_testing = ui_testing;
-        self
+        Self::create(dst, fallback_bundle)
     }
 
     fn maybe_anonymized(&self, line_num: usize) -> Cow<'static, str> {
@@ -1243,7 +1193,7 @@ impl EmitterWriter {
         let will_be_emitted = |span: Span| {
             !span.is_dummy() && {
                 let file = sm.lookup_source_file(span.hi());
-                sm.ensure_source_file_source_present(file)
+                should_show_source_code(&self.ignored_directories_in_source_blocks, sm, &file)
             }
         };
 
@@ -1398,7 +1348,14 @@ impl EmitterWriter {
                 buffer.append(0, "]", Style::Level(*level));
                 label_width += 2 + code.len();
             }
-            let header_style = if is_secondary { Style::HeaderMsg } else { Style::MainHeaderMsg };
+            let header_style = if is_secondary {
+                Style::HeaderMsg
+            } else if self.short_message {
+                // For short messages avoid bolding the message, as it doesn't look great (#63835).
+                Style::NoStyle
+            } else {
+                Style::MainHeaderMsg
+            };
             if *level != Level::FailureNote {
                 buffer.append(0, ": ", header_style);
                 label_width += 2;
@@ -1438,7 +1395,11 @@ impl EmitterWriter {
         // Print out the annotate source lines that correspond with the error
         for annotated_file in annotated_files {
             // we can't annotate anything if the source is unavailable.
-            if !sm.ensure_source_file_source_present(annotated_file.file.clone()) {
+            if !should_show_source_code(
+                &self.ignored_directories_in_source_blocks,
+                sm,
+                &annotated_file.file,
+            ) {
                 if !self.short_message {
                     // We'll just print an unannotated message.
                     for (annotation_id, line) in annotated_file.lines.iter().enumerate() {
@@ -1979,7 +1940,9 @@ impl EmitterWriter {
                     is_multiline,
                 )
             }
-            if let DisplaySuggestion::Add = show_code_change && is_item_attribute {
+            if let DisplaySuggestion::Add = show_code_change
+                && is_item_attribute
+            {
                 // The suggestion adds an entire line of code, ending on a newline, so we'll also
                 // print the *following* line, to provide context of what we're advising people to
                 // do. Otherwise you would only see contextless code that can be confused for
@@ -1987,7 +1950,7 @@ impl EmitterWriter {
                 // We special case `#[derive(_)]\n` and other attribute suggestions, because those
                 // are the ones where context is most useful.
                 let file_lines = sm
-                    .span_to_lines(span.primary_span().unwrap().shrink_to_hi())
+                    .span_to_lines(parts[0].span.shrink_to_hi())
                     .expect("span_to_lines failed when emitting suggestion");
                 let line_num = sm.lookup_char_pos(parts[0].span.lo()).line;
                 if let Some(line) = file_lines.file.get_line(line_num - 1) {
@@ -2150,7 +2113,7 @@ impl EmitterWriter {
                         &mut self.dst,
                         self.short_message,
                     ) {
-                        panic!("failed to emit error: {}", e)
+                        panic!("failed to emit error: {e}")
                     }
                 }
                 if !self.short_message {
@@ -2166,7 +2129,7 @@ impl EmitterWriter {
                             true,
                             None,
                         ) {
-                            panic!("failed to emit error: {}", err);
+                            panic!("failed to emit error: {err}");
                         }
                     }
                     for sugg in suggestions {
@@ -2185,7 +2148,7 @@ impl EmitterWriter {
                                     true,
                                     None,
                                 ) {
-                                    panic!("failed to emit error: {}", e);
+                                    panic!("failed to emit error: {e}");
                                 }
                             }
                             SuggestionStyle::HideCodeInline
@@ -2198,22 +2161,21 @@ impl EmitterWriter {
                                     &Level::Help,
                                     max_line_num_len,
                                 ) {
-                                    panic!("failed to emit error: {}", e);
+                                    panic!("failed to emit error: {e}");
                                 }
                             }
                         }
                     }
                 }
             }
-            Err(e) => panic!("failed to emit error: {}", e),
+            Err(e) => panic!("failed to emit error: {e}"),
         }
 
-        let mut dst = self.dst.writable();
-        match writeln!(dst) {
-            Err(e) => panic!("failed to emit error: {}", e),
+        match writeln!(self.dst) {
+            Err(e) => panic!("failed to emit error: {e}"),
             _ => {
-                if let Err(e) = dst.flush() {
-                    panic!("failed to emit error: {}", e)
+                if let Err(e) = self.dst.flush() {
+                    panic!("failed to emit error: {e}")
                 }
             }
         }
@@ -2303,22 +2265,25 @@ impl EmitterWriter {
 
         // Colorize addition/replacements with green.
         for &SubstitutionHighlight { start, end } in highlight_parts {
-            // Account for tabs when highlighting (#87972).
-            let tabs: usize = line_to_add
-                .chars()
-                .take(start)
-                .map(|ch| match ch {
-                    '\t' => 3,
-                    _ => 0,
-                })
-                .sum();
-            buffer.set_style_range(
-                *row_num,
-                max_line_num_len + 3 + start + tabs,
-                max_line_num_len + 3 + end + tabs,
-                Style::Addition,
-                true,
-            );
+            // This is a no-op for empty ranges
+            if start != end {
+                // Account for tabs when highlighting (#87972).
+                let tabs: usize = line_to_add
+                    .chars()
+                    .take(start)
+                    .map(|ch| match ch {
+                        '\t' => 3,
+                        _ => 0,
+                    })
+                    .sum();
+                buffer.set_style_range(
+                    *row_num,
+                    max_line_num_len + 3 + start + tabs,
+                    max_line_num_len + 3 + end + tabs,
+                    Style::Addition,
+                    true,
+                );
+            }
         }
         *row_num += 1;
     }
@@ -2396,7 +2361,9 @@ impl FileWithAnnotatedLines {
                 }
 
                 let label = label.as_ref().map(|m| {
-                    emitter.translate_message(m, args).map_err(Report::new).unwrap().to_string()
+                    normalize_whitespace(
+                        &emitter.translate_message(m, &args).map_err(Report::new).unwrap(),
+                    )
                 });
 
                 if lo.line != hi.line {
@@ -2620,8 +2587,6 @@ fn emit_to_destination(
 ) -> io::Result<()> {
     use crate::lock;
 
-    let mut dst = dst.writable();
-
     // In order to prevent error message interleaving, where multiple error lines get intermixed
     // when multiple compiler processes error simultaneously, we emit errors with additional
     // steps.
@@ -2637,7 +2602,8 @@ fn emit_to_destination(
     let _buffer_lock = lock::acquire_global_lock("rustc_errors");
     for (pos, line) in rendered_buffer.iter().enumerate() {
         for part in line {
-            dst.apply_style(*lvl, part.style)?;
+            let style = part.style.color_spec(*lvl);
+            dst.set_color(&style)?;
             write!(dst, "{}", part.text)?;
             dst.reset()?;
         }
@@ -2649,61 +2615,69 @@ fn emit_to_destination(
     Ok(())
 }
 
-pub enum Destination {
-    Terminal(StandardStream),
-    Buffered(BufferWriter),
-    // The bool denotes whether we should be emitting ansi color codes or not
-    Raw(Box<(dyn Write + Send)>, bool),
+pub type Destination = Box<(dyn WriteColor + Send)>;
+
+struct Buffy {
+    buffer_writer: BufferWriter,
+    buffer: Buffer,
 }
 
-pub enum WritableDst<'a> {
-    Terminal(&'a mut StandardStream),
-    Buffered(&'a mut BufferWriter, Buffer),
-    Raw(&'a mut (dyn Write + Send)),
-    ColoredRaw(Ansi<&'a mut (dyn Write + Send)>),
+impl Write for Buffy {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.buffer_writer.print(&self.buffer)?;
+        self.buffer.clear();
+        Ok(())
+    }
 }
 
-impl Destination {
-    fn from_stderr(color: ColorConfig) -> Destination {
-        let choice = color.to_color_choice();
-        // On Windows we'll be performing global synchronization on the entire
-        // system for emitting rustc errors, so there's no need to buffer
-        // anything.
-        //
-        // On non-Windows we rely on the atomicity of `write` to ensure errors
-        // don't get all jumbled up.
-        if cfg!(windows) {
-            Terminal(StandardStream::stderr(choice))
-        } else {
-            Buffered(BufferWriter::stderr(choice))
+impl Drop for Buffy {
+    fn drop(&mut self) {
+        if !self.buffer.is_empty() {
+            self.flush().unwrap();
+            panic!("buffers need to be flushed in order to print their contents");
         }
     }
+}
 
-    fn writable(&mut self) -> WritableDst<'_> {
-        match *self {
-            Destination::Terminal(ref mut t) => WritableDst::Terminal(t),
-            Destination::Buffered(ref mut t) => {
-                let buf = t.buffer();
-                WritableDst::Buffered(t, buf)
-            }
-            Destination::Raw(ref mut t, false) => WritableDst::Raw(t),
-            Destination::Raw(ref mut t, true) => WritableDst::ColoredRaw(Ansi::new(t)),
-        }
-    }
-
+impl WriteColor for Buffy {
     fn supports_color(&self) -> bool {
-        match *self {
-            Self::Terminal(ref stream) => stream.supports_color(),
-            Self::Buffered(ref buffer) => buffer.buffer().supports_color(),
-            Self::Raw(_, supports_color) => supports_color,
-        }
+        self.buffer.supports_color()
+    }
+
+    fn set_color(&mut self, spec: &ColorSpec) -> io::Result<()> {
+        self.buffer.set_color(spec)
+    }
+
+    fn reset(&mut self) -> io::Result<()> {
+        self.buffer.reset()
     }
 }
 
-impl<'a> WritableDst<'a> {
-    fn apply_style(&mut self, lvl: Level, style: Style) -> io::Result<()> {
+fn from_stderr(color: ColorConfig) -> Destination {
+    let choice = color.to_color_choice();
+    // On Windows we'll be performing global synchronization on the entire
+    // system for emitting rustc errors, so there's no need to buffer
+    // anything.
+    //
+    // On non-Windows we rely on the atomicity of `write` to ensure errors
+    // don't get all jumbled up.
+    if cfg!(windows) {
+        Box::new(StandardStream::stderr(choice))
+    } else {
+        let buffer_writer = BufferWriter::stderr(choice);
+        let buffer = buffer_writer.buffer();
+        Box::new(Buffy { buffer_writer, buffer })
+    }
+}
+
+impl Style {
+    fn color_spec(&self, lvl: Level) -> ColorSpec {
         let mut spec = ColorSpec::new();
-        match style {
+        match self {
             Style::Addition => {
                 spec.set_fg(Some(Color::Green)).set_intense(true);
             }
@@ -2748,53 +2722,7 @@ impl<'a> WritableDst<'a> {
                 spec.set_bold(true);
             }
         }
-        self.set_color(&spec)
-    }
-
-    fn set_color(&mut self, color: &ColorSpec) -> io::Result<()> {
-        match *self {
-            WritableDst::Terminal(ref mut t) => t.set_color(color),
-            WritableDst::Buffered(_, ref mut t) => t.set_color(color),
-            WritableDst::ColoredRaw(ref mut t) => t.set_color(color),
-            WritableDst::Raw(_) => Ok(()),
-        }
-    }
-
-    fn reset(&mut self) -> io::Result<()> {
-        match *self {
-            WritableDst::Terminal(ref mut t) => t.reset(),
-            WritableDst::Buffered(_, ref mut t) => t.reset(),
-            WritableDst::ColoredRaw(ref mut t) => t.reset(),
-            WritableDst::Raw(_) => Ok(()),
-        }
-    }
-}
-
-impl<'a> Write for WritableDst<'a> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match *self {
-            WritableDst::Terminal(ref mut t) => t.write(bytes),
-            WritableDst::Buffered(_, ref mut buf) => buf.write(bytes),
-            WritableDst::Raw(ref mut w) => w.write(bytes),
-            WritableDst::ColoredRaw(ref mut t) => t.write(bytes),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match *self {
-            WritableDst::Terminal(ref mut t) => t.flush(),
-            WritableDst::Buffered(_, ref mut buf) => buf.flush(),
-            WritableDst::Raw(ref mut w) => w.flush(),
-            WritableDst::ColoredRaw(ref mut w) => w.flush(),
-        }
-    }
-}
-
-impl<'a> Drop for WritableDst<'a> {
-    fn drop(&mut self) {
-        if let WritableDst::Buffered(ref mut dst, ref mut buf) = self {
-            drop(dst.print(buf));
-        }
+        spec
     }
 }
 
@@ -2817,4 +2745,19 @@ pub fn is_case_difference(sm: &SourceMap, suggested: &str, sp: Span) -> bool {
             // FIXME: We sometimes suggest the same thing we already have, which is a
             //        bug, but be defensive against that here.
             && found != suggested
+}
+
+pub(crate) fn should_show_source_code(
+    ignored_directories: &[String],
+    sm: &SourceMap,
+    file: &SourceFile,
+) -> bool {
+    if !sm.ensure_source_file_source_present(file) {
+        return false;
+    }
+
+    let FileName::Real(name) = &file.name else { return true };
+    name.local_path()
+        .map(|path| ignored_directories.iter().all(|dir| !path.starts_with(dir)))
+        .unwrap_or(true)
 }

@@ -63,8 +63,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let [payload] = this.check_shim(abi, Abi::Rust, link_name, args)?;
         let payload = this.read_scalar(payload)?;
         let thread = this.active_thread_mut();
-        assert!(thread.panic_payload.is_none(), "the panic runtime should avoid double-panics");
-        thread.panic_payload = Some(payload);
+        thread.panic_payloads.push(payload);
 
         // Jump to the unwind block to begin unwinding.
         this.unwind_to_block(unwind)?;
@@ -146,7 +145,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
             // The Thread's `panic_payload` holds what was passed to `miri_start_panic`.
             // This is exactly the second argument we need to pass to `catch_fn`.
-            let payload = this.active_thread_mut().panic_payload.take().unwrap();
+            let payload = this.active_thread_mut().panic_payloads.pop().unwrap();
 
             // Push the `catch_fn` stackframe.
             let f_instance = this.get_ptr_fn(catch_unwind.catch_fn)?.as_instance()?;
@@ -186,6 +185,25 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             &[msg.to_ref(this)],
             None,
             StackPopCleanup::Goto { ret: None, unwind },
+        )
+    }
+
+    /// Start a non-unwinding panic in the interpreter with the given message as payload.
+    fn start_panic_nounwind(&mut self, msg: &str) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+
+        // First arg: message.
+        let msg = this.allocate_str(msg, MiriMemoryKind::Machine.into(), Mutability::Not)?;
+
+        // Call the lang item.
+        let panic = this.tcx.lang_items().panic_nounwind().unwrap();
+        let panic = ty::Instance::mono(this.tcx.tcx, panic);
+        this.call_function(
+            panic,
+            Abi::Rust,
+            &[msg.to_ref(this)],
+            None,
+            StackPopCleanup::Goto { ret: None, unwind: mir::UnwindAction::Unreachable },
         )
     }
 

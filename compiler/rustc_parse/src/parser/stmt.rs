@@ -20,9 +20,10 @@ use rustc_ast::{AttrStyle, AttrVec, LocalKind, MacCall, MacCallStmt, MacStmtStyl
 use rustc_ast::{Block, BlockCheckMode, Expr, ExprKind, HasAttrs, Local, Stmt};
 use rustc_ast::{StmtKind, DUMMY_NODE_ID};
 use rustc_errors::{Applicability, DiagnosticBuilder, ErrorGuaranteed, PResult};
-use rustc_span::source_map::{BytePos, Span};
 use rustc_span::symbol::{kw, sym, Ident};
+use rustc_span::{BytePos, Span};
 
+use std::borrow::Cow;
 use std::mem;
 use thin_vec::{thin_vec, ThinVec};
 
@@ -40,7 +41,8 @@ impl<'a> Parser<'a> {
 
     /// If `force_collect` is [`ForceCollect::Yes`], forces collection of tokens regardless of whether
     /// or not we have attributes
-    pub(crate) fn parse_stmt_without_recovery(
+    // Public for `cfg_eval` macro expansion.
+    pub fn parse_stmt_without_recovery(
         &mut self,
         capture_semi: bool,
         force_collect: ForceCollect,
@@ -50,7 +52,9 @@ impl<'a> Parser<'a> {
 
         // Don't use `maybe_whole` so that we have precise control
         // over when we bump the parser
-        if let token::Interpolated(nt) = &self.token.kind && let token::NtStmt(stmt) = &**nt {
+        if let token::Interpolated(nt) = &self.token.kind
+            && let token::NtStmt(stmt) = &nt.0
+        {
             let mut stmt = stmt.clone();
             self.bump();
             stmt.visit_attrs(|stmt_attrs| {
@@ -90,7 +94,11 @@ impl<'a> Parser<'a> {
                 attrs,
                 errors::InvalidVariableDeclarationSub::UseLetNotVar,
             )?
-        } else if self.check_path() && !self.token.is_qpath_start() && !self.is_path_start_item() {
+        } else if self.check_path()
+            && !self.token.is_qpath_start()
+            && !self.is_path_start_item()
+            && !self.is_builtin()
+        {
             // We have avoided contextual keywords like `union`, items with `crate` visibility,
             // or `auto trait` items. We aim to parse an arbitrary path `a::b` but not something
             // that starts like a path (1 token), but it fact not a path.
@@ -99,7 +107,13 @@ impl<'a> Parser<'a> {
                 ForceCollect::Yes => {
                     self.collect_tokens_no_attrs(|this| this.parse_stmt_path_start(lo, attrs))?
                 }
-                ForceCollect::No => self.parse_stmt_path_start(lo, attrs)?,
+                ForceCollect::No => match self.parse_stmt_path_start(lo, attrs) {
+                    Ok(stmt) => stmt,
+                    Err(mut err) => {
+                        self.suggest_add_missing_let_for_stmt(&mut err);
+                        return Err(err);
+                    }
+                },
             }
         } else if let Some(item) = self.parse_item_common(
             attrs.clone(),
@@ -181,10 +195,9 @@ impl<'a> Parser<'a> {
     /// At this point, the `!` token after the path has already been eaten.
     fn parse_stmt_mac(&mut self, lo: Span, attrs: AttrVec, path: ast::Path) -> PResult<'a, Stmt> {
         let args = self.parse_delim_args()?;
-        let delim = args.delim.to_token();
         let hi = self.prev_token.span;
 
-        let style = match delim {
+        let style = match args.delim {
             Delimiter::Brace => MacStmtStyle::Braces,
             _ => MacStmtStyle::NoBraces,
         };
@@ -216,8 +229,9 @@ impl<'a> Parser<'a> {
     /// Also error if the previous token was a doc comment.
     fn error_outer_attrs(&self, attrs: AttrWrapper) {
         if !attrs.is_empty()
-        && let attrs = attrs.take_for_recovery(self.sess)
-        && let attrs @ [.., last] = &*attrs {
+            && let attrs = attrs.take_for_recovery(self.sess)
+            && let attrs @ [.., last] = &*attrs
+        {
             if last.is_doc_comment() {
                 self.sess.emit_err(errors::DocCommentDoesNotDocumentAnything {
                     span: last.span,
@@ -288,7 +302,7 @@ impl<'a> Parser<'a> {
                 Ok(ty) => (None, Some(ty)),
                 Err(mut err) => {
                     if let Ok(snip) = self.span_to_snippet(pat.span) {
-                        err.span_label(pat.span, format!("while parsing the type for `{}`", snip));
+                        err.span_label(pat.span, format!("while parsing the type for `{snip}`"));
                     }
                     // we use noexpect here because we don't actually expect Eq to be here
                     // but we are still checking for it in order to be able to handle it if
@@ -353,7 +367,7 @@ impl<'a> Parser<'a> {
                         // `let...else if`. Emit the same error that `parse_block()` would,
                         // but explicitly point out that this pattern is not allowed.
                         let msg = "conditional `else if` is not supported for `let...else`";
-                        return Err(self.error_block_no_opening_brace_msg(msg));
+                        return Err(self.error_block_no_opening_brace_msg(Cow::from(msg)));
                     }
                     let els = self.parse_block()?;
                     self.check_let_else_init_bool_expr(&init);
@@ -427,7 +441,7 @@ impl<'a> Parser<'a> {
 
     fn error_block_no_opening_brace_msg(
         &mut self,
-        msg: &str,
+        msg: Cow<'static, str>,
     ) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
         let sp = self.token.span;
         let mut e = self.struct_span_err(sp, msg);
@@ -490,8 +504,8 @@ impl<'a> Parser<'a> {
 
     fn error_block_no_opening_brace<T>(&mut self) -> PResult<'a, T> {
         let tok = super::token_descr(&self.token);
-        let msg = format!("expected `{{`, found {}", tok);
-        Err(self.error_block_no_opening_brace_msg(&msg))
+        let msg = format!("expected `{{`, found {tok}");
+        Err(self.error_block_no_opening_brace_msg(Cow::from(msg)))
     }
 
     /// Parses a block. Inner attributes are allowed.
@@ -555,21 +569,12 @@ impl<'a> Parser<'a> {
                     if self.token == token::Colon {
                         // if next token is following a colon, it's likely a path
                         // and we can suggest a path separator
-                        let ident_span = self.prev_token.span;
                         self.bump();
                         if self.token.span.lo() == self.prev_token.span.hi() {
                             err.span_suggestion_verbose(
                                 self.prev_token.span,
                                 "maybe write a path separator here",
                                 "::",
-                                Applicability::MaybeIncorrect,
-                            );
-                        }
-                        if self.look_ahead(1, |token| token == &token::Eq) {
-                            err.span_suggestion_verbose(
-                                ident_span.shrink_to_lo(),
-                                "you might have meant to introduce a new binding",
-                                "let ",
                                 Applicability::MaybeIncorrect,
                             );
                         }
@@ -614,35 +619,19 @@ impl<'a> Parser<'a> {
         match &mut stmt.kind {
             // Expression without semicolon.
             StmtKind::Expr(expr)
-                if self.token != token::Eof && classify::expr_requires_semi_to_be_stmt(expr) => {
+                if self.token != token::Eof && classify::expr_requires_semi_to_be_stmt(expr) =>
+            {
                 // Just check for errors and recover; do not eat semicolon yet.
                 // `expect_one_of` returns PResult<'a, bool /* recovered */>
 
-                let expect_result = self.expect_one_of(&[], &[token::Semi, token::CloseDelim(Delimiter::Brace)]);
+                let expect_result =
+                    self.expect_one_of(&[], &[token::Semi, token::CloseDelim(Delimiter::Brace)]);
 
                 let replace_with_err = 'break_recover: {
                     match expect_result {
-                    // Recover from parser, skip type error to avoid extra errors.
+                        // Recover from parser, skip type error to avoid extra errors.
                         Ok(true) => true,
                         Err(mut e) => {
-                            if let TokenKind::DocComment(..) = self.token.kind
-                                && let Ok(snippet) = self.span_to_snippet(self.token.span)
-                            {
-                                let sp = self.token.span;
-                                let marker = &snippet[..3];
-                                let (comment_marker, doc_comment_marker) = marker.split_at(2);
-
-                                e.span_suggestion(
-                                    sp.with_hi(sp.lo() + BytePos(marker.len() as u32)),
-                                    format!(
-                                        "add a space before `{}` to use a regular comment",
-                                        doc_comment_marker,
-                                    ),
-                                    format!("{} {}", comment_marker, doc_comment_marker),
-                                    Applicability::MaybeIncorrect,
-                                );
-                            }
-
                             if self.recover_colon_as_semi() {
                                 // recover_colon_as_semi has already emitted a nicer error.
                                 e.delay_as_bug();
@@ -653,14 +642,19 @@ impl<'a> Parser<'a> {
                             }
 
                             match &expr.kind {
-                                ExprKind::Path(None, ast::Path { segments, .. }) if segments.len() == 1 => {
+                                ExprKind::Path(None, ast::Path { segments, .. })
+                                    if segments.len() == 1 =>
+                                {
                                     if self.token == token::Colon
                                         && self.look_ahead(1, |token| {
-                                            token.is_whole_block() || matches!(
-                                                token.kind,
-                                                token::Ident(kw::For | kw::Loop | kw::While, false)
-                                                    | token::OpenDelim(Delimiter::Brace)
-                                            )
+                                            token.is_whole_block()
+                                                || matches!(
+                                                    token.kind,
+                                                    token::Ident(
+                                                        kw::For | kw::Loop | kw::While,
+                                                        false
+                                                    ) | token::OpenDelim(Delimiter::Brace)
+                                                )
                                         })
                                     {
                                         let snapshot = self.create_snapshot_for_diagnostic();
@@ -701,9 +695,8 @@ impl<'a> Parser<'a> {
                             }
 
                             true
-
                         }
-                        Ok(false) => false
+                        Ok(false) => false,
                     }
                 };
 
@@ -726,7 +719,9 @@ impl<'a> Parser<'a> {
                 }
                 eat_semi = false;
             }
-            StmtKind::Empty | StmtKind::Item(_) | StmtKind::Local(_) | StmtKind::Semi(_) => eat_semi = false,
+            StmtKind::Empty | StmtKind::Item(_) | StmtKind::Local(_) | StmtKind::Semi(_) => {
+                eat_semi = false
+            }
         }
 
         if add_semi_to_stmt || (eat_semi && self.eat(&token::Semi)) {

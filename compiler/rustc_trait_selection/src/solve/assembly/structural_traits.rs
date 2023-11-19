@@ -1,6 +1,9 @@
+//! Code which is used by built-in goals that match "structurally", such a auto
+//! traits, `Copy`/`Clone`.
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::{def_id::DefId, Movability, Mutability};
 use rustc_infer::traits::query::NoSolution;
+use rustc_middle::traits::solve::Goal;
 use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
 };
@@ -9,8 +12,9 @@ use crate::solve::EvalCtxt;
 
 // Calculates the constituent types of a type for `auto trait` purposes.
 //
-// For types with an "existential" binder, i.e. generator witnesses, we also
+// For types with an "existential" binder, i.e. coroutine witnesses, we also
 // instantiate the binder with placeholders eagerly.
+#[instrument(level = "debug", skip(ecx), ret)]
 pub(in crate::solve) fn instantiate_constituent_tys_for_auto_trait<'tcx>(
     ecx: &EvalCtxt<'_, 'tcx>,
     ty: Ty<'tcx>,
@@ -28,12 +32,12 @@ pub(in crate::solve) fn instantiate_constituent_tys_for_auto_trait<'tcx>(
         | ty::Char => Ok(vec![]),
 
         // Treat `str` like it's defined as `struct str([u8]);`
-        ty::Str => Ok(vec![tcx.mk_slice(tcx.types.u8)]),
+        ty::Str => Ok(vec![Ty::new_slice(tcx, tcx.types.u8)]),
 
         ty::Dynamic(..)
         | ty::Param(..)
         | ty::Foreign(..)
-        | ty::Alias(ty::Projection, ..)
+        | ty::Alias(ty::Projection | ty::Inherent | ty::Weak, ..)
         | ty::Placeholder(..)
         | ty::Bound(..)
         | ty::Infer(_) => {
@@ -51,36 +55,34 @@ pub(in crate::solve) fn instantiate_constituent_tys_for_auto_trait<'tcx>(
             Ok(tys.iter().collect())
         }
 
-        ty::Closure(_, ref substs) => Ok(vec![substs.as_closure().tupled_upvars_ty()]),
+        ty::Closure(_, ref args) => Ok(vec![args.as_closure().tupled_upvars_ty()]),
 
-        ty::Generator(_, ref substs, _) => {
-            let generator_substs = substs.as_generator();
-            Ok(vec![generator_substs.tupled_upvars_ty(), generator_substs.witness()])
+        ty::Coroutine(_, ref args, _) => {
+            let coroutine_args = args.as_coroutine();
+            Ok(vec![coroutine_args.tupled_upvars_ty(), coroutine_args.witness()])
         }
 
-        ty::GeneratorWitness(types) => Ok(ecx.instantiate_binder_with_placeholders(types).to_vec()),
-
-        ty::GeneratorWitnessMIR(def_id, substs) => Ok(ecx
+        ty::CoroutineWitness(def_id, args) => Ok(ecx
             .tcx()
-            .generator_hidden_types(def_id)
+            .coroutine_hidden_types(def_id)
             .map(|bty| {
                 ecx.instantiate_binder_with_placeholders(replace_erased_lifetimes_with_bound_vars(
                     tcx,
-                    bty.subst(tcx, substs),
+                    bty.instantiate(tcx, args),
                 ))
             })
             .collect()),
 
         // For `PhantomData<T>`, we pass `T`.
-        ty::Adt(def, substs) if def.is_phantom_data() => Ok(vec![substs.type_at(0)]),
+        ty::Adt(def, args) if def.is_phantom_data() => Ok(vec![args.type_at(0)]),
 
-        ty::Adt(def, substs) => Ok(def.all_fields().map(|f| f.ty(tcx, substs)).collect()),
+        ty::Adt(def, args) => Ok(def.all_fields().map(|f| f.ty(tcx, args)).collect()),
 
-        ty::Alias(ty::Opaque, ty::AliasTy { def_id, substs, .. }) => {
+        ty::Alias(ty::Opaque, ty::AliasTy { def_id, args, .. }) => {
             // We can resolve the `impl Trait` to its concrete type,
             // which enforces a DAG between the functions requiring
             // the auto trait bounds in question.
-            Ok(vec![tcx.type_of(def_id).subst(tcx, substs)])
+            Ok(vec![tcx.type_of(def_id).instantiate(tcx, args)])
         }
     }
 }
@@ -89,24 +91,24 @@ pub(in crate::solve) fn replace_erased_lifetimes_with_bound_vars<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
 ) -> ty::Binder<'tcx, Ty<'tcx>> {
-    debug_assert!(!ty.has_late_bound_regions());
+    debug_assert!(!ty.has_bound_regions());
     let mut counter = 0;
     let ty = tcx.fold_regions(ty, |r, current_depth| match r.kind() {
         ty::ReErased => {
-            let br =
-                ty::BoundRegion { var: ty::BoundVar::from_u32(counter), kind: ty::BrAnon(None) };
+            let br = ty::BoundRegion { var: ty::BoundVar::from_u32(counter), kind: ty::BrAnon };
             counter += 1;
-            tcx.mk_re_late_bound(current_depth, br)
+            ty::Region::new_bound(tcx, current_depth, br)
         }
         // All free regions should be erased here.
         r => bug!("unexpected region: {r:?}"),
     });
     let bound_vars = tcx.mk_bound_variable_kinds_from_iter(
-        (0..counter).map(|_| ty::BoundVariableKind::Region(ty::BrAnon(None))),
+        (0..counter).map(|_| ty::BoundVariableKind::Region(ty::BrAnon)),
     );
     ty::Binder::bind_with_vars(ty, bound_vars)
 }
 
+#[instrument(level = "debug", skip(ecx), ret)]
 pub(in crate::solve) fn instantiate_constituent_tys_for_sized_trait<'tcx>(
     ecx: &EvalCtxt<'_, 'tcx>,
     ty: Ty<'tcx>,
@@ -122,9 +124,8 @@ pub(in crate::solve) fn instantiate_constituent_tys_for_sized_trait<'tcx>(
         | ty::RawPtr(..)
         | ty::Char
         | ty::Ref(..)
-        | ty::Generator(..)
-        | ty::GeneratorWitness(..)
-        | ty::GeneratorWitnessMIR(..)
+        | ty::Coroutine(..)
+        | ty::CoroutineWitness(..)
         | ty::Array(..)
         | ty::Closure(..)
         | ty::Never
@@ -146,30 +147,25 @@ pub(in crate::solve) fn instantiate_constituent_tys_for_sized_trait<'tcx>(
 
         ty::Tuple(tys) => Ok(tys.to_vec()),
 
-        ty::Adt(def, substs) => {
+        ty::Adt(def, args) => {
             let sized_crit = def.sized_constraint(ecx.tcx());
-            Ok(sized_crit
-                .0
-                .iter()
-                .map(|ty| sized_crit.rebind(*ty).subst(ecx.tcx(), substs))
-                .collect())
+            Ok(sized_crit.iter_instantiated(ecx.tcx(), args).collect())
         }
     }
 }
 
+#[instrument(level = "debug", skip(ecx), ret)]
 pub(in crate::solve) fn instantiate_constituent_tys_for_copy_clone_trait<'tcx>(
     ecx: &EvalCtxt<'_, 'tcx>,
     ty: Ty<'tcx>,
 ) -> Result<Vec<Ty<'tcx>>, NoSolution> {
     match *ty.kind() {
-        ty::Infer(ty::IntVar(_) | ty::FloatVar(_))
-        | ty::FnDef(..)
-        | ty::FnPtr(_)
-        | ty::Error(_) => Ok(vec![]),
+        ty::FnDef(..) | ty::FnPtr(_) | ty::Error(_) => Ok(vec![]),
 
         // Implementations are provided in core
         ty::Uint(_)
         | ty::Int(_)
+        | ty::Infer(ty::IntVar(_) | ty::FloatVar(_))
         | ty::Bool
         | ty::Float(_)
         | ty::Char
@@ -181,7 +177,7 @@ pub(in crate::solve) fn instantiate_constituent_tys_for_copy_clone_trait<'tcx>(
         ty::Dynamic(..)
         | ty::Str
         | ty::Slice(_)
-        | ty::Generator(_, _, Movability::Static)
+        | ty::Coroutine(_, _, Movability::Static)
         | ty::Foreign(..)
         | ty::Ref(_, _, Mutability::Mut)
         | ty::Adt(_, _)
@@ -196,26 +192,24 @@ pub(in crate::solve) fn instantiate_constituent_tys_for_copy_clone_trait<'tcx>(
 
         ty::Tuple(tys) => Ok(tys.to_vec()),
 
-        ty::Closure(_, substs) => Ok(vec![substs.as_closure().tupled_upvars_ty()]),
+        ty::Closure(_, args) => Ok(vec![args.as_closure().tupled_upvars_ty()]),
 
-        ty::Generator(_, substs, Movability::Movable) => {
-            if ecx.tcx().features().generator_clone {
-                let generator = substs.as_generator();
-                Ok(vec![generator.tupled_upvars_ty(), generator.witness()])
+        ty::Coroutine(_, args, Movability::Movable) => {
+            if ecx.tcx().features().coroutine_clone {
+                let coroutine = args.as_coroutine();
+                Ok(vec![coroutine.tupled_upvars_ty(), coroutine.witness()])
             } else {
                 Err(NoSolution)
             }
         }
 
-        ty::GeneratorWitness(types) => Ok(ecx.instantiate_binder_with_placeholders(types).to_vec()),
-
-        ty::GeneratorWitnessMIR(def_id, substs) => Ok(ecx
+        ty::CoroutineWitness(def_id, args) => Ok(ecx
             .tcx()
-            .generator_hidden_types(def_id)
+            .coroutine_hidden_types(def_id)
             .map(|bty| {
                 ecx.instantiate_binder_with_placeholders(replace_erased_lifetimes_with_bound_vars(
                     ecx.tcx(),
-                    bty.subst(ecx.tcx(), substs),
+                    bty.instantiate(ecx.tcx(), args),
                 ))
             })
             .collect()),
@@ -230,14 +224,14 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_callable<'tcx>(
 ) -> Result<Option<ty::Binder<'tcx, (Ty<'tcx>, Ty<'tcx>)>>, NoSolution> {
     match *self_ty.kind() {
         // keep this in sync with assemble_fn_pointer_candidates until the old solver is removed.
-        ty::FnDef(def_id, substs) => {
+        ty::FnDef(def_id, args) => {
             let sig = tcx.fn_sig(def_id);
             if sig.skip_binder().is_fn_trait_compatible()
                 && tcx.codegen_fn_attrs(def_id).target_features.is_empty()
             {
                 Ok(Some(
-                    sig.subst(tcx, substs)
-                        .map_bound(|sig| (tcx.mk_tup(sig.inputs()), sig.output())),
+                    sig.instantiate(tcx, args)
+                        .map_bound(|sig| (Ty::new_tup(tcx, sig.inputs()), sig.output())),
                 ))
             } else {
                 Err(NoSolution)
@@ -246,14 +240,14 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_callable<'tcx>(
         // keep this in sync with assemble_fn_pointer_candidates until the old solver is removed.
         ty::FnPtr(sig) => {
             if sig.is_fn_trait_compatible() {
-                Ok(Some(sig.map_bound(|sig| (tcx.mk_tup(sig.inputs()), sig.output()))))
+                Ok(Some(sig.map_bound(|sig| (Ty::new_tup(tcx, sig.inputs()), sig.output()))))
             } else {
                 Err(NoSolution)
             }
         }
-        ty::Closure(_, substs) => {
-            let closure_substs = substs.as_closure();
-            match closure_substs.kind_ty().to_opt_closure_kind() {
+        ty::Closure(_, args) => {
+            let closure_args = args.as_closure();
+            match closure_args.kind_ty().to_opt_closure_kind() {
                 // If the closure's kind doesn't extend the goal kind,
                 // then the closure doesn't implement the trait.
                 Some(closure_kind) => {
@@ -269,7 +263,7 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_callable<'tcx>(
                     }
                 }
             }
-            Ok(Some(closure_substs.sig().map_bound(|sig| (sig.inputs()[0], sig.output()))))
+            Ok(Some(closure_args.sig().map_bound(|sig| (sig.inputs()[0], sig.output()))))
         }
         ty::Bool
         | ty::Char
@@ -284,9 +278,8 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_callable<'tcx>(
         | ty::RawPtr(_)
         | ty::Ref(_, _, _)
         | ty::Dynamic(_, _, _)
-        | ty::Generator(_, _, _)
-        | ty::GeneratorWitness(_)
-        | ty::GeneratorWitnessMIR(..)
+        | ty::Coroutine(_, _, _)
+        | ty::CoroutineWitness(..)
         | ty::Never
         | ty::Tuple(_)
         | ty::Alias(_, _)
@@ -347,17 +340,24 @@ pub(in crate::solve) fn predicates_for_object_candidate<'tcx>(
     param_env: ty::ParamEnv<'tcx>,
     trait_ref: ty::TraitRef<'tcx>,
     object_bound: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
-) -> Vec<ty::Predicate<'tcx>> {
+) -> Vec<Goal<'tcx, ty::Predicate<'tcx>>> {
     let tcx = ecx.tcx();
     let mut requirements = vec![];
     requirements.extend(
-        tcx.super_predicates_of(trait_ref.def_id).instantiate(tcx, trait_ref.substs).predicates,
+        tcx.super_predicates_of(trait_ref.def_id).instantiate(tcx, trait_ref.args).predicates,
     );
     for item in tcx.associated_items(trait_ref.def_id).in_definition_order() {
         // FIXME(associated_const_equality): Also add associated consts to
         // the requirements here.
         if item.kind == ty::AssocKind::Type {
-            requirements.extend(tcx.item_bounds(item.def_id).subst(tcx, trait_ref.substs));
+            // associated types that require `Self: Sized` do not show up in the built-in
+            // implementation of `Trait for dyn Trait`, and can be dropped here.
+            if tcx.generics_require_sized_self(item.def_id) {
+                continue;
+            }
+
+            requirements
+                .extend(tcx.item_bounds(item.def_id).iter_instantiated(tcx, trait_ref.args));
         }
     }
 
@@ -377,17 +377,22 @@ pub(in crate::solve) fn predicates_for_object_candidate<'tcx>(
         }
     }
 
-    requirements.fold_with(&mut ReplaceProjectionWith {
-        ecx,
-        param_env,
-        mapping: replace_projection_with,
-    })
+    let mut folder =
+        ReplaceProjectionWith { ecx, param_env, mapping: replace_projection_with, nested: vec![] };
+    let folded_requirements = requirements.fold_with(&mut folder);
+
+    folder
+        .nested
+        .into_iter()
+        .chain(folded_requirements.into_iter().map(|clause| Goal::new(tcx, param_env, clause)))
+        .collect()
 }
 
 struct ReplaceProjectionWith<'a, 'tcx> {
     ecx: &'a EvalCtxt<'a, 'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     mapping: FxHashMap<DefId, ty::PolyProjectionPredicate<'tcx>>,
+    nested: Vec<Goal<'tcx, ty::Predicate<'tcx>>>,
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReplaceProjectionWith<'_, 'tcx> {
@@ -403,13 +408,12 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReplaceProjectionWith<'_, 'tcx> {
             // but the where clauses we instantiated are not. We can solve this by instantiating
             // the binder at the usage site.
             let proj = self.ecx.instantiate_binder_with_infer(*replacement);
-            // FIXME: Technically this folder could be fallible?
-            let nested = self
-                .ecx
-                .eq_and_get_goals(self.param_env, alias_ty, proj.projection_ty)
-                .expect("expected to be able to unify goal projection with dyn's projection");
-            // FIXME: Technically we could register these too..
-            assert!(nested.is_empty(), "did not expect unification to have any nested goals");
+            // FIXME: Technically this equate could be fallible...
+            self.nested.extend(
+                self.ecx
+                    .eq_and_get_goals(self.param_env, alias_ty, proj.projection_ty)
+                    .expect("expected to be able to unify goal projection with dyn's projection"),
+            );
             proj.term.ty().unwrap()
         } else {
             ty.super_fold_with(self)

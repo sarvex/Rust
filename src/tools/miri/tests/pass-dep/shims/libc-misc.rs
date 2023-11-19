@@ -3,32 +3,12 @@
 #![feature(io_error_more)]
 
 use std::fs::{remove_file, File};
+use std::mem::transmute;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
-fn tmp() -> PathBuf {
-    use std::ffi::{c_char, CStr, CString};
-
-    let path = std::env::var("MIRI_TEMP")
-        .unwrap_or_else(|_| std::env::temp_dir().into_os_string().into_string().unwrap());
-    // These are host paths. We need to convert them to the target.
-    let path = CString::new(path).unwrap();
-    let mut out = Vec::with_capacity(1024);
-
-    unsafe {
-        extern "Rust" {
-            fn miri_host_to_target_path(
-                path: *const c_char,
-                out: *mut c_char,
-                out_size: usize,
-            ) -> usize;
-        }
-        let ret = miri_host_to_target_path(path.as_ptr(), out.as_mut_ptr(), out.capacity());
-        assert_eq!(ret, 0);
-        let out = CStr::from_ptr(out.as_ptr()).to_str().unwrap();
-        PathBuf::from(out)
-    }
-}
+#[path = "../../utils/mod.rs"]
+mod utils;
 
 /// Test allocating variant of `realpath`.
 fn test_posix_realpath_alloc() {
@@ -38,7 +18,7 @@ fn test_posix_realpath_alloc() {
     use std::os::unix::ffi::OsStringExt;
 
     let buf;
-    let path = tmp().join("miri_test_libc_posix_realpath_alloc");
+    let path = utils::tmp().join("miri_test_libc_posix_realpath_alloc");
     let c_path = CString::new(path.as_os_str().as_bytes()).expect("CString::new failed");
 
     // Cleanup before test.
@@ -63,7 +43,7 @@ fn test_posix_realpath_noalloc() {
     use std::ffi::{CStr, CString};
     use std::os::unix::ffi::OsStrExt;
 
-    let path = tmp().join("miri_test_libc_posix_realpath_noalloc");
+    let path = utils::tmp().join("miri_test_libc_posix_realpath_noalloc");
     let c_path = CString::new(path.as_os_str().as_bytes()).expect("CString::new failed");
 
     let mut v = vec![0; libc::PATH_MAX as usize];
@@ -101,10 +81,9 @@ fn test_posix_realpath_errors() {
 
 #[cfg(target_os = "linux")]
 fn test_posix_fadvise() {
-    use std::convert::TryInto;
     use std::io::Write;
 
-    let path = tmp().join("miri_test_libc_posix_fadvise.txt");
+    let path = utils::tmp().join("miri_test_libc_posix_fadvise.txt");
     // Cleanup before test
     remove_file(&path).ok();
 
@@ -131,7 +110,7 @@ fn test_posix_fadvise() {
 fn test_sync_file_range() {
     use std::io::Write;
 
-    let path = tmp().join("miri_test_libc_sync_file_range.txt");
+    let path = utils::tmp().join("miri_test_libc_sync_file_range.txt");
     // Cleanup before test.
     remove_file(&path).ok();
 
@@ -193,6 +172,7 @@ fn test_thread_local_errno() {
 }
 
 /// Tests whether clock support exists at all
+#[cfg(not(target_os = "freebsd"))]
 fn test_clocks() {
     let mut tp = std::mem::MaybeUninit::<libc::timespec>::uninit();
     let is_error = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, tp.as_mut_ptr()) };
@@ -207,7 +187,7 @@ fn test_clocks() {
             unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, tp.as_mut_ptr()) };
         assert_eq!(is_error, 0);
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     {
         let is_error = unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, tp.as_mut_ptr()) };
         assert_eq!(is_error, 0);
@@ -244,7 +224,7 @@ fn test_isatty() {
         libc::isatty(libc::STDERR_FILENO);
 
         // But when we open a file, it is definitely not a TTY.
-        let path = tmp().join("notatty.txt");
+        let path = utils::tmp().join("notatty.txt");
         // Cleanup before test.
         remove_file(&path).ok();
         let file = File::create(&path).unwrap();
@@ -258,6 +238,7 @@ fn test_isatty() {
     }
 }
 
+#[cfg(not(target_os = "freebsd"))]
 fn test_posix_mkstemp() {
     use std::ffi::CString;
     use std::ffi::OsStr;
@@ -397,8 +378,35 @@ fn test_sigrt() {
     assert!(max - min >= 8)
 }
 
+fn test_dlsym() {
+    let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, b"notasymbol\0".as_ptr().cast()) };
+    assert!(addr as usize == 0);
+
+    let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, b"isatty\0".as_ptr().cast()) };
+    assert!(addr as usize != 0);
+    let isatty: extern "C" fn(i32) -> i32 = unsafe { transmute(addr) };
+    assert_eq!(isatty(999), 0);
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+    assert_eq!(errno, libc::EBADF);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn test_reallocarray() {
+    unsafe {
+        let mut p = libc::reallocarray(std::ptr::null_mut(), 4096, 2);
+        assert!(!p.is_null());
+        libc::free(p);
+        p = libc::malloc(16);
+        let r = libc::reallocarray(p, 2, 32);
+        assert!(!r.is_null());
+        libc::free(r);
+    }
+}
+
 fn main() {
     test_posix_gettimeofday();
+
+    #[cfg(not(target_os = "freebsd"))] // FIXME we should support this on FreeBSD as well
     test_posix_mkstemp();
 
     test_posix_realpath_alloc();
@@ -408,11 +416,19 @@ fn main() {
     test_thread_local_errno();
 
     test_isatty();
+
+    #[cfg(not(target_os = "freebsd"))] // FIXME we should support this on FreeBSD as well
     test_clocks();
+
+    test_dlsym();
 
     test_memcpy();
     test_strcpy();
 
+    #[cfg(not(target_os = "macos"))] // reallocarray does not exist on macOS
+    test_reallocarray();
+
+    // These are Linux-specific
     #[cfg(target_os = "linux")]
     {
         test_posix_fadvise();

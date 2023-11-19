@@ -5,6 +5,7 @@
 // the page, so we don't see major layout changes during the load of the page.
 "use strict";
 
+const builtinThemes = ["light", "dark", "ayu"];
 const darkThemes = ["dark", "ayu"];
 window.currentTheme = document.getElementById("themeStyle");
 
@@ -108,7 +109,7 @@ function getCurrentValue(name) {
 // Get a value from the rustdoc-vars div, which is used to convey data from
 // Rust to the JS. If there is no such element, return null.
 const getVar = (function getVar(name) {
-    const el = document.getElementById("rustdoc-vars");
+    const el = document.querySelector("head > meta[name='rustdoc-vars']");
     return el ? el.attributes["data-" + name].value : null;
 });
 
@@ -119,19 +120,32 @@ function switchTheme(newThemeName, saveTheme) {
         updateLocalStorage("theme", newThemeName);
     }
 
-    let newHref;
+    document.documentElement.setAttribute("data-theme", newThemeName);
 
-    if (newThemeName === "light" || newThemeName === "dark" || newThemeName === "ayu") {
-        newHref = getVar("static-root-path") + getVar("theme-" + newThemeName + "-css");
+    if (builtinThemes.indexOf(newThemeName) !== -1) {
+        if (window.currentTheme) {
+            window.currentTheme.parentNode.removeChild(window.currentTheme);
+            window.currentTheme = null;
+        }
     } else {
-        newHref = getVar("root-path") + newThemeName + getVar("resource-suffix") + ".css";
-    }
-
-    if (!window.currentTheme) {
-        document.write(`<link rel="stylesheet" id="themeStyle" href="${newHref}">`);
-        window.currentTheme = document.getElementById("themeStyle");
-    } else if (newHref !== window.currentTheme.href) {
-        window.currentTheme.href = newHref;
+        const newHref = getVar("root-path") + newThemeName +
+            getVar("resource-suffix") + ".css";
+        if (!window.currentTheme) {
+            // If we're in the middle of loading, document.write blocks
+            // rendering, but if we are done, it would blank the page.
+            if (document.readyState === "loading") {
+                document.write(`<link rel="stylesheet" id="themeStyle" href="${newHref}">`);
+                window.currentTheme = document.getElementById("themeStyle");
+            } else {
+                window.currentTheme = document.createElement("link");
+                window.currentTheme.rel = "stylesheet";
+                window.currentTheme.id = "themeStyle";
+                window.currentTheme.href = newHref;
+                document.documentElement.appendChild(window.currentTheme);
+            }
+        } else if (newHref !== window.currentTheme.href) {
+            window.currentTheme.href = newHref;
+        }
     }
 }
 
@@ -185,7 +199,7 @@ updateTheme();
 if (getSettingValue("source-sidebar-show") === "true") {
     // At this point in page load, `document.body` is not available yet.
     // Set a class on the `<html>` element instead.
-    addClass(document.documentElement, "source-sidebar-expanded");
+    addClass(document.documentElement, "src-sidebar-expanded");
 }
 
 // If we navigate away (for example to a settings page), and then use the back or

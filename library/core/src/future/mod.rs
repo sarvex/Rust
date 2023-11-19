@@ -38,7 +38,7 @@ pub use poll_fn::{poll_fn, PollFn};
 
 /// This type is needed because:
 ///
-/// a) Generators cannot implement `for<'a, 'b> Generator<&'a mut Context<'b>>`, so we need to pass
+/// a) Coroutines cannot implement `for<'a, 'b> Coroutine<&'a mut Context<'b>>`, so we need to pass
 ///    a raw pointer (see <https://github.com/rust-lang/rust/issues/68923>).
 /// b) Raw pointers and `NonNull` aren't `Send` or `Sync`, so that would make every single future
 ///    non-Send/Sync as well, and we don't want that.
@@ -65,11 +65,4 @@ pub unsafe fn get_context<'a, 'b>(cx: ResumeTy) -> &'a mut Context<'b> {
     // SAFETY: the caller must guarantee that `cx.0` is a valid pointer
     // that fulfills all the requirements for a mutable reference.
     unsafe { &mut *cx.0.as_ptr().cast() }
-}
-
-#[doc(hidden)]
-#[unstable(feature = "gen_future", issue = "50547")]
-#[inline]
-pub const fn identity_future<O, Fut: Future<Output = O>>(f: Fut) -> Fut {
-    f
 }

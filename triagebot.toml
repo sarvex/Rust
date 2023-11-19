@@ -13,14 +13,27 @@ allow-unauthenticated = [
     "WG-*",
     "beta-nominated",
     "const-hack",
-    "llvm-main",
+    "llvm-*",
     "needs-fcp",
     "relnotes",
     "requires-*",
     "regression-*",
     "perf-*",
     "AsyncAwait-OnDeck",
+    "needs-triage",
 ]
+
+[review-submitted]
+# This label is added when a "request changes" review is submitted.
+reviewed_label = "S-waiting-on-author"
+# These labels are removed when a "request changes" review is submitted.
+review_labels = ["S-waiting-on-review"]
+
+[review-requested]
+# Those labels are removed when PR author requests a review from an assignee
+remove_labels = ["S-waiting-on-author"]
+# Those labels are added when PR author requests a review from an assignee
+add_labels = ["S-waiting-on-review"]
 
 [glacier]
 
@@ -176,6 +189,98 @@ exclude_labels = [
     "T-*",
 ]
 
+[autolabel."O-android"]
+trigger_files = [
+    "library/std/src/os/android"
+]
+
+[autolabel."O-fuchsia"]
+trigger_files = [
+    "library/std/src/os/fuchsia"
+]
+
+[autolabel."O-hermit"]
+trigger_files = [
+    "library/std/src/sys/hermit",
+    "library/std/src/os/hermit"
+]
+
+[autolabel."O-ios"]
+trigger_files = [
+    "library/std/src/os/ios"
+]
+
+[autolabel."O-itron"]
+trigger_files = [
+    "library/std/src/sys/itron"
+]
+
+[autolabel."O-linux"]
+trigger_files = [
+    "library/std/src/os/linux"
+]
+
+[autolabel."O-macos"]
+trigger_files = [
+    "library/std/src/os/macos"
+]
+
+[autolabel."O-netbsd"]
+trigger_files = [
+    "library/std/src/os/netbsd"
+]
+
+[autolabel."O-redox"]
+trigger_files = [
+    "library/std/src/os/redox"
+]
+
+[autolabel."O-SGX"]
+trigger_files = [
+    "library/std/src/sys/sgx",
+    "library/std/src/os/fortanix_sgx"
+]
+
+[autolabel."O-solaris"]
+trigger_files = [
+    "library/std/src/os/solaris"
+]
+
+[autolabel."O-solid"]
+trigger_files = [
+    "library/std/src/sys/solid",
+    "library/std/src/os/solid"
+]
+
+[autolabel."O-unix"]
+trigger_files = [
+    "library/std/src/sys/unix",
+    "library/std/src/os/unix"
+]
+
+[autolabel."O-wasi"]
+trigger_files = [
+    "library/std/src/sys/wasi",
+    "library/std/src/os/wasi"
+]
+
+[autolabel."O-wasm"]
+trigger_files = [
+    "library/std/src/sys/wasm",
+    "library/std/src/os/wasm"
+]
+
+[autolabel."O-watchos"]
+trigger_files = [
+    "library/std/src/os/watchos"
+]
+
+[autolabel."O-windows"]
+trigger_files = [
+    "library/std/src/sys/windows",
+    "library/std/src/os/windows"
+]
+
 [autolabel."T-bootstrap"]
 trigger_files = [
     "x.py",
@@ -190,6 +295,7 @@ trigger_files = [
     "src/stage0.json",
     "src/tools/compiletest",
     "src/tools/tidy",
+    "src/tools/rustdoc-gui-test",
 ]
 
 [autolabel."T-infra"]
@@ -253,10 +359,16 @@ trigger_files = [
 [autolabel."S-waiting-on-review"]
 new_pr = true
 
+[autolabel."needs-triage"]
+new_issue = true
+exclude_labels = [
+    "C-tracking-issue"
+]
+
 [autolabel."WG-trait-system-refactor"]
 trigger_files = [
     "compiler/rustc_trait_selection/src/solve",
-    "compiler/rustc_middle/src/traits/solve.rs"
+    "compiler/rustc_middle/src/traits/solve"
 ]
 
 [notify-zulip."I-prioritize"]
@@ -302,6 +414,10 @@ message_on_add = """\
 Issue #{number} "{title}" has been added.
 """
 
+[no-merges]
+exclude_titles = ["Rollup of", "subtree update", "Subtree update"]
+labels = ["has-merge-commits", "S-waiting-on-author"]
+
 [github-releases]
 format = "rustc"
 project-name = "Rust"
@@ -309,14 +425,6 @@ changelog-path = "RELEASES.md"
 changelog-branch = "master"
 
 [shortcut]
-
-
-[mentions."compiler/rustc_apfloat"]
-message = """
-Changes rustc_apfloat. rustc_apfloat is currently in limbo and you almost \
-certainly don't want to change it (see #55993).
-"""
-cc = ["@eddyb"]
 
 [mentions."compiler/rustc_codegen_cranelift"]
 cc = ["@bjorn3"]
@@ -371,30 +479,13 @@ cc = ["@GuillaumeGomez"]
 message = "Some changes might have occurred in exhaustiveness checking"
 cc = ["@Nadrieril"]
 
-[mentions."library"]
+[mentions."library/portable-simd"]
 message = """
-Hey! It looks like you've submitted a new PR for the library teams!
-
-If this PR contains changes to any `rust-lang/rust` public library APIs then \
-please comment with `@rustbot label +T-libs-api -T-libs` to tag it \
-appropriately. If this PR contains changes to any unstable APIs please edit \
-the PR description to add a link to the relevant [API Change \
-Proposal](https://std-dev-guide.rust-lang.org/feature-lifecycle/api-change-proposals.html) \
-or [create one](https://github.com/rust-lang/libs-team/issues/new?assignees=&labels=api-change-proposal%2C+T-libs-api&template=api-change-proposal.md&title=%28My+API+Change+Proposal%29) \
-if you haven't already. If you're unsure where your change falls no worries, \
-just leave it as is and the reviewer will take a look and make a decision to \
-forward on if necessary.
-
-Examples of `T-libs-api` changes:
-
-* Stabilizing library features
-* Introducing insta-stable changes such as new implementations of existing \
-  stable traits on existing stable types
-* Introducing new or changing existing unstable library APIs (excluding \
-  permanently unstable features / features without a tracking issue)
-* Changing public documentation in ways that create new stability guarantees
-* Changing observable runtime behavior of library APIs
+Portable SIMD is developed in its own repository. If possible, consider \
+making this change to [rust-lang/portable-simd](https://github.com/rust-lang/portable-simd) \
+instead.
 """
+cc = ["@calebzulawski", "@programmerjake"]
 
 [mentions."src/librustdoc/clean/types.rs"]
 cc = ["@camelid"]
@@ -403,12 +494,15 @@ cc = ["@camelid"]
 message = "Some changes occurred in HTML/CSS/JS."
 cc = [
     "@GuillaumeGomez",
-    "@Folyd",
     "@jsha",
 ]
 
 [mentions."src/librustdoc/html/static/css/themes"]
 message = "Some changes occurred in HTML/CSS themes."
+cc = ["@GuillaumeGomez"]
+
+[mentions."tests/rustdoc-gui/"]
+message = "Some changes occurred in GUI tests."
 cc = ["@GuillaumeGomez"]
 
 [mentions."src/librustdoc/html/static/css/themes/ayu.css"]
@@ -460,9 +554,9 @@ cc = ["@davidtwco", "@compiler-errors", "@JohnTitor", "@TaKO8Ki"]
 message = "`rustc_macros::diagnostics` was changed"
 cc = ["@davidtwco", "@compiler-errors", "@JohnTitor", "@TaKO8Ki"]
 
-[mentions."compiler/rustc_smir"]
+[mentions."compiler/stable_mir"]
 message = "This PR changes Stable MIR"
-cc = ["@oli-obk", "@celinval"]
+cc = ["@oli-obk", "@celinval", "@spastorino", "@ouz-a"]
 
 [mentions."compiler/rustc_target/src/spec"]
 message = """
@@ -484,10 +578,24 @@ Otherwise, you can ignore this comment.
 [mentions."src/tools/x"]
 message = "`src/tools/x` was changed. Bump version of Cargo.toml in `src/tools/x` so tidy will suggest installing the new version."
 
+[mentions."src/tools/tidy/src/deps.rs"]
+message = "The list of allowed third-party dependencies may have been modified! You must ensure that any new dependencies have compatible licenses before merging."
+cc = ["@davidtwco", "@wesleywiser"]
+
+[mentions."src/bootstrap/src/core/config"]
+message = "This PR modifies `src/bootstrap/src/core/config`. If appropriate, please also update `CONFIG_CHANGE_HISTORY` in `src/bootstrap/src/lib.rs` and `change-id` in `config.example.toml`."
+[mentions."src/bootstrap/defaults"]
+message = "This PR modifies `src/bootstrap/defaults`. If appropriate, please also update `CONFIG_CHANGE_HISTORY` in `src/bootstrap/src/lib.rs` and `change-id` in `config.example.toml`."
+[mentions."config.example.toml"]
+message = "This PR changes `config.example.toml`. If appropriate, please also update `CONFIG_CHANGE_HISTORY` in `src/bootstrap/src/lib.rs` and `change-id` in `config.example.toml`."
+
 [mentions."src/bootstrap/defaults/config.compiler.toml"]
 message = "This PR changes src/bootstrap/defaults/config.compiler.toml. If appropriate, please also update `config.codegen.toml` so the defaults are in sync."
 [mentions."src/bootstrap/defaults/config.codegen.toml"]
 message = "This PR changes src/bootstrap/defaults/config.codegen.toml. If appropriate, please also update `config.compiler.toml` so the defaults are in sync."
+
+[mentions."src/bootstrap/src/core/build_steps/llvm.rs"]
+message = "This PR changes how LLVM is built. Consider updating src/bootstrap/download-ci-llvm-stamp."
 
 [mentions."tests/ui/deriving/deriving-all-codegen.stdout"]
 message = "Changes to the code generated for builtin derived traits."
@@ -500,19 +608,18 @@ cc = ["@nnethercote"]
 [assign]
 warn_non_default_branch = true
 contributing_url = "https://rustc-dev-guide.rust-lang.org/getting-started.html"
+users_on_vacation = ["jyn514", "WaffleLapkin", "oli-obk"]
 
 [assign.adhoc_groups]
 compiler-team = [
     "@cjgillot",
+    "@compiler-errors",
     "@petrochenkov",
     "@davidtwco",
     "@oli-obk",
-    "@lcnr",
     "@wesleywiser",
 ]
 compiler-team-contributors = [
-    "@compiler-errors",
-    "@jackh726",
     "@TaKO8Ki",
     "@WaffleLapkin",
     "@b-naber",
@@ -531,16 +638,18 @@ libs = [
 bootstrap = [
     "@Mark-Simulacrum",
     "@albertlarsan68",
-    "@ozkanonur",
+    "@onur-ozkan",
+    "@clubby789",
 ]
 infra-ci = [
     "@Mark-Simulacrum",
-    "@pietroalbini",
+    "@Kobzol",
 ]
 rustdoc = [
     "@jsha",
     "@GuillaumeGomez",
     "@notriddle",
+    "@fmease",
 ]
 docs = [
     "@ehuss",
@@ -584,6 +693,7 @@ types = [
     "@lcnr",
     "@oli-obk",
     "@spastorino",
+    "@BoxyUwU",
 ]
 borrowck = [
     "@davidtwco",
@@ -603,12 +713,18 @@ style-team = [
     "@yaahc",
 ]
 
+project-stable-mir = [
+    "@celinval",
+    "@oli-obk",
+    "@spastorino",
+    "@ouz-a",
+]
+
 [assign.owners]
 "/.github/workflows" =                       ["infra-ci"]
 "/Cargo.lock" =                              ["@Mark-Simulacrum"]
 "/Cargo.toml" =                              ["@Mark-Simulacrum"]
 "/compiler" =                                ["compiler"]
-"/compiler/rustc_apfloat" =                  ["@eddyb"]
 "/compiler/rustc_ast" =                      ["compiler", "parser"]
 "/compiler/rustc_ast_lowering" =             ["compiler", "ast_lowering"]
 "/compiler/rustc_hir_analysis" =             ["compiler", "types"]
@@ -616,9 +732,11 @@ style-team = [
 "/compiler/rustc_llvm" =                     ["@cuviper"]
 "/compiler/rustc_middle/src/mir" =           ["compiler", "mir"]
 "/compiler/rustc_middle/src/traits" =        ["compiler", "types"]
+"/compiler/rustc_middle/src/ty" =            ["compiler", "types"]
 "/compiler/rustc_const_eval/src/interpret" = ["compiler", "mir"]
 "/compiler/rustc_const_eval/src/transform" = ["compiler", "mir-opt"]
 "/compiler/rustc_mir_build/src/build" =      ["compiler", "mir"]
+"/compiler/rustc_smir" =                     ["project-stable-mir"]
 "/compiler/rustc_parse" =                    ["compiler", "parser"]
 "/compiler/rustc_parse/src/lexer" =          ["compiler", "lexer"]
 "/compiler/rustc_query_impl" =               ["compiler", "query-system"]
@@ -626,8 +744,9 @@ style-team = [
 "/compiler/rustc_trait_selection" =          ["compiler", "types"]
 "/compiler/rustc_traits" =                   ["compiler", "types"]
 "/compiler/rustc_type_ir" =                  ["compiler", "types"]
+"/compiler/stable_mir" =                     ["project-stable-mir"]
 "/library/alloc" =                           ["libs"]
-"/library/core" =                            ["libs", "@scottmcm"]
+"/library/core" =                            ["libs"]
 "/library/panic_abort" =                     ["libs"]
 "/library/panic_unwind" =                    ["libs"]
 "/library/proc_macro" =                      ["@petrochenkov"]
@@ -663,3 +782,4 @@ style-team = [
 "/src/tools/rustdoc-themes" =                ["rustdoc"]
 "/src/tools/tidy" =                          ["bootstrap"]
 "/src/tools/x" =                             ["bootstrap"]
+"/src/tools/rustdoc-gui-test" =              ["bootstrap", "@onur-ozkan"]

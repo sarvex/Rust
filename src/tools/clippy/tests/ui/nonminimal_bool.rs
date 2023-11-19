@@ -1,6 +1,8 @@
+//@no-rustfix: overlapping suggestions
 #![feature(lint_reasons)]
-#![allow(unused, clippy::diverging_sub_expression)]
+#![allow(unused, clippy::diverging_sub_expression, clippy::needless_if)]
 #![warn(clippy::nonminimal_bool)]
+#![allow(clippy::useless_vec)]
 
 fn main() {
     let a: bool = unimplemented!();
@@ -9,15 +11,23 @@ fn main() {
     let d: bool = unimplemented!();
     let e: bool = unimplemented!();
     let _ = !true;
+    //~^ ERROR: this boolean expression can be simplified
+    //~| NOTE: `-D clippy::nonminimal-bool` implied by `-D warnings`
     let _ = !false;
+    //~^ ERROR: this boolean expression can be simplified
     let _ = !!a;
+    //~^ ERROR: this boolean expression can be simplified
     let _ = false || a;
+    //~^ ERROR: this boolean expression can be simplified
     // don't lint on cfgs
     let _ = cfg!(you_shall_not_not_pass) && a;
     let _ = a || !b || !c || !d || !e;
     let _ = !(!a && b);
+    //~^ ERROR: this boolean expression can be simplified
     let _ = !(!a || b);
+    //~^ ERROR: this boolean expression can be simplified
     let _ = !a && !(b && c);
+    //~^ ERROR: this boolean expression can be simplified
 }
 
 fn equality_stuff() {
@@ -26,10 +36,15 @@ fn equality_stuff() {
     let c: i32 = unimplemented!();
     let d: i32 = unimplemented!();
     let _ = a == b && c == 5 && a == b;
+    //~^ ERROR: this boolean expression can be simplified
     let _ = a == b || c == 5 || a == b;
+    //~^ ERROR: this boolean expression can be simplified
     let _ = a == b && c == 5 && b == a;
+    //~^ ERROR: this boolean expression can be simplified
     let _ = a != b || !(a != b || c == d);
+    //~^ ERROR: this boolean expression can be simplified
     let _ = a != b && !(a != b && c == d);
+    //~^ ERROR: this boolean expression can be simplified
 }
 
 fn issue3847(a: u32, b: u32) -> bool {
@@ -60,6 +75,7 @@ fn check_expect() {
 
 fn issue9428() {
     if matches!(true, true) && true {
+        //~^ ERROR: this boolean expression can be simplified
         println!("foo");
     }
 }
@@ -109,4 +125,18 @@ fn issue_10435() {
     if !(x == [0]) {
         println!("{}", line!());
     }
+}
+
+fn issue10836() {
+    struct Foo(bool);
+    impl std::ops::Not for Foo {
+        type Output = bool;
+
+        fn not(self) -> Self::Output {
+            !self.0
+        }
+    }
+
+    // Should not lint
+    let _: bool = !!Foo(true);
 }

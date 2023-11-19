@@ -4,6 +4,13 @@
 
 "use strict";
 
+// The amount of time that the cursor must remain still over a hover target before
+// revealing a tooltip.
+//
+// https://www.nngroup.com/articles/timing-exposing-content/
+window.RUSTDOC_TOOLTIP_HOVER_MS = 300;
+window.RUSTDOC_TOOLTIP_HOVER_EXIT_MS = 450;
+
 // Given a basename (e.g. "storage") and an extension (e.g. ".js"), return a URL
 // for a resource under the root-path, with the resource-suffix.
 function resourcePath(basename, extension) {
@@ -42,10 +49,17 @@ window.currentCrate = getVar("current-crate");
 function setMobileTopbar() {
     // FIXME: It would be nicer to generate this text content directly in HTML,
     // but with the current code it's hard to get the right information in the right place.
-    const mobileLocationTitle = document.querySelector(".mobile-topbar h2");
+    const mobileTopbar = document.querySelector(".mobile-topbar");
     const locationTitle = document.querySelector(".sidebar h2.location");
-    if (mobileLocationTitle && locationTitle) {
-        mobileLocationTitle.innerHTML = locationTitle.innerHTML;
+    if (mobileTopbar) {
+        const mobileTitle = document.createElement("h2");
+        mobileTitle.className = "location";
+        if (hasClass(document.querySelector(".rustdoc"), "crate")) {
+            mobileTitle.innerText = `Crate ${window.currentCrate}`;
+        } else if (locationTitle) {
+            mobileTitle.innerHTML = locationTitle.innerHTML;
+        }
+        mobileTopbar.appendChild(mobileTitle);
     }
 }
 
@@ -169,13 +183,6 @@ function browserSupportsHistoryApi() {
     return window.history && typeof window.history.pushState === "function";
 }
 
-function loadCss(cssUrl) {
-    const link = document.createElement("link");
-    link.href = cssUrl;
-    link.rel = "stylesheet";
-    document.getElementsByTagName("head")[0].appendChild(link);
-}
-
 function preLoadCss(cssUrl) {
     // https://developer.mozilla.org/en-US/docs/Web/HTML/Link_types/preload
     const link = document.createElement("link");
@@ -203,11 +210,7 @@ function preLoadCss(cssUrl) {
         event.preventDefault();
         // Sending request for the CSS and the JS files at the same time so it will
         // hopefully be loaded when the JS will generate the settings content.
-        loadCss(getVar("static-root-path") + getVar("settings-css"));
         loadScript(getVar("static-root-path") + getVar("settings-js"));
-        preLoadCss(getVar("static-root-path") + getVar("theme-light-css"));
-        preLoadCss(getVar("static-root-path") + getVar("theme-dark-css"));
-        preLoadCss(getVar("static-root-path") + getVar("theme-ayu-css"));
         // Pre-load all theme CSS files, so that switching feels seamless.
         //
         // When loading settings.html as a standalone page, the equivalent HTML is
@@ -270,13 +273,17 @@ function preLoadCss(cssUrl) {
             searchState.mouseMovedAfterSearch = false;
             document.title = searchState.title;
         },
-        hideResults: () => {
-            switchDisplayedElement(null);
+        removeQueryParameters: () => {
+            // We change the document title.
             document.title = searchState.titleBeforeSearch;
-            // We also remove the query parameter from the URL.
             if (browserSupportsHistoryApi()) {
                 history.replaceState(null, "", getNakedUrl() + window.location.hash);
             }
+        },
+        hideResults: () => {
+            switchDisplayedElement(null);
+            // We also remove the query parameter from the URL.
+            searchState.removeQueryParameters();
         },
         getQueryStringParams: () => {
             const params = {};
@@ -350,6 +357,34 @@ function preLoadCss(cssUrl) {
             savedHash = pageId;
             if (pageId !== "") {
                 expandSection(pageId);
+            }
+        }
+        if (savedHash.startsWith("impl-")) {
+            // impl-disambiguated links, used by the search engine
+            // format: impl-X[-for-Y]/method.WHATEVER
+            // turn this into method.WHATEVER[-NUMBER]
+            const splitAt = savedHash.indexOf("/");
+            if (splitAt !== -1) {
+                const implId = savedHash.slice(0, splitAt);
+                const assocId = savedHash.slice(splitAt + 1);
+                const implElem = document.getElementById(implId);
+                if (implElem && implElem.parentElement.tagName === "SUMMARY" &&
+                    implElem.parentElement.parentElement.tagName === "DETAILS") {
+                    onEachLazy(implElem.parentElement.parentElement.querySelectorAll(
+                        `[id^="${assocId}"]`),
+                        item => {
+                            const numbered = /([^-]+)-([0-9]+)/.exec(item.id);
+                            if (item.id === assocId || (numbered && numbered[1] === assocId)) {
+                                openParentDetails(item);
+                                item.scrollIntoView();
+                                // Let the section expand itself before trying to highlight
+                                setTimeout(() => {
+                                    window.location.replace("#" + item.id);
+                                }, 0);
+                            }
+                        }
+                    );
+                }
             }
         }
     }
@@ -450,22 +485,27 @@ function preLoadCss(cssUrl) {
                 return;
             }
 
+            const modpath = hasClass(document.querySelector(".rustdoc"), "mod") ? "../" : "";
+
             const h3 = document.createElement("h3");
-            h3.innerHTML = `<a href="index.html#${id}">${longty}</a>`;
+            h3.innerHTML = `<a href="${modpath}index.html#${id}">${longty}</a>`;
             const ul = document.createElement("ul");
             ul.className = "block " + shortty;
 
             for (const name of filtered) {
                 let path;
                 if (shortty === "mod") {
-                    path = name + "/index.html";
+                    path = `${modpath}${name}/index.html`;
                 } else {
-                    path = shortty + "." + name + ".html";
+                    path = `${modpath}${shortty}.${name}.html`;
                 }
-                const current_page = document.location.href.split("/").pop();
+                let current_page = document.location.href.toString();
+                if (current_page.endsWith("/")) {
+                    current_page += "index.html";
+                }
                 const link = document.createElement("a");
                 link.href = path;
-                if (path === current_page) {
+                if (link.href === current_page) {
                     link.className = "current";
                 }
                 link.textContent = name;
@@ -478,23 +518,38 @@ function preLoadCss(cssUrl) {
         }
 
         if (sidebar) {
+            // keep this synchronized with ItemSection::ALL in html/render/mod.rs
+            // Re-exports aren't shown here, because they don't have child pages
+            //block("reexport", "reexports", "Re-exports");
             block("primitive", "primitives", "Primitive Types");
             block("mod", "modules", "Modules");
             block("macro", "macros", "Macros");
             block("struct", "structs", "Structs");
             block("enum", "enums", "Enums");
-            block("union", "unions", "Unions");
             block("constant", "constants", "Constants");
             block("static", "static", "Statics");
             block("trait", "traits", "Traits");
             block("fn", "functions", "Functions");
-            block("type", "types", "Type Definitions");
+            block("type", "types", "Type Aliases");
+            block("union", "unions", "Unions");
+            // No point, because these items don't appear in modules
+            //block("impl", "impls", "Implementations");
+            //block("tymethod", "tymethods", "Type Methods");
+            //block("method", "methods", "Methods");
+            //block("structfield", "fields", "Fields");
+            //block("variant", "variants", "Variants");
+            //block("associatedtype", "associated-types", "Associated Types");
+            //block("associatedconstant", "associated-consts", "Associated Constants");
             block("foreigntype", "foreign-types", "Foreign Types");
             block("keyword", "keywords", "Keywords");
+            block("opaque", "opaque-types", "Opaque Types");
+            block("attr", "attributes", "Attribute Macros");
+            block("derive", "derives", "Derive Macros");
             block("traitalias", "trait-aliases", "Trait Aliases");
         }
     }
 
+    // <https://github.com/search?q=repo%3Arust-lang%2Frust+[RUSTDOCIMPL]+trait.impl&type=code>
     window.register_implementors = imp => {
         const implementors = document.getElementById("implementors-list");
         const synthetic_implementors = document.getElementById("synthetic-implementors-list");
@@ -561,7 +616,7 @@ function preLoadCss(cssUrl) {
                 onEachLazy(code.getElementsByTagName("a"), elem => {
                     const href = elem.getAttribute("href");
 
-                    if (href && !/^(?:[a-z+]+:)?\/\//.test(href)) {
+                    if (href && !href.startsWith("#") && !/^(?:[a-z+]+:)?\/\//.test(href)) {
                         elem.setAttribute("href", window.rootPath + href);
                     }
                 });
@@ -583,6 +638,216 @@ function preLoadCss(cssUrl) {
     };
     if (window.pending_implementors) {
         window.register_implementors(window.pending_implementors);
+    }
+
+    /**
+     * <https://github.com/search?q=repo%3Arust-lang%2Frust+[RUSTDOCIMPL]+type.impl&type=code>
+     *
+     * [RUSTDOCIMPL] type.impl
+     *
+     * This code inlines implementations into the type alias docs at runtime. It's done at
+     * runtime because some crates have many type aliases and many methods, and we don't want
+     * to generate *O*`(types*methods)` HTML text. The data inside is mostly HTML fragments,
+     * wrapped in JSON.
+     *
+     * - It only includes docs generated for the current crate. This function accepts an
+     *   object mapping crate names to the set of impls.
+     *
+     * - It filters down to the set of applicable impls. The Rust type checker is used to
+     *   tag each HTML blob with the set of type aliases that can actually use it, so the
+     *   JS only needs to consult the attached list of type aliases.
+     *
+     * - It renames the ID attributes, to avoid conflicting IDs in the resulting DOM.
+     *
+     * - It adds the necessary items to the sidebar. If it's an inherent impl, that means
+     *   adding methods, associated types, and associated constants. If it's a trait impl,
+     *   that means adding it to the trait impl sidebar list.
+     *
+     * - It adds the HTML block itself. If it's an inherent impl, it goes after the type
+     *   alias's own inherent impls. If it's a trait impl, it goes in the Trait
+     *   Implementations section.
+     *
+     * - After processing all of the impls, it sorts the sidebar items by name.
+     *
+     * @param {{[cratename: string]: Array<Array<string|0>>}} impl
+     */
+    window.register_type_impls = imp => {
+        if (!imp || !imp[window.currentCrate]) {
+            return;
+        }
+        window.pending_type_impls = null;
+        const idMap = new Map();
+
+        let implementations = document.getElementById("implementations-list");
+        let trait_implementations = document.getElementById("trait-implementations-list");
+        let trait_implementations_header = document.getElementById("trait-implementations");
+
+        // We want to include the current type alias's impls, and no others.
+        const script = document.querySelector("script[data-self-path]");
+        const selfPath = script ? script.getAttribute("data-self-path") : null;
+
+        // These sidebar blocks need filled in, too.
+        const mainContent = document.querySelector("#main-content");
+        const sidebarSection = document.querySelector(".sidebar section");
+        let methods = document.querySelector(".sidebar .block.method");
+        let associatedTypes = document.querySelector(".sidebar .block.associatedtype");
+        let associatedConstants = document.querySelector(".sidebar .block.associatedconstant");
+        let sidebarTraitList = document.querySelector(".sidebar .block.trait-implementation");
+
+        for (const impList of imp[window.currentCrate]) {
+            const types = impList.slice(2);
+            const text = impList[0];
+            const isTrait = impList[1] !== 0;
+            const traitName = impList[1];
+            if (types.indexOf(selfPath) === -1) {
+                continue;
+            }
+            let outputList = isTrait ? trait_implementations : implementations;
+            if (outputList === null) {
+                const outputListName = isTrait ? "Trait Implementations" : "Implementations";
+                const outputListId = isTrait ?
+                    "trait-implementations-list" :
+                    "implementations-list";
+                const outputListHeaderId = isTrait ? "trait-implementations" : "implementations";
+                const outputListHeader = document.createElement("h2");
+                outputListHeader.id = outputListHeaderId;
+                outputListHeader.innerText = outputListName;
+                outputList = document.createElement("div");
+                outputList.id = outputListId;
+                if (isTrait) {
+                    const link = document.createElement("a");
+                    link.href = `#${outputListHeaderId}`;
+                    link.innerText = "Trait Implementations";
+                    const h = document.createElement("h3");
+                    h.appendChild(link);
+                    trait_implementations = outputList;
+                    trait_implementations_header = outputListHeader;
+                    sidebarSection.appendChild(h);
+                    sidebarTraitList = document.createElement("ul");
+                    sidebarTraitList.className = "block trait-implementation";
+                    sidebarSection.appendChild(sidebarTraitList);
+                    mainContent.appendChild(outputListHeader);
+                    mainContent.appendChild(outputList);
+                } else {
+                    implementations = outputList;
+                    if (trait_implementations) {
+                        mainContent.insertBefore(outputListHeader, trait_implementations_header);
+                        mainContent.insertBefore(outputList, trait_implementations_header);
+                    } else {
+                        const mainContent = document.querySelector("#main-content");
+                        mainContent.appendChild(outputListHeader);
+                        mainContent.appendChild(outputList);
+                    }
+                }
+            }
+            const template = document.createElement("template");
+            template.innerHTML = text;
+
+            onEachLazy(template.content.querySelectorAll("a"), elem => {
+                const href = elem.getAttribute("href");
+
+                if (href && !href.startsWith("#") && !/^(?:[a-z+]+:)?\/\//.test(href)) {
+                    elem.setAttribute("href", window.rootPath + href);
+                }
+            });
+            onEachLazy(template.content.querySelectorAll("[id]"), el => {
+                let i = 0;
+                if (idMap.has(el.id)) {
+                    i = idMap.get(el.id);
+                } else if (document.getElementById(el.id)) {
+                    i = 1;
+                    while (document.getElementById(`${el.id}-${2 * i}`)) {
+                        i = 2 * i;
+                    }
+                    while (document.getElementById(`${el.id}-${i}`)) {
+                        i += 1;
+                    }
+                }
+                if (i !== 0) {
+                    const oldHref = `#${el.id}`;
+                    const newHref = `#${el.id}-${i}`;
+                    el.id = `${el.id}-${i}`;
+                    onEachLazy(template.content.querySelectorAll("a[href]"), link => {
+                        if (link.getAttribute("href") === oldHref) {
+                            link.href = newHref;
+                        }
+                    });
+                }
+                idMap.set(el.id, i + 1);
+            });
+            const templateAssocItems = template.content.querySelectorAll("section.tymethod, " +
+                "section.method, section.associatedtype, section.associatedconstant");
+            if (isTrait) {
+                const li = document.createElement("li");
+                const a = document.createElement("a");
+                a.href = `#${template.content.querySelector(".impl").id}`;
+                a.textContent = traitName;
+                li.appendChild(a);
+                sidebarTraitList.append(li);
+            } else {
+                onEachLazy(templateAssocItems, item => {
+                    let block = hasClass(item, "associatedtype") ? associatedTypes : (
+                        hasClass(item, "associatedconstant") ? associatedConstants : (
+                        methods));
+                    if (!block) {
+                        const blockTitle = hasClass(item, "associatedtype") ? "Associated Types" : (
+                            hasClass(item, "associatedconstant") ? "Associated Constants" : (
+                            "Methods"));
+                        const blockClass = hasClass(item, "associatedtype") ? "associatedtype" : (
+                            hasClass(item, "associatedconstant") ? "associatedconstant" : (
+                            "method"));
+                        const blockHeader = document.createElement("h3");
+                        const blockLink = document.createElement("a");
+                        blockLink.href = "#implementations";
+                        blockLink.innerText = blockTitle;
+                        blockHeader.appendChild(blockLink);
+                        block = document.createElement("ul");
+                        block.className = `block ${blockClass}`;
+                        const insertionReference = methods || sidebarTraitList;
+                        if (insertionReference) {
+                            const insertionReferenceH = insertionReference.previousElementSibling;
+                            sidebarSection.insertBefore(blockHeader, insertionReferenceH);
+                            sidebarSection.insertBefore(block, insertionReferenceH);
+                        } else {
+                            sidebarSection.appendChild(blockHeader);
+                            sidebarSection.appendChild(block);
+                        }
+                        if (hasClass(item, "associatedtype")) {
+                            associatedTypes = block;
+                        } else if (hasClass(item, "associatedconstant")) {
+                            associatedConstants = block;
+                        } else {
+                            methods = block;
+                        }
+                    }
+                    const li = document.createElement("li");
+                    const a = document.createElement("a");
+                    a.innerText = item.id.split("-")[0].split(".")[1];
+                    a.href = `#${item.id}`;
+                    li.appendChild(a);
+                    block.appendChild(li);
+                });
+            }
+            outputList.appendChild(template.content);
+        }
+
+        for (const list of [methods, associatedTypes, associatedConstants, sidebarTraitList]) {
+            if (!list) {
+                continue;
+            }
+            const newChildren = Array.prototype.slice.call(list.children);
+            newChildren.sort((a, b) => {
+                const aI = a.innerText;
+                const bI = b.innerText;
+                return aI < bI ? -1 :
+                    aI > bI ? 1 :
+                    0;
+            });
+            list.replaceChildren(...newChildren);
+        }
+    };
+    if (window.pending_type_impls) {
+        window.register_type_impls(window.pending_type_impls);
     }
 
     function addSidebarCrates() {
@@ -772,6 +1037,13 @@ function preLoadCss(cssUrl) {
         });
     });
 
+    /**
+     * Show a tooltip immediately.
+     *
+     * @param {DOMElement} e - The tooltip's anchor point. The DOM is consulted to figure
+     *                         out what the tooltip should contain, and where it should be
+     *                         positioned.
+     */
     function showTooltip(e) {
         const notable_ty = e.getAttribute("data-notable-ty");
         if (!window.NOTABLE_TRAITS && notable_ty) {
@@ -782,8 +1054,10 @@ function preLoadCss(cssUrl) {
                 throw new Error("showTooltip() called with notable without any notable traits!");
             }
         }
+        // Make this function idempotent. If the tooltip is already shown, avoid doing extra work
+        // and leave it alone.
         if (window.CURRENT_TOOLTIP_ELEMENT && window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE === e) {
-            // Make this function idempotent.
+            clearTooltipHoverTimeout(window.CURRENT_TOOLTIP_ELEMENT);
             return;
         }
         window.hideAllModals(false);
@@ -791,11 +1065,18 @@ function preLoadCss(cssUrl) {
         if (notable_ty) {
             wrapper.innerHTML = "<div class=\"content\">" +
                 window.NOTABLE_TRAITS[notable_ty] + "</div>";
-        } else if (e.getAttribute("title") !== undefined) {
-            const titleContent = document.createElement("div");
-            titleContent.className = "content";
-            titleContent.appendChild(document.createTextNode(e.getAttribute("title")));
-            wrapper.appendChild(titleContent);
+        } else {
+            // Replace any `title` attribute with `data-title` to avoid double tooltips.
+            if (e.getAttribute("title") !== null) {
+                e.setAttribute("data-title", e.getAttribute("title"));
+                e.removeAttribute("title");
+            }
+            if (e.getAttribute("data-title") !== null) {
+                const titleContent = document.createElement("div");
+                titleContent.className = "content";
+                titleContent.appendChild(document.createTextNode(e.getAttribute("data-title")));
+                wrapper.appendChild(titleContent);
+            }
         }
         wrapper.className = "tooltip popover";
         const focusCatcher = document.createElement("div");
@@ -824,15 +1105,75 @@ function preLoadCss(cssUrl) {
         wrapper.style.visibility = "";
         window.CURRENT_TOOLTIP_ELEMENT = wrapper;
         window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE = e;
-        wrapper.onpointerleave = function(ev) {
+        clearTooltipHoverTimeout(window.CURRENT_TOOLTIP_ELEMENT);
+        wrapper.onpointerenter = ev => {
             // If this is a synthetic touch event, ignore it. A click event will be along shortly.
             if (ev.pointerType !== "mouse") {
                 return;
             }
-            if (!e.TOOLTIP_FORCE_VISIBLE && !elemIsInParent(event.relatedTarget, e)) {
-                hideTooltip(true);
+            clearTooltipHoverTimeout(e);
+        };
+        wrapper.onpointerleave = ev => {
+            // If this is a synthetic touch event, ignore it. A click event will be along shortly.
+            if (ev.pointerType !== "mouse") {
+                return;
+            }
+            if (!e.TOOLTIP_FORCE_VISIBLE && !elemIsInParent(ev.relatedTarget, e)) {
+                // See "Tooltip pointer leave gesture" below.
+                setTooltipHoverTimeout(e, false);
+                addClass(wrapper, "fade-out");
             }
         };
+    }
+
+    /**
+     * Show or hide the tooltip after a timeout. If a timeout was already set before this function
+     * was called, that timeout gets cleared. If the tooltip is already in the requested state,
+     * this function will still clear any pending timeout, but otherwise do nothing.
+     *
+     * @param {DOMElement} element - The tooltip's anchor point. The DOM is consulted to figure
+     *                               out what the tooltip should contain, and where it should be
+     *                               positioned.
+     * @param {boolean}    show    - If true, the tooltip will be made visible. If false, it will
+     *                               be hidden.
+     */
+    function setTooltipHoverTimeout(element, show) {
+        clearTooltipHoverTimeout(element);
+        if (!show && !window.CURRENT_TOOLTIP_ELEMENT) {
+            // To "hide" an already hidden element, just cancel its timeout.
+            return;
+        }
+        if (show && window.CURRENT_TOOLTIP_ELEMENT) {
+            // To "show" an already visible element, just cancel its timeout.
+            return;
+        }
+        if (window.CURRENT_TOOLTIP_ELEMENT &&
+            window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE !== element) {
+            // Don't do anything if another tooltip is already visible.
+            return;
+        }
+        element.TOOLTIP_HOVER_TIMEOUT = setTimeout(() => {
+            if (show) {
+                showTooltip(element);
+            } else if (!element.TOOLTIP_FORCE_VISIBLE) {
+                hideTooltip(false);
+            }
+        }, show ? window.RUSTDOC_TOOLTIP_HOVER_MS : window.RUSTDOC_TOOLTIP_HOVER_EXIT_MS);
+    }
+
+    /**
+     * If a show/hide timeout was set by `setTooltipHoverTimeout`, cancel it. If none exists,
+     * do nothing.
+     *
+     * @param {DOMElement} element - The tooltip's anchor point,
+     *                               as passed to `setTooltipHoverTimeout`.
+     */
+    function clearTooltipHoverTimeout(element) {
+        if (element.TOOLTIP_HOVER_TIMEOUT !== undefined) {
+            removeClass(window.CURRENT_TOOLTIP_ELEMENT, "fade-out");
+            clearTimeout(element.TOOLTIP_HOVER_TIMEOUT);
+            delete element.TOOLTIP_HOVER_TIMEOUT;
+        }
     }
 
     function tooltipBlurHandler(event) {
@@ -854,6 +1195,12 @@ function preLoadCss(cssUrl) {
         }
     }
 
+    /**
+     * Hide the current tooltip immediately.
+     *
+     * @param {boolean} focus - If set to `true`, move keyboard focus to the tooltip anchor point.
+     *                          If set to `false`, leave keyboard focus alone.
+     */
     function hideTooltip(focus) {
         if (window.CURRENT_TOOLTIP_ELEMENT) {
             if (window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE.TOOLTIP_FORCE_VISIBLE) {
@@ -864,38 +1211,77 @@ function preLoadCss(cssUrl) {
             }
             const body = document.getElementsByTagName("body")[0];
             body.removeChild(window.CURRENT_TOOLTIP_ELEMENT);
+            clearTooltipHoverTimeout(window.CURRENT_TOOLTIP_ELEMENT);
             window.CURRENT_TOOLTIP_ELEMENT = null;
         }
     }
 
     onEachLazy(document.getElementsByClassName("tooltip"), e => {
-        e.onclick = function() {
-            this.TOOLTIP_FORCE_VISIBLE = this.TOOLTIP_FORCE_VISIBLE ? false : true;
-            if (window.CURRENT_TOOLTIP_ELEMENT && !this.TOOLTIP_FORCE_VISIBLE) {
+        e.onclick = () => {
+            e.TOOLTIP_FORCE_VISIBLE = e.TOOLTIP_FORCE_VISIBLE ? false : true;
+            if (window.CURRENT_TOOLTIP_ELEMENT && !e.TOOLTIP_FORCE_VISIBLE) {
                 hideTooltip(true);
             } else {
-                showTooltip(this);
+                showTooltip(e);
                 window.CURRENT_TOOLTIP_ELEMENT.setAttribute("tabindex", "0");
                 window.CURRENT_TOOLTIP_ELEMENT.focus();
                 window.CURRENT_TOOLTIP_ELEMENT.onblur = tooltipBlurHandler;
             }
             return false;
         };
-        e.onpointerenter = function(ev) {
+        e.onpointerenter = ev => {
             // If this is a synthetic touch event, ignore it. A click event will be along shortly.
             if (ev.pointerType !== "mouse") {
                 return;
             }
-            showTooltip(this);
+            setTooltipHoverTimeout(e, true);
         };
-        e.onpointerleave = function(ev) {
+        e.onpointermove = ev => {
             // If this is a synthetic touch event, ignore it. A click event will be along shortly.
             if (ev.pointerType !== "mouse") {
                 return;
             }
-            if (!this.TOOLTIP_FORCE_VISIBLE &&
+            setTooltipHoverTimeout(e, true);
+        };
+        e.onpointerleave = ev => {
+            // If this is a synthetic touch event, ignore it. A click event will be along shortly.
+            if (ev.pointerType !== "mouse") {
+                return;
+            }
+            if (!e.TOOLTIP_FORCE_VISIBLE &&
                 !elemIsInParent(ev.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT)) {
-                hideTooltip(true);
+                // Tooltip pointer leave gesture:
+                //
+                // Designing a good hover microinteraction is a matter of guessing user
+                // intent from what are, literally, vague gestures. In this case, guessing if
+                // hovering in or out of the tooltip base is intentional or not.
+                //
+                // To figure this out, a few different techniques are used:
+                //
+                // * When the mouse pointer enters a tooltip anchor point, its hitbox is grown
+                //   on the bottom, where the popover is/will appear. Search "hover tunnel" in
+                //   rustdoc.css for the implementation.
+                // * There's a delay when the mouse pointer enters the popover base anchor, in
+                //   case the mouse pointer was just passing through and the user didn't want
+                //   to open it.
+                // * Similarly, a delay is added when exiting the anchor, or the popover
+                //   itself, before hiding it.
+                // * A fade-out animation is layered onto the pointer exit delay to immediately
+                //   inform the user that they successfully dismissed the popover, while still
+                //   providing a way for them to cancel it if it was a mistake and they still
+                //   wanted to interact with it.
+                // * No animation is used for revealing it, because we don't want people to try
+                //   to interact with an element while it's in the middle of fading in: either
+                //   they're allowed to interact with it while it's fading in, meaning it can't
+                //   serve as mistake-proofing for the popover, or they can't, but
+                //   they might try and be frustrated.
+                //
+                // See also:
+                // * https://www.nngroup.com/articles/timing-exposing-content/
+                // * https://www.nngroup.com/articles/tooltip-guidelines/
+                // * https://bjk5.com/post/44698559168/breaking-down-amazons-mega-dropdown
+                setTooltipHoverTimeout(e, false);
+                addClass(window.CURRENT_TOOLTIP_ELEMENT, "fade-out");
             }
         };
     });
@@ -918,9 +1304,10 @@ function preLoadCss(cssUrl) {
 
     function buildHelpMenu() {
         const book_info = document.createElement("span");
+        const channel = getVar("channel");
         book_info.className = "top";
-        book_info.innerHTML = "You can find more information in \
-            <a href=\"https://doc.rust-lang.org/rustdoc/\">the rustdoc book</a>.";
+        book_info.innerHTML = `You can find more information in \
+<a href="https://doc.rust-lang.org/${channel}/rustdoc/">the rustdoc book</a>.`;
 
         const shortcuts = [
             ["?", "Show this help dialog"],
@@ -940,6 +1327,9 @@ function preLoadCss(cssUrl) {
         div_shortcuts.innerHTML = "<h2>Keyboard Shortcuts</h2><dl>" + shortcuts + "</dl></div>";
 
         const infos = [
+            `For a full list of all search features, take a look <a \
+href="https://doc.rust-lang.org/${channel}/rustdoc/how-to-read-rustdoc.html\
+#the-search-interface">here</a>.`,
             "Prefix searches with a type followed by a colon (e.g., <code>fn:</code>) to \
              restrict the search to a given item kind.",
             "Accepted kinds are: <code>fn</code>, <code>mod</code>, <code>struct</code>, \
@@ -949,6 +1339,10 @@ function preLoadCss(cssUrl) {
              <code>-&gt; vec</code> or <code>String, enum:Cow -&gt; bool</code>)",
             "You can look for items with an exact name by putting double quotes around \
              your request: <code>\"string\"</code>",
+             "Look for functions that accept or return \
+              <a href=\"https://doc.rust-lang.org/std/primitive.slice.html\">slices</a> and \
+              <a href=\"https://doc.rust-lang.org/std/primitive.array.html\">arrays</a> by writing \
+              square brackets (e.g., <code>-&gt; [u8]</code> or <code>[] -&gt; Option</code>)",
             "Look for items inside another one by searching for a path: <code>vec::Vec</code>",
         ].map(x => "<p>" + x + "</p>").join("");
         const div_infos = document.createElement("div");
@@ -999,7 +1393,7 @@ function preLoadCss(cssUrl) {
      *
      * Pass "true" to reset focus for tooltip popovers.
      */
-    window.hideAllModals = function(switchFocus) {
+    window.hideAllModals = switchFocus => {
         hideSidebar();
         window.hidePopoverMenus();
         hideTooltip(switchFocus);
@@ -1008,7 +1402,7 @@ function preLoadCss(cssUrl) {
     /**
      * Hide all the popover menus.
      */
-    window.hidePopoverMenus = function() {
+    window.hidePopoverMenus = () => {
         onEachLazy(document.querySelectorAll(".search-form .popover"), elem => {
             elem.style.display = "none";
         });

@@ -2,7 +2,7 @@
 #![allow(unused)]
 #![allow(deref_nullptr)]
 #![allow(clippy::unnecessary_operation)]
-#![allow(clippy::drop_copy)]
+#![allow(dropping_copy_types)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
 
 extern crate proc_macros;
@@ -145,6 +145,13 @@ fn _field_fn_ptr(x: unsafe fn()) {
         x.0();
         x.0();
     }
+}
+
+// await expands to an unsafe block with several operations, but this is fine.: #11312
+async fn await_desugaring_silent() {
+    async fn helper() {}
+
+    helper().await;
 }
 
 fn main() {}

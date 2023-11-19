@@ -7,7 +7,7 @@
 //! `RETURN_PLACE` the MIR arguments) are always fully normalized (and
 //! contain revealed `impl Trait` values).
 
-use rustc_infer::infer::LateBoundRegionConversionTime;
+use rustc_infer::infer::BoundRegionConversionTime;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty};
 use rustc_span::Span;
@@ -35,7 +35,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             .instantiate_canonical_with_fresh_inference_vars(body.span, &user_provided_poly_sig);
         let user_provided_sig = self.infcx.instantiate_binder_with_fresh_vars(
             body.span,
-            LateBoundRegionConversionTime::FnCall,
+            BoundRegionConversionTime::FnCall,
             user_provided_sig,
         );
 
@@ -101,7 +101,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         );
 
         // We will not have a universal_regions.yield_ty if we yield (by accident)
-        // outside of a generator and return an `impl Trait`, so emit a delay_span_bug
+        // outside of a coroutine and return an `impl Trait`, so emit a delay_span_bug
         // because we don't want to panic in an assert here if we've already got errors.
         if body.yield_ty().is_some() != universal_regions.yield_ty.is_some() {
             self.tcx().sess.delay_span_bug(
@@ -124,21 +124,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         // Return types are a bit more complex. They may contain opaque `impl Trait` types.
         let mir_output_ty = body.local_decls[RETURN_PLACE].ty;
         let output_span = body.local_decls[RETURN_PLACE].source_info.span;
-        if let Err(terr) = self.eq_types(
-            normalized_output_ty,
-            mir_output_ty,
-            Locations::All(output_span),
-            ConstraintCategory::BoringNoLocation,
-        ) {
-            span_mirbug!(
-                self,
-                Location::START,
-                "equate_inputs_and_outputs: `{:?}=={:?}` failed with `{:?}`",
-                normalized_output_ty,
-                mir_output_ty,
-                terr
-            );
-        };
+        self.equate_normalized_input_or_output(normalized_output_ty, mir_output_ty, output_span);
     }
 
     #[instrument(skip(self), level = "debug")]

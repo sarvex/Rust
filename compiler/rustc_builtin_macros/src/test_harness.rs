@@ -4,10 +4,12 @@ use rustc_ast as ast;
 use rustc_ast::entry::EntryPointType;
 use rustc_ast::mut_visit::{ExpectOne, *};
 use rustc_ast::ptr::P;
+use rustc_ast::visit::{walk_item, Visitor};
 use rustc_ast::{attr, ModKind};
 use rustc_expand::base::{ExtCtxt, ResolverExpand};
 use rustc_expand::expand::{AstFragment, ExpansionConfig};
 use rustc_feature::Features;
+use rustc_session::lint::builtin::UNNAMEABLE_TEST_ITEMS;
 use rustc_session::Session;
 use rustc_span::hygiene::{AstPass, SyntaxContext, Transparency};
 use rustc_span::symbol::{sym, Ident, Symbol};
@@ -39,7 +41,12 @@ struct TestCtxt<'a> {
 
 /// Traverse the crate, collecting all the test functions, eliding any
 /// existing main functions, and synthesizing a main test harness
-pub fn inject(krate: &mut ast::Crate, sess: &Session, resolver: &mut dyn ResolverExpand) {
+pub fn inject(
+    krate: &mut ast::Crate,
+    sess: &Session,
+    features: &Features,
+    resolver: &mut dyn ResolverExpand,
+) {
     let span_diagnostic = sess.diagnostic();
     let panic_strategy = sess.panic_strategy();
     let platform_panic_strategy = sess.target.panic_strategy;
@@ -63,10 +70,7 @@ pub fn inject(krate: &mut ast::Crate, sess: &Session, resolver: &mut dyn Resolve
                     // Silently allow compiling with panic=abort on these platforms,
                     // but with old behavior (abort if a test fails).
                 } else {
-                    span_diagnostic.err(
-                        "building tests with panic=abort is not supported \
-                                         without `-Zpanic_abort_tests`",
-                    );
+                    span_diagnostic.emit_err(errors::TestsNotSupport {});
                 }
                 PanicStrategy::Unwind
             }
@@ -77,7 +81,7 @@ pub fn inject(krate: &mut ast::Crate, sess: &Session, resolver: &mut dyn Resolve
             resolver,
             reexport_test_harness_main,
             krate,
-            &sess.features_untracked(),
+            features,
             panic_strategy,
             test_runner,
         )
@@ -140,36 +144,42 @@ impl<'a> MutVisitor for TestHarnessGenerator<'a> {
             let prev_tests = mem::take(&mut self.tests);
             noop_visit_item_kind(&mut item.kind, self);
             self.add_test_cases(item.id, span, prev_tests);
+        } else {
+            // But in those cases, we emit a lint to warn the user of these missing tests.
+            walk_item(&mut InnerItemLinter { sess: self.cx.ext_cx.sess }, &item);
         }
         smallvec![P(item)]
     }
 }
 
-// Beware, this is duplicated in librustc_passes/entry.rs (with
-// `rustc_hir::Item`), so make sure to keep them in sync.
-fn entry_point_type(item: &ast::Item, depth: usize) -> EntryPointType {
+struct InnerItemLinter<'a> {
+    sess: &'a Session,
+}
+
+impl<'a> Visitor<'a> for InnerItemLinter<'_> {
+    fn visit_item(&mut self, i: &'a ast::Item) {
+        if let Some(attr) = attr::find_by_name(&i.attrs, sym::rustc_test_marker) {
+            self.sess.parse_sess.buffer_lint(
+                UNNAMEABLE_TEST_ITEMS,
+                attr.span,
+                i.id,
+                crate::fluent_generated::builtin_macros_unnameable_test_items,
+            );
+        }
+    }
+}
+
+fn entry_point_type(item: &ast::Item, at_root: bool) -> EntryPointType {
     match item.kind {
         ast::ItemKind::Fn(..) => {
-            if attr::contains_name(&item.attrs, sym::start) {
-                EntryPointType::Start
-            } else if attr::contains_name(&item.attrs, sym::rustc_main) {
-                EntryPointType::RustcMainAttr
-            } else if item.ident.name == sym::main {
-                if depth == 0 {
-                    // This is a top-level function so can be 'main'
-                    EntryPointType::MainNamed
-                } else {
-                    EntryPointType::OtherMain
-                }
-            } else {
-                EntryPointType::None
-            }
+            rustc_ast::entry::entry_point_type(&item.attrs, at_root, Some(item.ident.name))
         }
         _ => EntryPointType::None,
     }
 }
+
 /// A folder used to remove any entry points (like fn main) because the harness
-/// generator will provide its own
+/// coroutine will provide its own
 struct EntryPointCleaner<'a> {
     // Current depth in the ast
     sess: &'a Session,
@@ -186,7 +196,7 @@ impl<'a> MutVisitor for EntryPointCleaner<'a> {
         // Remove any #[rustc_main] or #[start] from the AST so it doesn't
         // clash with the one we're going to add, but mark it as
         // #[allow(dead_code)] to avoid printing warnings.
-        let item = match entry_point_type(&item, self.depth) {
+        let item = match entry_point_type(&item, self.depth == 0) {
             EntryPointType::MainNamed | EntryPointType::RustcMainAttr | EntryPointType::Start => {
                 item.map(|ast::Item { id, ident, attrs, kind, vis, span, tokens }| {
                     let allow_dead_code = attr::mk_attr_nested_word(
@@ -224,15 +234,13 @@ fn generate_test_harness(
     panic_strategy: PanicStrategy,
     test_runner: Option<ast::Path>,
 ) {
-    let mut econfig = ExpansionConfig::default("test".to_string());
-    econfig.features = Some(features);
-
+    let econfig = ExpansionConfig::default("test".to_string(), features);
     let ext_cx = ExtCtxt::new(sess, econfig, resolver, None);
 
     let expn_id = ext_cx.resolver.expansion_for_ast_pass(
         DUMMY_SP,
         AstPass::TestHarness,
-        &[sym::test, sym::rustc_attrs, sym::no_coverage],
+        &[sym::test, sym::rustc_attrs, sym::coverage_attribute],
         None,
     );
     let def_site = DUMMY_SP.with_def_site_ctxt(expn_id.to_expn_id());
@@ -313,8 +321,8 @@ fn mk_main(cx: &mut TestCtxt<'_>) -> P<ast::Item> {
 
     // #[rustc_main]
     let main_attr = ecx.attr_word(sym::rustc_main, sp);
-    // #[no_coverage]
-    let no_coverage_attr = ecx.attr_word(sym::no_coverage, sp);
+    // #[coverage(off)]
+    let coverage_attr = ecx.attr_nested_word(sym::coverage, sym::off, sp);
 
     // pub fn main() { ... }
     let main_ret_ty = ecx.ty(sp, ast::TyKind::Tup(ThinVec::new()));
@@ -344,7 +352,7 @@ fn mk_main(cx: &mut TestCtxt<'_>) -> P<ast::Item> {
 
     let main = P(ast::Item {
         ident: main_id,
-        attrs: thin_vec![main_attr, no_coverage_attr],
+        attrs: thin_vec![main_attr, coverage_attr],
         id: ast::DUMMY_NODE_ID,
         kind: main,
         vis: ast::Visibility { span: sp, kind: ast::VisibilityKind::Public, tokens: None },

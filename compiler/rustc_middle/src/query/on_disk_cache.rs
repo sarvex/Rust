@@ -22,7 +22,7 @@ use rustc_span::hygiene::{
     ExpnId, HygieneDecodeContext, HygieneEncodeContext, SyntaxContext, SyntaxContextData,
 };
 use rustc_span::source_map::{SourceMap, StableSourceFileId};
-use rustc_span::{BytePos, ExpnData, ExpnHash, Pos, SourceFile, Span};
+use rustc_span::{BytePos, ExpnData, ExpnHash, Pos, RelativeBytePos, SourceFile, Span};
 use rustc_span::{CachingSourceMapView, Symbol};
 use std::collections::hash_map::Entry;
 use std::io;
@@ -104,7 +104,9 @@ struct Footer {
     query_result_index: EncodedDepNodeIndex,
     side_effects_index: EncodedDepNodeIndex,
     // The location of all allocations.
-    interpret_alloc_index: Vec<u32>,
+    // Most uses only need values up to u32::MAX, but benchmarking indicates that we can use a u64
+    // without measurable overhead. This permits larger const allocations without ICEing.
+    interpret_alloc_index: Vec<u64>,
     // See `OnDiskCache.syntax_contexts`
     syntax_contexts: FxHashMap<u32, AbsoluteBytePos>,
     // See `OnDiskCache.expn_data`
@@ -301,7 +303,7 @@ impl<'sess> OnDiskCache<'sess> {
                     interpret_alloc_index.reserve(new_n - n);
                     for idx in n..new_n {
                         let id = encoder.interpret_allocs[idx];
-                        let pos: u32 = encoder.position().try_into().unwrap();
+                        let pos: u64 = encoder.position().try_into().unwrap();
                         interpret_alloc_index.push(pos);
                         interpret::specialized_encode_alloc_id(&mut encoder, tcx, id);
                     }
@@ -686,11 +688,12 @@ impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for Span {
 
         let file_lo_index = SourceFileIndex::decode(decoder);
         let line_lo = usize::decode(decoder);
-        let col_lo = BytePos::decode(decoder);
+        let col_lo = RelativeBytePos::decode(decoder);
         let len = BytePos::decode(decoder);
 
         let file_lo = decoder.file_index_to_file(file_lo_index);
-        let lo = file_lo.lines(|lines| lines[line_lo - 1] + col_lo);
+        let lo = file_lo.lines()[line_lo - 1] + col_lo;
+        let lo = file_lo.absolute_position(lo);
         let hi = lo + len;
 
         Span::new(lo, hi, ctxt, parent)
@@ -785,13 +788,6 @@ impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>>
 impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>>
     for &'tcx IndexVec<mir::Promoted, mir::Body<'tcx>>
 {
-    #[inline]
-    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
-        RefDecodable::decode(d)
-    }
-}
-
-impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx [(ty::Predicate<'tcx>, Span)] {
     #[inline]
     fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
         RefDecodable::decode(d)
@@ -900,7 +896,7 @@ impl<'a, 'tcx> Encodable<CacheEncoder<'a, 'tcx>> for Span {
         }
 
         if let Some(parent) = span_data.parent {
-            let enclosing = s.tcx.source_span(parent).data_untracked();
+            let enclosing = s.tcx.source_span_untracked(parent).data_untracked();
             if enclosing.contains(span_data) {
                 TAG_RELATIVE_SPAN.encode(s);
                 (span_data.lo - enclosing.lo).to_u32().encode(s);

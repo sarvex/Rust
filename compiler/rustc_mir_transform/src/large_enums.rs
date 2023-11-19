@@ -30,6 +30,9 @@ pub struct EnumSizeOpt {
 
 impl<'tcx> MirPass<'tcx> for EnumSizeOpt {
     fn is_enabled(&self, sess: &Session) -> bool {
+        // There are some differences in behavior on wasm and ARM that are not properly
+        // understood, so we conservatively treat this optimization as unsound:
+        // https://github.com/rust-lang/rust/pull/85158#issuecomment-1101836457
         sess.opts.unstable_opts.unsound_mir_opts || sess.mir_opt_level() >= 3
     }
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -48,17 +51,14 @@ impl EnumSizeOpt {
         alloc_cache: &mut FxHashMap<Ty<'tcx>, AllocId>,
     ) -> Option<(AdtDef<'tcx>, usize, AllocId)> {
         let adt_def = match ty.kind() {
-            ty::Adt(adt_def, _substs) if adt_def.is_enum() => adt_def,
+            ty::Adt(adt_def, _args) if adt_def.is_enum() => adt_def,
             _ => return None,
         };
         let layout = tcx.layout_of(param_env.and(ty)).ok()?;
         let variants = match &layout.variants {
             Variants::Single { .. } => return None,
-            Variants::Multiple { tag_encoding, .. }
-                if matches!(tag_encoding, TagEncoding::Niche { .. }) =>
-            {
-                return None;
-            }
+            Variants::Multiple { tag_encoding: TagEncoding::Niche { .. }, .. } => return None,
+
             Variants::Multiple { variants, .. } if variants.len() <= 1 => return None,
             Variants::Multiple { variants, .. } => variants,
         };
@@ -114,7 +114,7 @@ impl EnumSizeOpt {
             tcx.data_layout.ptr_sized_integer().align(&tcx.data_layout).abi,
             Mutability::Not,
         );
-        let alloc = tcx.create_memory_alloc(tcx.mk_const_alloc(alloc));
+        let alloc = tcx.reserve_and_set_memory_alloc(tcx.mk_const_alloc(alloc));
         Some((*adt_def, num_discrs, *alloc_cache.entry(ty).or_insert(alloc)))
     }
     fn optim<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -139,9 +139,8 @@ impl EnumSizeOpt {
 
                     let (adt_def, num_variants, alloc_id) =
                         self.candidate(tcx, param_env, ty, &mut alloc_cache)?;
-                    let alloc = tcx.global_alloc(alloc_id).unwrap_memory();
 
-                    let tmp_ty = tcx.mk_array(tcx.types.usize, num_variants as u64);
+                    let tmp_ty = Ty::new_array(tcx, tcx.types.usize, num_variants as u64);
 
                     let size_array_local = local_decls.push(LocalDecl::new(tmp_ty, span));
                     let store_live = Statement {
@@ -150,11 +149,11 @@ impl EnumSizeOpt {
                     };
 
                     let place = Place::from(size_array_local);
-                    let constant_vals = Constant {
+                    let constant_vals = ConstOperand {
                         span,
                         user_ty: None,
-                        literal: ConstantKind::Val(
-                            interpret::ConstValue::ByRef { alloc, offset: Size::ZERO },
+                        const_: Const::Val(
+                            ConstValue::Indirect { alloc_id, offset: Size::ZERO },
                             tmp_ty,
                         ),
                     };
@@ -208,8 +207,9 @@ impl EnumSizeOpt {
                         ))),
                     };
 
-                    let dst =
-                        Place::from(local_decls.push(LocalDecl::new(tcx.mk_mut_ptr(ty), span)));
+                    let dst = Place::from(
+                        local_decls.push(LocalDecl::new(Ty::new_mut_ptr(tcx, ty), span)),
+                    );
 
                     let dst_ptr = Statement {
                         source_info,
@@ -219,7 +219,7 @@ impl EnumSizeOpt {
                         ))),
                     };
 
-                    let dst_cast_ty = tcx.mk_mut_ptr(tcx.types.u8);
+                    let dst_cast_ty = Ty::new_mut_ptr(tcx, tcx.types.u8);
                     let dst_cast_place =
                         Place::from(local_decls.push(LocalDecl::new(dst_cast_ty, span)));
 
@@ -231,8 +231,9 @@ impl EnumSizeOpt {
                         ))),
                     };
 
-                    let src =
-                        Place::from(local_decls.push(LocalDecl::new(tcx.mk_imm_ptr(ty), span)));
+                    let src = Place::from(
+                        local_decls.push(LocalDecl::new(Ty::new_imm_ptr(tcx, ty), span)),
+                    );
 
                     let src_ptr = Statement {
                         source_info,
@@ -242,7 +243,7 @@ impl EnumSizeOpt {
                         ))),
                     };
 
-                    let src_cast_ty = tcx.mk_imm_ptr(tcx.types.u8);
+                    let src_cast_ty = Ty::new_imm_ptr(tcx, tcx.types.u8);
                     let src_cast_place =
                         Place::from(local_decls.push(LocalDecl::new(src_cast_ty, span)));
 

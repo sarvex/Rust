@@ -1,11 +1,13 @@
 use clippy_utils::diagnostics::{span_lint_hir, span_lint_hir_and_then};
-use clippy_utils::is_lint_allowed;
-use clippy_utils::peel_blocks;
 use clippy_utils::source::snippet_opt;
 use clippy_utils::ty::has_drop;
+use clippy_utils::{get_parent_node, is_lint_allowed, peel_blocks};
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::{is_range_literal, BinOpKind, BlockCheckMode, Expr, ExprKind, PatKind, Stmt, StmtKind, UnsafeSource};
+use rustc_hir::{
+    is_range_literal, BinOpKind, BlockCheckMode, Expr, ExprKind, ItemKind, Node, PatKind, Stmt, StmtKind, UnsafeSource,
+};
+use rustc_infer::infer::TyCtxtInferExt as _;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
 use rustc_session::{declare_lint_pass, declare_tool_lint};
@@ -21,7 +23,7 @@ declare_clippy_lint! {
     /// readable.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// 0;
     /// ```
     #[clippy::version = "pre 1.29.0"]
@@ -86,28 +88,66 @@ impl<'tcx> LateLintPass<'tcx> for NoEffect {
 fn check_no_effect(cx: &LateContext<'_>, stmt: &Stmt<'_>) -> bool {
     if let StmtKind::Semi(expr) = stmt.kind {
         if has_no_effect(cx, expr) {
-            span_lint_hir(cx, NO_EFFECT, expr.hir_id, stmt.span, "statement with no effect");
+            span_lint_hir_and_then(
+                cx,
+                NO_EFFECT,
+                expr.hir_id,
+                stmt.span,
+                "statement with no effect",
+                |diag| {
+                    for parent in cx.tcx.hir().parent_iter(stmt.hir_id) {
+                        if let Node::Item(item) = parent.1
+                            && let ItemKind::Fn(..) = item.kind
+                            && let Some(Node::Block(block)) = get_parent_node(cx.tcx, stmt.hir_id)
+                            && let [.., final_stmt] = block.stmts
+                            && final_stmt.hir_id == stmt.hir_id
+                        {
+                            let expr_ty = cx.typeck_results().expr_ty(expr);
+                            let mut ret_ty = cx
+                                .tcx
+                                .fn_sig(item.owner_id)
+                                .instantiate_identity()
+                                .output()
+                                .skip_binder();
+
+                            // Remove `impl Future<Output = T>` to get `T`
+                            if cx.tcx.ty_is_opaque_future(ret_ty)
+                                && let Some(true_ret_ty) = cx.tcx.infer_ctxt().build().get_impl_future_output_ty(ret_ty)
+                            {
+                                ret_ty = true_ret_ty;
+                            }
+
+                            if !ret_ty.is_unit() && ret_ty == expr_ty {
+                                diag.span_suggestion(
+                                    stmt.span.shrink_to_lo(),
+                                    "did you mean to return it?",
+                                    "return ",
+                                    Applicability::MaybeIncorrect,
+                                );
+                            }
+                        }
+                    }
+                },
+            );
             return true;
         }
     } else if let StmtKind::Local(local) = stmt.kind {
-        if_chain! {
-            if !is_lint_allowed(cx, NO_EFFECT_UNDERSCORE_BINDING, local.hir_id);
-            if let Some(init) = local.init;
-            if local.els.is_none();
-            if !local.pat.span.from_expansion();
-            if has_no_effect(cx, init);
-            if let PatKind::Binding(_, _, ident, _) = local.pat.kind;
-            if ident.name.to_ident_string().starts_with('_');
-            then {
-                span_lint_hir(
-                    cx,
-                    NO_EFFECT_UNDERSCORE_BINDING,
-                    init.hir_id,
-                    stmt.span,
-                    "binding to `_` prefixed variable with no side-effect"
-                );
-                return true;
-            }
+        if !is_lint_allowed(cx, NO_EFFECT_UNDERSCORE_BINDING, local.hir_id)
+            && let Some(init) = local.init
+            && local.els.is_none()
+            && !local.pat.span.from_expansion()
+            && has_no_effect(cx, init)
+            && let PatKind::Binding(_, _, ident, _) = local.pat.kind
+            && ident.name.to_ident_string().starts_with('_')
+        {
+            span_lint_hir(
+                cx,
+                NO_EFFECT_UNDERSCORE_BINDING,
+                init.hir_id,
+                stmt.span,
+                "binding to `_` prefixed variable with no side-effect",
+            );
+            return true;
         }
     }
     false
@@ -120,7 +160,7 @@ fn has_no_effect(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     match peel_blocks(expr).kind {
         ExprKind::Lit(..) | ExprKind::Closure { .. } => true,
         ExprKind::Path(..) => !has_drop(cx, cx.typeck_results().expr_ty(expr)),
-        ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) => has_no_effect(cx, a) && has_no_effect(cx, b),
+        ExprKind::Index(a, b, _) | ExprKind::Binary(_, a, b) => has_no_effect(cx, a) && has_no_effect(cx, b),
         ExprKind::Array(v) | ExprKind::Tup(v) => v.iter().all(|val| has_no_effect(cx, val)),
         ExprKind::Repeat(inner, _)
         | ExprKind::Cast(inner, _)
@@ -157,63 +197,60 @@ fn has_no_effect(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
 }
 
 fn check_unnecessary_operation(cx: &LateContext<'_>, stmt: &Stmt<'_>) {
-    if_chain! {
-        if let StmtKind::Semi(expr) = stmt.kind;
-        let ctxt = stmt.span.ctxt();
-        if expr.span.ctxt() == ctxt;
-        if let Some(reduced) = reduce_expression(cx, expr);
-        if !in_external_macro(cx.sess(), stmt.span);
-        if reduced.iter().all(|e| e.span.ctxt() == ctxt);
-        then {
-            if let ExprKind::Index(..) = &expr.kind {
-                let snippet = if let (Some(arr), Some(func)) =
-                    (snippet_opt(cx, reduced[0].span), snippet_opt(cx, reduced[1].span))
-                {
+    if let StmtKind::Semi(expr) = stmt.kind
+        && let ctxt = stmt.span.ctxt()
+        && expr.span.ctxt() == ctxt
+        && let Some(reduced) = reduce_expression(cx, expr)
+        && !in_external_macro(cx.sess(), stmt.span)
+        && reduced.iter().all(|e| e.span.ctxt() == ctxt)
+    {
+        if let ExprKind::Index(..) = &expr.kind {
+            let snippet =
+                if let (Some(arr), Some(func)) = (snippet_opt(cx, reduced[0].span), snippet_opt(cx, reduced[1].span)) {
                     format!("assert!({}.len() > {});", &arr, &func)
                 } else {
                     return;
                 };
-                span_lint_hir_and_then(
-                    cx,
-                    UNNECESSARY_OPERATION,
-                    expr.hir_id,
-                    stmt.span,
-                    "unnecessary operation",
-                    |diag| {
-                        diag.span_suggestion(
-                            stmt.span,
-                            "statement can be written as",
-                            snippet,
-                            Applicability::MaybeIncorrect,
-                        );
-                    },
-                );
-            } else {
-                let mut snippet = String::new();
-                for e in reduced {
-                    if let Some(snip) = snippet_opt(cx, e.span) {
-                        snippet.push_str(&snip);
-                        snippet.push(';');
-                    } else {
-                        return;
-                    }
+            span_lint_hir_and_then(
+                cx,
+                UNNECESSARY_OPERATION,
+                expr.hir_id,
+                stmt.span,
+                "unnecessary operation",
+                |diag| {
+                    diag.span_suggestion(
+                        stmt.span,
+                        "statement can be written as",
+                        snippet,
+                        Applicability::MaybeIncorrect,
+                    );
+                },
+            );
+        } else {
+            let mut snippet = String::new();
+            for e in reduced {
+                if let Some(snip) = snippet_opt(cx, e.span) {
+                    snippet.push_str(&snip);
+                    snippet.push(';');
+                } else {
+                    return;
                 }
-                span_lint_hir_and_then(
-                    cx,
-                    UNNECESSARY_OPERATION,
-                    expr.hir_id,
-                    stmt.span,
-                    "unnecessary operation",
-                    |diag| {
-                        diag.span_suggestion(
-                            stmt.span,
-                            "statement can be reduced to",
-                            snippet,
-                            Applicability::MachineApplicable,
-                        );
-                    },
-                );
             }
+            span_lint_hir_and_then(
+                cx,
+                UNNECESSARY_OPERATION,
+                expr.hir_id,
+                stmt.span,
+                "unnecessary operation",
+                |diag| {
+                    diag.span_suggestion(
+                        stmt.span,
+                        "statement can be reduced to",
+                        snippet,
+                        Applicability::MachineApplicable,
+                    );
+                },
+            );
         }
     }
 }
@@ -223,7 +260,7 @@ fn reduce_expression<'a>(cx: &LateContext<'_>, expr: &'a Expr<'a>) -> Option<Vec
         return None;
     }
     match expr.kind {
-        ExprKind::Index(a, b) => Some(vec![a, b]),
+        ExprKind::Index(a, b, _) => Some(vec![a, b]),
         ExprKind::Binary(ref binop, a, b) if binop.node != BinOpKind::And && binop.node != BinOpKind::Or => {
             Some(vec![a, b])
         },

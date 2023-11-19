@@ -26,7 +26,9 @@ pub fn check_crate(tcx: TyCtxt<'_>, items: &mut lang_items::LanguageItems) {
     for id in crate_items.foreign_items() {
         let attrs = tcx.hir().attrs(id.hir_id());
         if let Some((lang_item, _)) = lang_items::extract(attrs) {
-            if let Some(item) = LangItem::from_name(lang_item) && item.is_weak() {
+            if let Some(item) = LangItem::from_name(lang_item)
+                && item.is_weak()
+            {
                 if items.get(item).is_none() {
                     items.missing.push(item);
                 }
@@ -43,7 +45,7 @@ pub fn check_crate(tcx: TyCtxt<'_>, items: &mut lang_items::LanguageItems) {
 fn verify(tcx: TyCtxt<'_>, items: &lang_items::LanguageItems) {
     // We only need to check for the presence of weak lang items if we're
     // emitting something that's not an rlib.
-    let needs_check = tcx.sess.crate_types().iter().any(|kind| match *kind {
+    let needs_check = tcx.crate_types().iter().any(|kind| match *kind {
         CrateType::Dylib
         | CrateType::ProcMacro
         | CrateType::Cdylib

@@ -5,7 +5,7 @@ use rustc_ast::InlineAsmTemplatePiece;
 use super::*;
 use crate::ty;
 
-TrivialTypeTraversalAndLiftImpls! {
+TrivialTypeTraversalImpls! {
     BlockTailInfo,
     MirPhase,
     SourceInfo,
@@ -19,8 +19,8 @@ TrivialTypeTraversalAndLiftImpls! {
     hir::Movability,
     BasicBlock,
     SwitchTargets,
-    GeneratorKind,
-    GeneratorSavedLocal,
+    CoroutineKind,
+    CoroutineSavedLocal,
 }
 
 TrivialTypeTraversalImpls! {

@@ -1,4 +1,4 @@
-use rustc_ast::{ast, MetaItemKind, NestedMetaItem};
+use rustc_ast::{ast, attr, MetaItemKind, NestedMetaItem};
 use rustc_attr::{list_contains_name, InlineAttr, InstructionSetAttr, OptimizeAttr};
 use rustc_errors::struct_span_err;
 use rustc_hir as hir;
@@ -7,7 +7,7 @@ use rustc_hir::def_id::{DefId, LocalDefId, LOCAL_CRATE};
 use rustc_hir::{lang_items, weak_lang_items::WEAK_LANG_ITEMS, LangItem};
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir::mono::Linkage;
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::{self as ty, TyCtxt};
 use rustc_session::{lint, parse::feature_err};
 use rustc_span::symbol::Ident;
@@ -16,7 +16,10 @@ use rustc_target::spec::{abi, SanitizerSet};
 
 use crate::errors;
 use crate::target_features::from_target_feature;
-use crate::{errors::ExpectedUsedSymbol, target_features::check_target_feature_trait_unsafe};
+use crate::{
+    errors::{ExpectedCoverageSymbol, ExpectedUsedSymbol},
+    target_features::check_target_feature_trait_unsafe,
+};
 
 fn linkage_by_name(tcx: TyCtxt<'_>, def_id: LocalDefId, name: &str) -> Linkage {
     use rustc_middle::mir::mono::Linkage::*;
@@ -58,6 +61,14 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
     let mut codegen_fn_attrs = CodegenFnAttrs::new();
     if tcx.should_inherit_track_caller(did) {
         codegen_fn_attrs.flags |= CodegenFnAttrFlags::TRACK_CALLER;
+    }
+
+    // When `no_builtins` is applied at the crate level, we should add the
+    // `no-builtins` attribute to each function to ensure it takes effect in LTO.
+    let crate_attrs = tcx.hir().attrs(rustc_hir::CRATE_HIR_ID);
+    let no_builtins = attr::contains_name(crate_attrs, sym::no_builtins);
+    if no_builtins {
+        codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_BUILTINS;
     }
 
     let supported_target_features = tcx.supported_target_features(LOCAL_CRATE);
@@ -120,7 +131,21 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
                         .emit();
                 }
             }
-            sym::no_coverage => codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_COVERAGE,
+            sym::coverage => {
+                let inner = attr.meta_item_list();
+                match inner.as_deref() {
+                    Some([item]) if item.has_name(sym::off) => {
+                        codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_COVERAGE;
+                    }
+                    Some([item]) if item.has_name(sym::on) => {
+                        // Allow #[coverage(on)] for being explicit, maybe also in future to enable
+                        // coverage on a smaller scope within an excluded larger scope.
+                    }
+                    Some(_) | None => {
+                        tcx.sess.emit_err(ExpectedCoverageSymbol { span: attr.span });
+                    }
+                }
+            }
             sym::rustc_std_internal_symbol => {
                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
             }
@@ -207,14 +232,24 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
             }
             sym::thread_local => codegen_fn_attrs.flags |= CodegenFnAttrFlags::THREAD_LOCAL,
             sym::track_caller => {
-                if !tcx.is_closure(did.to_def_id())
+                let is_closure = tcx.is_closure(did.to_def_id());
+
+                if !is_closure
                     && let Some(fn_sig) = fn_sig()
                     && fn_sig.skip_binder().abi() != abi::Abi::Rust
                 {
-                    struct_span_err!(tcx.sess, attr.span, E0737, "`#[track_caller]` requires Rust ABI")
-                        .emit();
+                    struct_span_err!(
+                        tcx.sess,
+                        attr.span,
+                        E0737,
+                        "`#[track_caller]` requires Rust ABI"
+                    )
+                    .emit();
                 }
-                if tcx.is_closure(did.to_def_id()) && !tcx.features().closure_track_caller {
+                if is_closure
+                    && !tcx.features().closure_track_caller
+                    && !attr.span.allows_unstable(sym::closure_track_caller)
+                {
                     feature_err(
                         &tcx.sess.parse_sess,
                         sym::closure_track_caller,
@@ -405,17 +440,18 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
                     && let [item] = items.as_slice()
                     && let Some((sym::align, literal)) = item.name_value_literal()
                 {
-                    rustc_attr::parse_alignment(&literal.kind).map_err(|msg| {
-                        struct_span_err!(
-                            tcx.sess.diagnostic(),
-                            attr.span,
-                            E0589,
-                            "invalid `repr(align)` attribute: {}",
-                            msg
-                        )
-                        .emit();
-                    })
-                    .ok()
+                    rustc_attr::parse_alignment(&literal.kind)
+                        .map_err(|msg| {
+                            struct_span_err!(
+                                tcx.sess.diagnostic(),
+                                attr.span,
+                                E0589,
+                                "invalid `repr(align)` attribute: {}",
+                                msg
+                            )
+                            .emit();
+                        })
+                        .ok()
                 } else {
                     None
                 };
@@ -493,7 +529,22 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
     });
 
     // #73631: closures inherit `#[target_feature]` annotations
-    if tcx.features().target_feature_11 && tcx.is_closure(did.to_def_id()) {
+    //
+    // If this closure is marked `#[inline(always)]`, simply skip adding `#[target_feature]`.
+    //
+    // At this point, `unsafe` has already been checked and `#[target_feature]` only affects codegen.
+    // Emitting both `#[inline(always)]` and `#[target_feature]` can potentially result in an
+    // ICE, because LLVM errors when the function fails to be inlined due to a target feature
+    // mismatch.
+    //
+    // Using `#[inline(always)]` implies that this closure will most likely be inlined into
+    // its parent function, which effectively inherits the features anyway. Boxing this closure
+    // would result in this closure being compiled without the inherited target features, but this
+    // is probably a poor usage of `#[inline(always)]` and easily avoided by not using the attribute.
+    if tcx.features().target_feature_11
+        && tcx.is_closure(did.to_def_id())
+        && codegen_fn_attrs.inline != InlineAttr::Always
+    {
         let owner_id = tcx.parent(did.to_def_id());
         if tcx.def_kind(owner_id).has_codegen_attrs() {
             codegen_fn_attrs
@@ -581,10 +632,7 @@ fn should_inherit_track_caller(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
         && let ty::AssocItemContainer::ImplContainer = impl_item.container
         && let Some(trait_item) = impl_item.trait_item_def_id
     {
-        return tcx
-            .codegen_fn_attrs(trait_item)
-            .flags
-            .intersects(CodegenFnAttrFlags::TRACK_CALLER);
+        return tcx.codegen_fn_attrs(trait_item).flags.intersects(CodegenFnAttrFlags::TRACK_CALLER);
     }
 
     false

@@ -166,7 +166,7 @@ pub fn eq_expr(l: &Expr, r: &Expr) -> bool {
         (Unary(lo, l), Unary(ro, r)) => mem::discriminant(lo) == mem::discriminant(ro) && eq_expr(l, r),
         (Lit(l), Lit(r)) => l == r,
         (Cast(l, lt), Cast(r, rt)) | (Type(l, lt), Type(r, rt)) => eq_expr(l, r) && eq_ty(lt, rt),
-        (Let(lp, le, _), Let(rp, re, _)) => eq_pat(lp, rp) && eq_expr(le, re),
+        (Let(lp, le, _, _), Let(rp, re, _, _)) => eq_pat(lp, rp) && eq_expr(le, re),
         (If(lc, lt, le), If(rc, rt, re)) => eq_expr(lc, rc) && eq_block(lt, rt) && eq_expr_opt(le, re),
         (While(lc, lt, ll), While(rc, rt, rl)) => eq_label(ll, rl) && eq_expr(lc, rc) && eq_block(lt, rt),
         (ForLoop(lp, li, lt, ll), ForLoop(rp, ri, rt, rl)) => {
@@ -178,7 +178,9 @@ pub fn eq_expr(l: &Expr, r: &Expr) -> bool {
         (Yield(l), Yield(r)) | (Ret(l), Ret(r)) => eq_expr_opt(l, r),
         (Break(ll, le), Break(rl, re)) => eq_label(ll, rl) && eq_expr_opt(le, re),
         (Continue(ll), Continue(rl)) => eq_label(ll, rl),
-        (Assign(l1, l2, _), Assign(r1, r2, _)) | (Index(l1, l2), Index(r1, r2)) => eq_expr(l1, r1) && eq_expr(l2, r2),
+        (Assign(l1, l2, _), Assign(r1, r2, _)) | (Index(l1, l2, _), Index(r1, r2, _)) => {
+            eq_expr(l1, r1) && eq_expr(l2, r2)
+        },
         (AssignOp(lo, lp, lv), AssignOp(ro, rp, rv)) => lo.node == ro.node && eq_expr(lp, rp) && eq_expr(lv, rv),
         (Field(lp, lf), Field(rp, rf)) => eq_id(*lf, *rf) && eq_expr(lp, rp),
         (Match(ls, la), Match(rs, ra)) => eq_expr(ls, rs) && over(la, ra, eq_arm),
@@ -209,7 +211,7 @@ pub fn eq_expr(l: &Expr, r: &Expr) -> bool {
                 && eq_fn_decl(lf, rf)
                 && eq_expr(le, re)
         },
-        (Async(lc, lb), Async(rc, rb)) => lc == rc && eq_block(lb, rb),
+        (Gen(lc, lb, lk), Gen(rc, rb, rk)) => lc == rc && eq_block(lb, rb) && lk == rk,
         (Range(lf, lt, ll), Range(rf, rt, rl)) => ll == rl && eq_expr_opt(lf, rf) && eq_expr_opt(lt, rt),
         (AddrOf(lbk, lm, le), AddrOf(rbk, rm, re)) => lbk == rbk && lm == rm && eq_expr(le, re),
         (Path(lq, lp), Path(rq, rp)) => both(lq, rq, eq_qself) && eq_path(lp, rp),
@@ -301,15 +303,17 @@ pub fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
         (
             Const(box ast::ConstItem {
                 defaultness: ld,
+                generics: lg,
                 ty: lt,
                 expr: le,
             }),
             Const(box ast::ConstItem {
                 defaultness: rd,
+                generics: rg,
                 ty: rt,
                 expr: re,
             }),
-        ) => eq_defaultness(*ld, *rd) && eq_ty(lt, rt) && eq_expr_opt(le, re),
+        ) => eq_defaultness(*ld, *rd) && eq_generics(lg, rg) && eq_ty(lt, rt) && eq_expr_opt(le, re),
         (
             Fn(box ast::Fn {
                 defaultness: ld,
@@ -476,15 +480,17 @@ pub fn eq_assoc_item_kind(l: &AssocItemKind, r: &AssocItemKind) -> bool {
         (
             Const(box ast::ConstItem {
                 defaultness: ld,
+                generics: lg,
                 ty: lt,
                 expr: le,
             }),
             Const(box ast::ConstItem {
                 defaultness: rd,
+                generics: rg,
                 ty: rt,
                 expr: re,
             }),
-        ) => eq_defaultness(*ld, *rd) && eq_ty(lt, rt) && eq_expr_opt(le, re),
+        ) => eq_defaultness(*ld, *rd) && eq_generics(lg, rg) && eq_ty(lt, rt) && eq_expr_opt(le, re),
         (
             Fn(box ast::Fn {
                 defaultness: ld,

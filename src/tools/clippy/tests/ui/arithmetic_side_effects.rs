@@ -10,12 +10,12 @@
     arithmetic_overflow,
     unconditional_panic
 )]
-#![feature(const_mut_refs, inline_const, saturating_int_impl)]
+#![feature(const_mut_refs, inline_const)]
 #![warn(clippy::arithmetic_side_effects)]
 
 extern crate proc_macro_derive;
 
-use core::num::{Saturating, Wrapping};
+use core::num::{NonZeroUsize, Saturating, Wrapping};
 
 const ONE: i32 = 1;
 const ZERO: i32 = 0;
@@ -456,6 +456,69 @@ pub fn integer_arithmetic() {
 
 pub fn issue_10583(a: u16) -> u16 {
     10 / a
+}
+
+pub fn issue_10767() {
+    let n = &1.0;
+    n + n;
+    3.1_f32 + &1.2_f32;
+    &3.4_f32 + 1.5_f32;
+    &3.5_f32 + &1.3_f32;
+}
+
+pub fn issue_10792() {
+    struct One {
+        a: u32,
+    }
+    struct Two {
+        b: u32,
+        c: u64,
+    }
+    const ONE: One = One { a: 1 };
+    const TWO: Two = Two { b: 2, c: 3 };
+    let _ = 10 / ONE.a;
+    let _ = 10 / TWO.b;
+    let _ = 10 / TWO.c;
+}
+
+pub fn issue_11145() {
+    let mut x: Wrapping<u32> = Wrapping(0_u32);
+    x += 1;
+}
+
+pub fn issue_11262() {
+    let one = 1;
+    let zero = 0;
+    let _ = 2 / one;
+    let _ = 2 / zero;
+}
+
+pub fn issue_11392() {
+    fn example_div(unsigned: usize, nonzero_unsigned: NonZeroUsize) -> usize {
+        unsigned / nonzero_unsigned
+    }
+
+    fn example_rem(unsigned: usize, nonzero_unsigned: NonZeroUsize) -> usize {
+        unsigned % nonzero_unsigned
+    }
+
+    let (unsigned, nonzero_unsigned) = (0, NonZeroUsize::new(1).unwrap());
+    example_div(unsigned, nonzero_unsigned);
+    example_rem(unsigned, nonzero_unsigned);
+}
+
+pub fn issue_11393() {
+    fn example_div(x: Wrapping<i32>, maybe_zero: Wrapping<i32>) -> Wrapping<i32> {
+        x / maybe_zero
+    }
+
+    fn example_rem(x: Wrapping<i32>, maybe_zero: Wrapping<i32>) -> Wrapping<i32> {
+        x % maybe_zero
+    }
+
+    let [x, maybe_zero] = [1, 0].map(Wrapping);
+    example_div(x, maybe_zero);
+    example_rem(x, maybe_zero);
 }
 
 fn main() {}

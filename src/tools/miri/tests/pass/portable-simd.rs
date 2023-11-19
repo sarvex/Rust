@@ -1,6 +1,11 @@
 //@compile-flags: -Zmiri-strict-provenance
-#![feature(portable_simd, platform_intrinsics)]
+#![feature(portable_simd, platform_intrinsics, adt_const_params, inline_const)]
+#![allow(incomplete_features)]
 use std::simd::*;
+
+extern "platform-intrinsic" {
+    pub(crate) fn simd_bitmask<T, U>(x: T) -> U;
+}
 
 fn simd_ops_f32() {
     let a = f32x4::splat(10.0);
@@ -208,11 +213,40 @@ fn simd_mask() {
     assert_eq!(bitmask, 0b1010001101001001);
     assert_eq!(Mask::<i64, 16>::from_bitmask(bitmask), mask);
 
+    // Also directly call intrinsic, to test both kinds of return types.
+    unsafe {
+        let bitmask1: u16 = simd_bitmask(mask.to_int());
+        let bitmask2: [u8; 2] = simd_bitmask(mask.to_int());
+        if cfg!(target_endian = "little") {
+            assert_eq!(bitmask1, 0b1010001101001001);
+            assert_eq!(bitmask2, [0b01001001, 0b10100011]);
+        } else {
+            // All the bitstrings are reversed compared to above, but the array elements are in the
+            // same order.
+            assert_eq!(bitmask1, 0b1001001011000101);
+            assert_eq!(bitmask2, [0b10010010, 0b11000101]);
+        }
+    }
+
+    // Mask less than 8 bits long, which is a special case (padding with 0s).
     let values = [false, false, false, true];
     let mask = Mask::<i64, 4>::from_array(values);
     let bitmask = mask.to_bitmask();
     assert_eq!(bitmask, 0b1000);
     assert_eq!(Mask::<i64, 4>::from_bitmask(bitmask), mask);
+
+    // Also directly call intrinsic, to test both kinds of return types.
+    unsafe {
+        let bitmask1: u8 = simd_bitmask(mask.to_int());
+        let bitmask2: [u8; 1] = simd_bitmask(mask.to_int());
+        if cfg!(target_endian = "little") {
+            assert_eq!(bitmask1, 0b1000);
+            assert_eq!(bitmask2, [0b1000]);
+        } else {
+            assert_eq!(bitmask1, 0b0001);
+            assert_eq!(bitmask2, [0b0001]);
+        }
+    }
 }
 
 fn simd_cast() {
@@ -357,6 +391,8 @@ fn simd_intrinsics() {
         fn simd_reduce_any<T>(x: T) -> bool;
         fn simd_reduce_all<T>(x: T) -> bool;
         fn simd_select<M, T>(m: M, yes: T, no: T) -> T;
+        fn simd_shuffle_generic<T, U, const IDX: &'static [u32]>(x: T, y: T) -> U;
+        fn simd_shuffle<T, IDX, U>(x: T, y: T, idx: IDX) -> U;
     }
     unsafe {
         // Make sure simd_eq returns all-1 for `true`
@@ -379,6 +415,16 @@ fn simd_intrinsics() {
         assert_eq!(
             simd_select(i8x4::from_array([0, -1, -1, 0]), b, a),
             i32x4::from_array([10, 2, 10, 10])
+        );
+        assert_eq!(simd_shuffle_generic::<_, i32x4, { &[3, 1, 0, 2] }>(a, b), a,);
+        assert_eq!(simd_shuffle::<_, _, i32x4>(a, b, const { [3, 1, 0, 2] }), a,);
+        assert_eq!(
+            simd_shuffle_generic::<_, i32x4, { &[7, 5, 4, 6] }>(a, b),
+            i32x4::from_array([4, 2, 1, 10]),
+        );
+        assert_eq!(
+            simd_shuffle::<_, _, i32x4>(a, b, const { [7, 5, 4, 6] }),
+            i32x4::from_array([4, 2, 1, 10]),
         );
     }
 }

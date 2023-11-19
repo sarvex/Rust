@@ -6,6 +6,7 @@ mod returning;
 
 use std::borrow::Cow;
 
+use cranelift_codegen::ir::{AbiParam, SigRef};
 use cranelift_module::ModuleError;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::layout::FnAbiOf;
@@ -13,12 +14,9 @@ use rustc_session::Session;
 use rustc_target::abi::call::{Conv, FnAbi};
 use rustc_target::spec::abi::Abi;
 
-use cranelift_codegen::ir::{AbiParam, SigRef};
-
 use self::pass_mode::*;
-use crate::prelude::*;
-
 pub(crate) use self::returning::codegen_return;
+use crate::prelude::*;
 
 fn clif_sig_from_fn_abi<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -30,7 +28,7 @@ fn clif_sig_from_fn_abi<'tcx>(
     let inputs = fn_abi.args.iter().flat_map(|arg_abi| arg_abi.get_abi_param(tcx).into_iter());
 
     let (return_ptr, returns) = fn_abi.ret.get_abi_return(tcx);
-    // Sometimes the first param is an pointer to the place where the return value needs to be stored.
+    // Sometimes the first param is a pointer to the place where the return value needs to be stored.
     let params: Vec<_> = return_ptr.into_iter().chain(inputs).collect();
 
     Signature { params, returns, call_conv }
@@ -39,7 +37,7 @@ fn clif_sig_from_fn_abi<'tcx>(
 pub(crate) fn conv_to_call_conv(sess: &Session, c: Conv, default_call_conv: CallConv) -> CallConv {
     match c {
         Conv::Rust | Conv::C => default_call_conv,
-        Conv::RustCold => CallConv::Cold,
+        Conv::Cold | Conv::PreserveMost | Conv::PreserveAll => CallConv::Cold,
         Conv::X86_64SysV => CallConv::SystemV,
         Conv::X86_64Win64 => CallConv::WindowsFastcall,
 
@@ -48,7 +46,9 @@ pub(crate) fn conv_to_call_conv(sess: &Session, c: Conv, default_call_conv: Call
             default_call_conv
         }
 
-        Conv::X86Intr => sess.fatal("x86-interrupt call conv not yet implemented"),
+        Conv::X86Intr | Conv::RiscvInterrupt { .. } => {
+            sess.fatal(format!("interrupt call conv {c:?} not yet implemented"))
+        }
 
         Conv::ArmAapcs => sess.fatal("aapcs call conv not yet implemented"),
         Conv::CCmseNonSecureCall => {
@@ -70,7 +70,7 @@ pub(crate) fn get_function_sig<'tcx>(
     default_call_conv: CallConv,
     inst: Instance<'tcx>,
 ) -> Signature {
-    assert!(!inst.substs.has_infer());
+    assert!(!inst.args.has_infer());
     clif_sig_from_fn_abi(
         tcx,
         default_call_conv,
@@ -120,32 +120,25 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
         args: &[Value],
     ) -> Cow<'_, [Value]> {
         if self.tcx.sess.target.is_like_windows {
-            let (mut params, mut args): (Vec<_>, Vec<_>) =
-                params
-                    .into_iter()
-                    .zip(args)
-                    .map(|(param, &arg)| {
-                        if param.value_type == types::I128 {
-                            let arg_ptr = Pointer::stack_slot(self.bcx.create_sized_stack_slot(
-                                StackSlotData { kind: StackSlotKind::ExplicitSlot, size: 16 },
-                            ));
-                            arg_ptr.store(self, arg, MemFlags::trusted());
-                            (AbiParam::new(self.pointer_type), arg_ptr.get_addr(self))
-                        } else {
-                            (param, arg)
-                        }
-                    })
-                    .unzip();
+            let (mut params, mut args): (Vec<_>, Vec<_>) = params
+                .into_iter()
+                .zip(args)
+                .map(|(param, &arg)| {
+                    if param.value_type == types::I128 {
+                        let arg_ptr = self.create_stack_slot(16, 16);
+                        arg_ptr.store(self, arg, MemFlags::trusted());
+                        (AbiParam::new(self.pointer_type), arg_ptr.get_addr(self))
+                    } else {
+                        (param, arg)
+                    }
+                })
+                .unzip();
 
             let indirect_ret_val = returns.len() == 1 && returns[0].value_type == types::I128;
 
             if indirect_ret_val {
                 params.insert(0, AbiParam::new(self.pointer_type));
-                let ret_ptr =
-                    Pointer::stack_slot(self.bcx.create_sized_stack_slot(StackSlotData {
-                        kind: StackSlotKind::ExplicitSlot,
-                        size: 16,
-                    }));
+                let ret_ptr = self.create_stack_slot(16, 16);
                 args.insert(0, ret_ptr.get_addr(self));
                 self.lib_call_unadjusted(name, params, vec![], &args);
                 return Cow::Owned(vec![ret_ptr.load(self, types::I128, MemFlags::trusted())]);
@@ -377,19 +370,20 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     let ret_place = codegen_place(fx, destination);
 
     // Handle special calls like intrinsics and empty drop glue.
-    let instance = if let ty::FnDef(def_id, substs) = *func.layout().ty.kind() {
+    let instance = if let ty::FnDef(def_id, fn_args) = *func.layout().ty.kind() {
         let instance =
-            ty::Instance::expect_resolve(fx.tcx, ty::ParamEnv::reveal_all(), def_id, substs)
+            ty::Instance::expect_resolve(fx.tcx, ty::ParamEnv::reveal_all(), def_id, fn_args)
                 .polymorphize(fx.tcx);
 
         if fx.tcx.symbol_name(instance).name.starts_with("llvm.") {
             crate::intrinsics::codegen_llvm_intrinsic_call(
                 fx,
                 &fx.tcx.symbol_name(instance).name,
-                substs,
+                fn_args,
                 args,
                 ret_place,
                 target,
+                source_info.span,
             );
             return;
         }
@@ -432,11 +426,9 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     let is_cold = if fn_sig.abi() == Abi::RustCold {
         true
     } else {
-        instance
-            .map(|inst| {
-                fx.tcx.codegen_fn_attrs(inst.def_id()).flags.contains(CodegenFnAttrFlags::COLD)
-            })
-            .unwrap_or(false)
+        instance.is_some_and(|inst| {
+            fx.tcx.codegen_fn_attrs(inst.def_id()).flags.contains(CodegenFnAttrFlags::COLD)
+        })
     };
     if is_cold {
         fx.bcx.set_cold_block(fx.bcx.current_block().unwrap());
@@ -447,9 +439,14 @@ pub(crate) fn codegen_terminator_call<'tcx>(
 
     // Unpack arguments tuple for closures
     let mut args = if fn_sig.abi() == Abi::RustCall {
-        assert_eq!(args.len(), 2, "rust-call abi requires two arguments");
-        let self_arg = codegen_call_argument_operand(fx, &args[0]);
-        let pack_arg = codegen_call_argument_operand(fx, &args[1]);
+        let (self_arg, pack_arg) = match args {
+            [pack_arg] => (None, codegen_call_argument_operand(fx, pack_arg)),
+            [self_arg, pack_arg] => (
+                Some(codegen_call_argument_operand(fx, self_arg)),
+                codegen_call_argument_operand(fx, pack_arg),
+            ),
+            _ => panic!("rust-call abi requires one or two arguments"),
+        };
 
         let tupled_arguments = match pack_arg.value.layout().ty.kind() {
             ty::Tuple(ref tupled_arguments) => tupled_arguments,
@@ -457,7 +454,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
         };
 
         let mut args = Vec::with_capacity(1 + tupled_arguments.len());
-        args.push(self_arg);
+        args.extend(self_arg);
         for i in 0..tupled_arguments.len() {
             args.push(CallArgument {
                 value: pack_arg.value.value_field(fx, FieldIdx::new(i)),
@@ -470,7 +467,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     };
 
     // Pass the caller location for `#[track_caller]`.
-    if instance.map(|inst| inst.def.requires_caller_location(fx.tcx)).unwrap_or(false) {
+    if instance.is_some_and(|inst| inst.def.requires_caller_location(fx.tcx)) {
         let caller_location = fx.get_caller_location(source_info);
         args.push(CallArgument { value: caller_location, is_owned: false });
     }
@@ -613,7 +610,7 @@ pub(crate) fn codegen_drop<'tcx>(
                 // `Instance::resolve_drop_in_place`?
                 let virtual_drop = Instance {
                     def: ty::InstanceDef::Virtual(drop_instance.def_id(), 0),
-                    substs: drop_instance.substs,
+                    args: drop_instance.args,
                 };
                 let fn_abi =
                     RevealAllLayoutCx(fx.tcx).fn_abi_of_instance(virtual_drop, ty::List::empty());
@@ -650,7 +647,7 @@ pub(crate) fn codegen_drop<'tcx>(
 
                 let virtual_drop = Instance {
                     def: ty::InstanceDef::Virtual(drop_instance.def_id(), 0),
-                    substs: drop_instance.substs,
+                    args: drop_instance.args,
                 };
                 let fn_abi =
                     RevealAllLayoutCx(fx.tcx).fn_abi_of_instance(virtual_drop, ty::List::empty());
@@ -667,7 +664,8 @@ pub(crate) fn codegen_drop<'tcx>(
 
                 let arg_value = drop_place.place_ref(
                     fx,
-                    fx.layout_of(fx.tcx.mk_ref(
+                    fx.layout_of(Ty::new_ref(
+                        fx.tcx,
                         fx.tcx.lifetimes.re_erased,
                         TypeAndMut { ty, mutbl: crate::rustc_hir::Mutability::Mut },
                     )),

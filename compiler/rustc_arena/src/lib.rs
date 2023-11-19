@@ -11,51 +11,37 @@
     html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
     test(no_crate_inject, attr(deny(warnings)))
 )]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![feature(core_intrinsics)]
 #![feature(dropck_eyepatch)]
 #![feature(new_uninit)]
 #![feature(maybe_uninit_slice)]
-#![feature(min_specialization)]
 #![feature(decl_macro)]
-#![feature(pointer_byte_offsets)]
 #![feature(rustc_attrs)]
 #![cfg_attr(test, feature(test))]
 #![feature(strict_provenance)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
+#![allow(internal_features)]
 #![allow(clippy::mut_from_ref)] // Arena allocators are one of the places where this pattern is fine.
 
 use smallvec::SmallVec;
 
 use std::alloc::Layout;
 use std::cell::{Cell, RefCell};
-use std::cmp;
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr::{self, NonNull};
 use std::slice;
+use std::{cmp, intrinsics};
 
+/// This calls the passed function while ensuring it won't be inlined into the caller.
 #[inline(never)]
 #[cold]
-fn cold_path<F: FnOnce() -> R, R>(f: F) -> R {
+fn outline<F: FnOnce() -> R, R>(f: F) -> R {
     f()
-}
-
-/// An arena that can hold objects of only one type.
-pub struct TypedArena<T> {
-    /// A pointer to the next object to be allocated.
-    ptr: Cell<*mut T>,
-
-    /// A pointer to the end of the allocated area. When this pointer is
-    /// reached, a new chunk is allocated.
-    end: Cell<*mut T>,
-
-    /// A vector of arena chunks.
-    chunks: RefCell<Vec<ArenaChunk<T>>>,
-
-    /// Marker indicating that dropping the arena causes its owned
-    /// instances of `T` to be dropped.
-    _own: PhantomData<T>,
 }
 
 struct ArenaChunk<T = u8> {
@@ -67,7 +53,7 @@ struct ArenaChunk<T = u8> {
 
 unsafe impl<#[may_dangle] T> Drop for ArenaChunk<T> {
     fn drop(&mut self) {
-        unsafe { Box::from_raw(self.storage.as_mut()) };
+        unsafe { drop(Box::from_raw(self.storage.as_mut())) }
     }
 }
 
@@ -127,6 +113,23 @@ impl<T> ArenaChunk<T> {
 const PAGE: usize = 4096;
 const HUGE_PAGE: usize = 2 * 1024 * 1024;
 
+/// An arena that can hold objects of only one type.
+pub struct TypedArena<T> {
+    /// A pointer to the next object to be allocated.
+    ptr: Cell<*mut T>,
+
+    /// A pointer to the end of the allocated area. When this pointer is
+    /// reached, a new chunk is allocated.
+    end: Cell<*mut T>,
+
+    /// A vector of arena chunks.
+    chunks: RefCell<Vec<ArenaChunk<T>>>,
+
+    /// Marker indicating that dropping the arena causes its owned
+    /// instances of `T` to be dropped.
+    _own: PhantomData<T>,
+}
+
 impl<T> Default for TypedArena<T> {
     /// Creates a new `TypedArena`.
     fn default() -> TypedArena<T> {
@@ -137,77 +140,6 @@ impl<T> Default for TypedArena<T> {
             end: Cell::new(ptr::null_mut()),
             chunks: Default::default(),
             _own: PhantomData,
-        }
-    }
-}
-
-trait IterExt<T> {
-    fn alloc_from_iter(self, arena: &TypedArena<T>) -> &mut [T];
-}
-
-impl<I, T> IterExt<T> for I
-where
-    I: IntoIterator<Item = T>,
-{
-    // This default collects into a `SmallVec` and then allocates by copying
-    // from it. The specializations below for types like `Vec` are more
-    // efficient, copying directly without the intermediate collecting step.
-    // This default could be made more efficient, like
-    // `DroplessArena::alloc_from_iter`, but it's not hot enough to bother.
-    #[inline]
-    default fn alloc_from_iter(self, arena: &TypedArena<T>) -> &mut [T] {
-        let vec: SmallVec<[_; 8]> = self.into_iter().collect();
-        vec.alloc_from_iter(arena)
-    }
-}
-
-impl<T, const N: usize> IterExt<T> for std::array::IntoIter<T, N> {
-    #[inline]
-    fn alloc_from_iter(self, arena: &TypedArena<T>) -> &mut [T] {
-        let len = self.len();
-        if len == 0 {
-            return &mut [];
-        }
-        // Move the content to the arena by copying and then forgetting it.
-        unsafe {
-            let start_ptr = arena.alloc_raw_slice(len);
-            self.as_slice().as_ptr().copy_to_nonoverlapping(start_ptr, len);
-            mem::forget(self);
-            slice::from_raw_parts_mut(start_ptr, len)
-        }
-    }
-}
-
-impl<T> IterExt<T> for Vec<T> {
-    #[inline]
-    fn alloc_from_iter(mut self, arena: &TypedArena<T>) -> &mut [T] {
-        let len = self.len();
-        if len == 0 {
-            return &mut [];
-        }
-        // Move the content to the arena by copying and then forgetting it.
-        unsafe {
-            let start_ptr = arena.alloc_raw_slice(len);
-            self.as_ptr().copy_to_nonoverlapping(start_ptr, len);
-            self.set_len(0);
-            slice::from_raw_parts_mut(start_ptr, len)
-        }
-    }
-}
-
-impl<A: smallvec::Array> IterExt<A::Item> for SmallVec<A> {
-    #[inline]
-    fn alloc_from_iter(mut self, arena: &TypedArena<A::Item>) -> &mut [A::Item] {
-        let len = self.len();
-        if len == 0 {
-            return &mut [];
-        }
-        // Move the content to the arena by copying and then forgetting it.
-        unsafe {
-            let start_ptr = arena.alloc_raw_slice(len);
-            self.as_ptr().copy_to_nonoverlapping(start_ptr, len);
-            self.set_len(0);
-            slice::from_raw_parts_mut(start_ptr, len)
         }
     }
 }
@@ -247,33 +179,55 @@ impl<T> TypedArena<T> {
         available_bytes >= additional_bytes
     }
 
-    /// Ensures there's enough space in the current chunk to fit `len` objects.
     #[inline]
-    fn ensure_capacity(&self, additional: usize) {
-        if !self.can_allocate(additional) {
-            self.grow(additional);
-            debug_assert!(self.can_allocate(additional));
-        }
-    }
-
-    #[inline]
-    unsafe fn alloc_raw_slice(&self, len: usize) -> *mut T {
+    fn alloc_raw_slice(&self, len: usize) -> *mut T {
         assert!(mem::size_of::<T>() != 0);
         assert!(len != 0);
 
-        self.ensure_capacity(len);
+        // Ensure the current chunk can fit `len` objects.
+        if !self.can_allocate(len) {
+            self.grow(len);
+            debug_assert!(self.can_allocate(len));
+        }
 
         let start_ptr = self.ptr.get();
-        // SAFETY: `self.ensure_capacity` makes sure that there is enough space
-        // for `len` elements.
+        // SAFETY: `can_allocate`/`grow` ensures that there is enough space for
+        // `len` elements.
         unsafe { self.ptr.set(start_ptr.add(len)) };
         start_ptr
     }
 
     #[inline]
     pub fn alloc_from_iter<I: IntoIterator<Item = T>>(&self, iter: I) -> &mut [T] {
+        // This implementation is entirely separate to
+        // `DroplessIterator::alloc_from_iter`, even though conceptually they
+        // are the same.
+        //
+        // `DroplessIterator` (in the fast case) writes elements from the
+        // iterator one at a time into the allocated memory. That's easy
+        // because the elements don't implement `Drop`. But for `TypedArena`
+        // they do implement `Drop`, which means that if the iterator panics we
+        // could end up with some allocated-but-uninitialized elements, which
+        // will then cause UB in `TypedArena::drop`.
+        //
+        // Instead we use an approach where any iterator panic will occur
+        // before the memory is allocated. This function is much less hot than
+        // `DroplessArena::alloc_from_iter`, so it doesn't need to be
+        // hyper-optimized.
         assert!(mem::size_of::<T>() != 0);
-        iter.alloc_from_iter(self)
+
+        let mut vec: SmallVec<[_; 8]> = iter.into_iter().collect();
+        if vec.is_empty() {
+            return &mut [];
+        }
+        // Move the content to the arena by copying and then forgetting it.
+        let len = vec.len();
+        let start_ptr = self.alloc_raw_slice(len);
+        unsafe {
+            vec.as_ptr().copy_to_nonoverlapping(start_ptr, len);
+            vec.set_len(0);
+            slice::from_raw_parts_mut(start_ptr, len)
+        }
     }
 
     /// Grows the arena.
@@ -362,6 +316,22 @@ unsafe impl<#[may_dangle] T> Drop for TypedArena<T> {
 
 unsafe impl<T: Send> Send for TypedArena<T> {}
 
+#[inline(always)]
+fn align_down(val: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    val & !(align - 1)
+}
+
+#[inline(always)]
+fn align_up(val: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (val + align - 1) & !(align - 1)
+}
+
+// Pointer alignment is common in compiler types, so keep `DroplessArena` aligned to them
+// to optimize away alignment code.
+const DROPLESS_ALIGNMENT: usize = mem::align_of::<usize>();
+
 /// An arena that can hold objects of multiple different types that impl `Copy`
 /// and/or satisfy `!mem::needs_drop`.
 pub struct DroplessArena {
@@ -374,6 +344,8 @@ pub struct DroplessArena {
     /// start. (This is slightly simpler and faster than allocating upwards,
     /// see <https://fitzgeraldnick.com/2019/11/01/always-bump-downwards.html>.)
     /// When this pointer crosses the start pointer, a new chunk is allocated.
+    ///
+    /// This is kept aligned to DROPLESS_ALIGNMENT.
     end: Cell<*mut u8>,
 
     /// A vector of arena chunks.
@@ -386,6 +358,8 @@ impl Default for DroplessArena {
     #[inline]
     fn default() -> DroplessArena {
         DroplessArena {
+            // We set both `start` and `end` to 0 so that the first call to
+            // alloc() will trigger a grow().
             start: Cell::new(ptr::null_mut()),
             end: Cell::new(ptr::null_mut()),
             chunks: Default::default(),
@@ -396,7 +370,11 @@ impl Default for DroplessArena {
 impl DroplessArena {
     #[inline(never)]
     #[cold]
-    fn grow(&self, additional: usize) {
+    fn grow(&self, layout: Layout) {
+        // Add some padding so we can align `self.end` while
+        // still fitting in a `layout` allocation.
+        let additional = layout.size() + cmp::max(DROPLESS_ALIGNMENT, layout.align()) - 1;
+
         unsafe {
             let mut chunks = self.chunks.borrow_mut();
             let mut new_cap;
@@ -415,53 +393,64 @@ impl DroplessArena {
             // Also ensure that this chunk can fit `additional`.
             new_cap = cmp::max(additional, new_cap);
 
-            let mut chunk = ArenaChunk::new(new_cap);
+            let mut chunk = ArenaChunk::new(align_up(new_cap, PAGE));
             self.start.set(chunk.start());
-            self.end.set(chunk.end());
+
+            // Align the end to DROPLESS_ALIGNMENT.
+            let end = align_down(chunk.end().addr(), DROPLESS_ALIGNMENT);
+
+            // Make sure we don't go past `start`. This should not happen since the allocation
+            // should be at least DROPLESS_ALIGNMENT - 1 bytes.
+            debug_assert!(chunk.start().addr() <= end);
+
+            self.end.set(chunk.end().with_addr(end));
+
             chunks.push(chunk);
-        }
-    }
-
-    /// Allocates a byte slice with specified layout from the current memory
-    /// chunk. Returns `None` if there is no free space left to satisfy the
-    /// request.
-    #[inline]
-    fn alloc_raw_without_grow(&self, layout: Layout) -> Option<*mut u8> {
-        let start = self.start.get().addr();
-        let old_end = self.end.get();
-        let end = old_end.addr();
-
-        let align = layout.align();
-        let bytes = layout.size();
-
-        let new_end = end.checked_sub(bytes)? & !(align - 1);
-        if start <= new_end {
-            let new_end = old_end.with_addr(new_end);
-            self.end.set(new_end);
-            Some(new_end)
-        } else {
-            None
         }
     }
 
     #[inline]
     pub fn alloc_raw(&self, layout: Layout) -> *mut u8 {
         assert!(layout.size() != 0);
+
+        // This loop executes once or twice: if allocation fails the first
+        // time, the `grow` ensures it will succeed the second time.
         loop {
-            if let Some(a) = self.alloc_raw_without_grow(layout) {
-                break a;
+            let start = self.start.get().addr();
+            let old_end = self.end.get();
+            let end = old_end.addr();
+
+            // Align allocated bytes so that `self.end` stays aligned to
+            // DROPLESS_ALIGNMENT.
+            let bytes = align_up(layout.size(), DROPLESS_ALIGNMENT);
+
+            // Tell LLVM that `end` is aligned to DROPLESS_ALIGNMENT.
+            unsafe { intrinsics::assume(end == align_down(end, DROPLESS_ALIGNMENT)) };
+
+            if let Some(sub) = end.checked_sub(bytes) {
+                let new_end = align_down(sub, layout.align());
+                if start <= new_end {
+                    let new_end = old_end.with_addr(new_end);
+                    // `new_end` is aligned to DROPLESS_ALIGNMENT as `align_down`
+                    // preserves alignment as both `end` and `bytes` are already
+                    // aligned to DROPLESS_ALIGNMENT.
+                    self.end.set(new_end);
+                    return new_end;
+                }
             }
+
             // No free space left. Allocate a new chunk to satisfy the request.
             // On failure the grow will panic or abort.
-            self.grow(layout.size());
+            self.grow(layout);
         }
     }
 
     #[inline]
     pub fn alloc<T>(&self, object: T) -> &mut T {
         assert!(!mem::needs_drop::<T>());
+        assert!(mem::size_of::<T>() != 0);
 
-        let mem = self.alloc_raw(Layout::for_value::<T>(&object)) as *mut T;
+        let mem = self.alloc_raw(Layout::new::<T>()) as *mut T;
 
         unsafe {
             // Write into uninitialized memory.
@@ -546,7 +535,7 @@ impl DroplessArena {
                 unsafe { self.write_from_iter(iter, len, mem) }
             }
             (_, _) => {
-                cold_path(move || -> &mut [T] {
+                outline(move || -> &mut [T] {
                     let mut vec: SmallVec<[_; 8]> = iter.collect();
                     if vec.is_empty() {
                         return &mut [];
@@ -658,10 +647,10 @@ pub macro declare_arena([$($a:tt $name:ident: $ty:ty,)*]) {
         }
 
         #[allow(clippy::mut_from_ref)]
-        pub fn alloc_from_iter<'a, T: ArenaAllocatable<'tcx, C>, C>(
-            &'a self,
+        pub fn alloc_from_iter<T: ArenaAllocatable<'tcx, C>, C>(
+            &self,
             iter: impl ::std::iter::IntoIterator<Item = T>,
-        ) -> &'a mut [T] {
+        ) -> &mut [T] {
             T::allocate_from_iter(self, iter)
         }
     }

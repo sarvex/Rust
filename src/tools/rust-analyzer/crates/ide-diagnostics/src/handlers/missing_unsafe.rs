@@ -4,16 +4,17 @@ use syntax::{ast, SyntaxNode};
 use syntax::{match_ast, AstNode};
 use text_edit::TextEdit;
 
-use crate::{fix, Diagnostic, DiagnosticsContext};
+use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsContext};
 
 // Diagnostic: missing-unsafe
 //
 // This diagnostic is triggered if an operation marked as `unsafe` is used outside of an `unsafe` function or block.
 pub(crate) fn missing_unsafe(ctx: &DiagnosticsContext<'_>, d: &hir::MissingUnsafe) -> Diagnostic {
-    Diagnostic::new(
-        "missing-unsafe",
+    Diagnostic::new_with_syntax_node_ptr(
+        ctx,
+        DiagnosticCode::RustcHardError("E0133"),
         "this operation is unsafe and requires an unsafe function or block",
-        ctx.sema.diagnostics_display_range(d.expr.clone().map(|it| it.into())).range,
+        d.expr.clone().map(|it| it.into()),
     )
     .with_fixes(fixes(ctx, d))
 }
@@ -24,7 +25,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingUnsafe) -> Option<Vec<Ass
         return None;
     }
 
-    let root = ctx.sema.db.parse_or_expand(d.expr.file_id)?;
+    let root = ctx.sema.db.parse_or_expand(d.expr.file_id);
     let expr = d.expr.value.to_node(&root);
 
     let node_to_add_unsafe_block = pick_best_node_to_add_unsafe_block(&expr)?;
@@ -99,9 +100,9 @@ mod tests {
             r#"
 fn main() {
     let x = &5 as *const usize;
-    unsafe { let y = *x; }
-    let z = *x;
-}         //^^💡 error: this operation is unsafe and requires an unsafe function or block
+    unsafe { let _y = *x; }
+    let _z = *x;
+}          //^^💡 error: this operation is unsafe and requires an unsafe function or block
 "#,
         )
     }
@@ -115,13 +116,13 @@ struct HasUnsafe;
 impl HasUnsafe {
     unsafe fn unsafe_fn(&self) {
         let x = &5 as *const usize;
-        let y = *x;
+        let _y = *x;
     }
 }
 
 unsafe fn unsafe_fn() {
     let x = &5 as *const usize;
-    let y = *x;
+    let _y = *x;
 }
 
 fn main() {
@@ -142,6 +143,8 @@ fn main() {
     fn missing_unsafe_diagnostic_with_static_mut() {
         check_diagnostics(
             r#"
+//- minicore: copy
+
 struct Ty {
     a: u8,
 }
@@ -149,10 +152,10 @@ struct Ty {
 static mut STATIC_MUT: Ty = Ty { a: 0 };
 
 fn main() {
-    let x = STATIC_MUT.a;
-          //^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+    let _x = STATIC_MUT.a;
+           //^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
     unsafe {
-        let x = STATIC_MUT.a;
+        let _x = STATIC_MUT.a;
     }
 }
 "#,
@@ -184,13 +187,13 @@ fn main() {
             r#"
 fn main() {
     let x = &5 as *const usize;
-    let z = *x$0;
+    let _z = *x$0;
 }
 "#,
             r#"
 fn main() {
     let x = &5 as *const usize;
-    let z = unsafe { *x };
+    let _z = unsafe { *x };
 }
 "#,
         );
@@ -228,7 +231,7 @@ struct S(usize);
 impl S {
     unsafe fn func(&self) {
         let x = &self.0 as *const usize;
-        let z = *x;
+        let _z = *x;
     }
 }
 fn main() {
@@ -241,7 +244,7 @@ struct S(usize);
 impl S {
     unsafe fn func(&self) {
         let x = &self.0 as *const usize;
-        let z = *x;
+        let _z = *x;
     }
 }
 fn main() {
@@ -256,6 +259,7 @@ fn main() {
     fn add_unsafe_block_when_accessing_mutable_static() {
         check_fix(
             r#"
+//- minicore: copy
 struct Ty {
     a: u8,
 }
@@ -263,7 +267,7 @@ struct Ty {
 static mut STATIC_MUT: Ty = Ty { a: 0 };
 
 fn main() {
-    let x = STATIC_MUT$0.a;
+    let _x = STATIC_MUT$0.a;
 }
 "#,
             r#"
@@ -274,7 +278,7 @@ struct Ty {
 static mut STATIC_MUT: Ty = Ty { a: 0 };
 
 fn main() {
-    let x = unsafe { STATIC_MUT.a };
+    let _x = unsafe { STATIC_MUT.a };
 }
 "#,
         )
@@ -374,19 +378,20 @@ fn main() {
     fn unsafe_expr_as_right_hand_side_of_assignment() {
         check_fix(
             r#"
+//- minicore: copy
 static mut STATIC_MUT: u8 = 0;
 
 fn main() {
-    let x;
-    x = STATIC_MUT$0;
+    let _x;
+    _x = STATIC_MUT$0;
 }
 "#,
             r#"
 static mut STATIC_MUT: u8 = 0;
 
 fn main() {
-    let x;
-    x = unsafe { STATIC_MUT };
+    let _x;
+    _x = unsafe { STATIC_MUT };
 }
 "#,
         )
@@ -396,17 +401,18 @@ fn main() {
     fn unsafe_expr_in_binary_plus() {
         check_fix(
             r#"
+//- minicore: copy
 static mut STATIC_MUT: u8 = 0;
 
 fn main() {
-    let x = STATIC_MUT$0 + 1;
+    let _x = STATIC_MUT$0 + 1;
 }
 "#,
             r#"
 static mut STATIC_MUT: u8 = 0;
 
 fn main() {
-    let x = unsafe { STATIC_MUT } + 1;
+    let _x = unsafe { STATIC_MUT } + 1;
 }
 "#,
         )
@@ -419,14 +425,14 @@ fn main() {
 static mut STATIC_MUT: u8 = 0;
 
 fn main() {
-    let x = &STATIC_MUT$0;
+    let _x = &STATIC_MUT$0;
 }
 "#,
             r#"
 static mut STATIC_MUT: u8 = 0;
 
 fn main() {
-    let x = unsafe { &STATIC_MUT };
+    let _x = unsafe { &STATIC_MUT };
 }
 "#,
         )
@@ -439,14 +445,14 @@ fn main() {
 static mut STATIC_MUT: u8 = 0;
 
 fn main() {
-    let x = &&STATIC_MUT$0;
+    let _x = &&STATIC_MUT$0;
 }
 "#,
             r#"
 static mut STATIC_MUT: u8 = 0;
 
 fn main() {
-    let x = unsafe { &&STATIC_MUT };
+    let _x = unsafe { &&STATIC_MUT };
 }
 "#,
         )

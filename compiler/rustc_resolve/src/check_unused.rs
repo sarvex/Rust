@@ -59,7 +59,6 @@ struct UnusedImportCheckVisitor<'a, 'b, 'tcx> {
     base_use_tree: Option<&'a ast::UseTree>,
     base_id: ast::NodeId,
     item_span: Span,
-    base_use_is_pub: bool,
 }
 
 struct ExternCrateToLint {
@@ -117,16 +116,11 @@ impl<'a, 'b, 'tcx> UnusedImportCheckVisitor<'a, 'b, 'tcx> {
         match item.kind {
             ast::UseTreeKind::Simple(Some(ident)) => {
                 if ident.name == kw::Underscore
-                    && !self
-                        .r
-                        .import_res_map
-                        .get(&id)
-                        .map(|per_ns| {
-                            per_ns.iter().filter_map(|res| res.as_ref()).any(|res| {
-                                matches!(res, Res::Def(DefKind::Trait | DefKind::TraitAlias, _))
-                            })
+                    && !self.r.import_res_map.get(&id).is_some_and(|per_ns| {
+                        per_ns.iter().filter_map(|res| res.as_ref()).any(|res| {
+                            matches!(res, Res::Def(DefKind::Trait | DefKind::TraitAlias, _))
                         })
-                        .unwrap_or(false)
+                    })
                 {
                     self.unused_import(self.base_id).add(id);
                 }
@@ -151,7 +145,6 @@ impl<'a, 'b, 'tcx> Visitor<'a> for UnusedImportCheckVisitor<'a, 'b, 'tcx> {
             // because this means that they were generated in some fashion by the
             // compiler and we don't need to consider them.
             ast::ItemKind::Use(..) if item.span.is_dummy() => return,
-            ast::ItemKind::Use(..) => self.base_use_is_pub = item.vis.kind.is_pub(),
             ast::ItemKind::ExternCrate(orig_name) => {
                 self.extern_crate_items.push(ExternCrateToLint {
                     id: item.id,
@@ -178,7 +171,7 @@ impl<'a, 'b, 'tcx> Visitor<'a> for UnusedImportCheckVisitor<'a, 'b, 'tcx> {
             self.base_use_tree = Some(use_tree);
         }
 
-        if self.base_use_is_pub {
+        if self.r.effective_visibilities.is_exported(self.r.local_def_id(id)) {
             self.check_import_as_underscore(use_tree, id);
             return;
         }
@@ -337,13 +330,12 @@ impl Resolver<'_, '_> {
             base_use_tree: None,
             base_id: ast::DUMMY_NODE_ID,
             item_span: DUMMY_SP,
-            base_use_is_pub: false,
         };
         visit::walk_crate(&mut visitor, krate);
 
         for unused in visitor.unused_imports.values() {
             let mut fixes = Vec::new();
-            let mut spans = match calc_unused_spans(unused, unused.use_tree, unused.use_tree_id) {
+            let spans = match calc_unused_spans(unused, unused.use_tree, unused.use_tree_id) {
                 UnusedSpanResult::Used => continue,
                 UnusedSpanResult::FlatUnused(span, remove) => {
                     fixes.push((remove, String::new()));
@@ -361,20 +353,19 @@ impl Resolver<'_, '_> {
                 }
             };
 
-            let len = spans.len();
-            spans.sort();
-            let ms = MultiSpan::from_spans(spans.clone());
-            let mut span_snippets = spans
+            let ms = MultiSpan::from_spans(spans);
+
+            let mut span_snippets = ms
+                .primary_spans()
                 .iter()
-                .filter_map(|s| match tcx.sess.source_map().span_to_snippet(*s) {
-                    Ok(s) => Some(format!("`{}`", s)),
-                    _ => None,
-                })
+                .filter_map(|span| tcx.sess.source_map().span_to_snippet(*span).ok())
+                .map(|s| format!("`{s}`"))
                 .collect::<Vec<String>>();
             span_snippets.sort();
+
             let msg = format!(
                 "unused import{}{}",
-                pluralize!(len),
+                pluralize!(ms.primary_spans().len()),
                 if !span_snippets.is_empty() {
                     format!(": {}", span_snippets.join(", "))
                 } else {
@@ -384,7 +375,7 @@ impl Resolver<'_, '_> {
 
             let fix_msg = if fixes.len() == 1 && fixes[0].0 == unused.item_span {
                 "remove the whole `use` item"
-            } else if spans.len() > 1 {
+            } else if ms.primary_spans().len() > 1 {
                 "remove the unused imports"
             } else {
                 "remove the unused import"
@@ -445,7 +436,7 @@ impl Resolver<'_, '_> {
 
             // If we are not in Rust 2018 edition, then we don't make any further
             // suggestions.
-            if !tcx.sess.rust_2018() {
+            if !tcx.sess.at_least_rust_2018() {
                 continue;
             }
 
@@ -469,7 +460,7 @@ impl Resolver<'_, '_> {
                 .r
                 .extern_prelude
                 .get(&extern_crate.ident)
-                .map_or(false, |entry| !entry.introduced_by_item)
+                .is_some_and(|entry| !entry.introduced_by_item)
             {
                 continue;
             }

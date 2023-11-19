@@ -9,8 +9,8 @@ use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::util::unicode::contains_text_flow_control_chars;
 use rustc_errors::{error_code, Applicability, Diagnostic, DiagnosticBuilder, StashKey};
 use rustc_lexer::unescape::{self, EscapeError, Mode};
-use rustc_lexer::Cursor;
 use rustc_lexer::{Base, DocStyle, RawStrError};
+use rustc_lexer::{Cursor, LiteralKind};
 use rustc_session::lint::builtin::{
     RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX, TEXT_DIRECTION_CODEPOINT_IN_COMMENT,
 };
@@ -64,25 +64,26 @@ pub(crate) fn parse_token_trees<'a>(
         override_span,
         nbsp_is_whitespace: false,
     };
-    let (token_trees, unmatched_delims) =
+    let (stream, res, unmatched_delims) =
         tokentrees::TokenTreesReader::parse_all_token_trees(string_reader);
-    match token_trees {
-        Ok(stream) if unmatched_delims.is_empty() => Ok(stream),
+    match res {
+        Ok(()) if unmatched_delims.is_empty() => Ok(stream),
         _ => {
             // Return error if there are unmatched delimiters or unclosed delimiters.
             // We emit delimiter mismatch errors first, then emit the unclosing delimiter mismatch
             // because the delimiter mismatch is more likely to be the root cause of error
 
             let mut buffer = Vec::with_capacity(1);
-            // Not using `emit_unclosed_delims` to use `db.buffer`
             for unmatched in unmatched_delims {
                 if let Some(err) = make_unclosed_delims_error(unmatched, &sess) {
                     err.buffer(&mut buffer);
                 }
             }
-            if let Err(err) = token_trees {
-                // Add unclosing delimiter error
-                err.buffer(&mut buffer);
+            if let Err(errs) = res {
+                // Add unclosing delimiter or diff marker errors
+                for err in errs {
+                    err.buffer(&mut buffer);
+                }
             }
             Err(buffer)
         }
@@ -118,6 +119,7 @@ impl<'a> StringReader<'a> {
         let mut swallow_next_invalid = 0;
         // Skip trivial (whitespace & comments) tokens
         loop {
+            let str_before = self.cursor.as_str();
             let token = self.cursor.advance_token();
             let start = self.pos;
             self.pos = self.pos + BytePos(token.len);
@@ -165,10 +167,7 @@ impl<'a> StringReader<'a> {
                     continue;
                 }
                 rustc_lexer::TokenKind::Ident => {
-                    let sym = nfc_normalize(self.str_from(start));
-                    let span = self.mk_sp(start, self.pos);
-                    self.sess.symbol_gallery.insert(sym, span);
-                    token::Ident(sym, false)
+                    self.ident(start)
                 }
                 rustc_lexer::TokenKind::RawIdent => {
                     let sym = nfc_normalize(self.str_from(start + BytePos(2)));
@@ -182,10 +181,7 @@ impl<'a> StringReader<'a> {
                 }
                 rustc_lexer::TokenKind::UnknownPrefix => {
                     self.report_unknown_prefix(start);
-                    let sym = nfc_normalize(self.str_from(start));
-                    let span = self.mk_sp(start, self.pos);
-                    self.sess.symbol_gallery.insert(sym, span);
-                    token::Ident(sym, false)
+                    self.ident(start)
                 }
                 rustc_lexer::TokenKind::InvalidIdent
                     // Do not recover an identifier with emoji if the codepoint is a confusable
@@ -202,6 +198,27 @@ impl<'a> StringReader<'a> {
                     self.sess.bad_unicode_identifiers.borrow_mut().entry(sym).or_default()
                         .push(span);
                     token::Ident(sym, false)
+                }
+                // split up (raw) c string literals to an ident and a string literal when edition < 2021.
+                rustc_lexer::TokenKind::Literal {
+                    kind: kind @ (LiteralKind::CStr { .. } | LiteralKind::RawCStr { .. }),
+                    suffix_start: _,
+                } if !self.mk_sp(start, self.pos).edition().at_least_rust_2021() => {
+                    let prefix_len = match kind {
+                        LiteralKind::CStr { .. } => 1,
+                        LiteralKind::RawCStr { .. } => 2,
+                        _ => unreachable!(),
+                    };
+
+                    // reset the state so that only the prefix ("c" or "cr")
+                    // was consumed.
+                    let lit_start = start + BytePos(prefix_len);
+                    self.pos = lit_start;
+                    self.cursor = Cursor::new(&str_before[prefix_len as usize..]);
+
+                    self.report_unknown_prefix(start);
+                    let prefix_span = self.mk_sp(start, lit_start);
+                    return (Token::new(self.ident(start), prefix_span), preceded_by_whitespace);
                 }
                 rustc_lexer::TokenKind::Literal { kind, suffix_start } => {
                     let suffix_start = start + BytePos(suffix_start);
@@ -315,6 +332,13 @@ impl<'a> StringReader<'a> {
             let span = self.mk_sp(start, self.pos);
             return (Token::new(kind, span), preceded_by_whitespace);
         }
+    }
+
+    fn ident(&self, start: BytePos) -> TokenKind {
+        let sym = nfc_normalize(self.str_from(start));
+        let span = self.mk_sp(start, self.pos);
+        self.sess.symbol_gallery.insert(sym, span);
+        token::Ident(sym, false)
     }
 
     fn struct_fatal_span_char(
@@ -662,7 +686,7 @@ impl<'a> StringReader<'a> {
                 &RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX,
                 prefix_span,
                 ast::CRATE_NODE_ID,
-                &format!("prefix `{prefix}` is unknown"),
+                format!("prefix `{prefix}` is unknown"),
                 BuiltinLintDiagnostics::ReservedPrefix(prefix_span),
             );
         }

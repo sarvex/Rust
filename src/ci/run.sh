@@ -8,7 +8,7 @@ fi
 
 if [ "$NO_CHANGE_USER" = "" ]; then
   if [ "$LOCAL_USER_ID" != "" ]; then
-    useradd --shell /bin/bash -u $LOCAL_USER_ID -o -c "" -m user
+    id -u user &>/dev/null || useradd --shell /bin/bash -u $LOCAL_USER_ID -o -c "" -m user
     export HOME=/home/user
     unset LOCAL_USER_ID
 
@@ -47,12 +47,14 @@ source "$ci_dir/shared.sh"
 
 export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
-if ! isCI || isCiBranch auto || isCiBranch beta || isCiBranch try || isCiBranch try-perf; then
+if ! isCI || isCiBranch auto || isCiBranch beta || isCiBranch try || isCiBranch try-perf || \
+  isCiBranch automation/bors/try; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set build.print-step-timings --enable-verbose-tests"
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set build.metrics"
     HAS_METRICS=1
 fi
 
+RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-verbose-configure"
 RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-sccache"
 RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --disable-manage-submodules"
 RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-locked-deps"
@@ -96,12 +98,14 @@ if [ "$DEPLOY$DEPLOY_ALT" = "1" ]; then
   if [ "$NO_LLVM_ASSERTIONS" = "1" ]; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --disable-llvm-assertions"
   elif [ "$DEPLOY_ALT" != "" ]; then
-    if [ "$NO_PARALLEL_COMPILER" = "" ]; then
-      RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.parallel-compiler"
+    if [ "$ALT_PARALLEL_COMPILER" = "" ]; then
+      RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.parallel-compiler=false"
     fi
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-llvm-assertions"
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.verify-llvm-ir"
   fi
+
+  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.codegen-backends=${CODEGEN_BACKENDS:-llvm}"
 else
   # We almost always want debug assertions enabled, but sometimes this takes too
   # long for too little benefit, so we just turn them off.
@@ -122,6 +126,16 @@ else
 
   RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.verify-llvm-ir"
 
+  # When running gcc backend tests, we need to install `libgccjit` and to not run llvm codegen
+  # tests as it will fail them.
+  if [[ "${ENABLE_GCC_CODEGEN}" == "1" ]]; then
+    # Test the Cranelift and GCC backends in CI. Bootstrap knows which targets to run tests on.
+    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.codegen-backends=llvm,cranelift,gcc"
+  else
+    # Test the Cranelift backend in CI. Bootstrap knows which targets to run tests on.
+    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.codegen-backends=llvm,cranelift"
+  fi
+
   # We enable this for non-dist builders, since those aren't trying to produce
   # fresh binaries. We currently don't entirely support distributing a fresh
   # copy of the compiler (including llvm tools, etc.) if we haven't actually
@@ -131,7 +145,7 @@ else
   # LLVM continuously on at least some builders to ensure it works, though.
   # (And PGO is its own can of worms).
   if [ "$NO_DOWNLOAD_CI_LLVM" = "" ]; then
-    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set llvm.download-ci-llvm=if-available"
+    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set llvm.download-ci-llvm=if-unchanged"
   else
     # When building for CI we want to use the static C++ Standard library
     # included with LLVM, since a dynamic libstdcpp may not be available.
@@ -153,13 +167,25 @@ fi
 # check for clock drifts. An HTTP URL is used instead of HTTPS since on Azure
 # Pipelines it happened that the certificates were marked as expired.
 datecheck() {
-  echo "== clock drift check =="
+  # If an error has happened, we do not want to start a new group, because that will collapse
+  # a previous group that might have contained the error log.
+  exit_code=$?
+
+  if [ $exit_code -eq 0 ]
+  then
+    echo "::group::Clock drift check"
+  fi
+
   echo -n "  local time: "
   date
   echo -n "  network time: "
   curl -fs --head http://ci-caches.rust-lang.org | grep ^Date: \
       | sed 's/Date: //g' || true
-  echo "== end clock drift check =="
+
+  if [ $exit_code -eq 0 ]
+  then
+    echo "::endgroup::"
+  fi
 }
 datecheck
 trap datecheck EXIT
@@ -170,12 +196,16 @@ trap datecheck EXIT
 # sccache server at the start of the build, but no need to worry if this fails.
 SCCACHE_IDLE_TIMEOUT=10800 sccache --start-server || true
 
+# Our build may overwrite config.toml, so we remove it here
+rm -f config.toml
+
 $SRC/configure $RUST_CONFIGURE_ARGS
 
 retry make prepare
 
 # Display the CPU and memory information. This helps us know why the CI timing
 # is fluctuating.
+echo "::group::Display CPU and Memory information"
 if isMacOS; then
     system_profiler SPHardwareDataType || true
     sysctl hw || true
@@ -185,8 +215,10 @@ else
     cat /proc/meminfo || true
     ncpus=$(grep processor /proc/cpuinfo | wc -l)
 fi
+echo "::endgroup::"
 
 if [ ! -z "$SCRIPT" ]; then
+  echo "Executing ${SCRIPT}"
   sh -x -c "$SCRIPT"
 else
   do_make() {
@@ -216,4 +248,6 @@ if [ "$RUN_CHECK_WITH_PARALLEL_QUERIES" != "" ]; then
   CARGO_INCREMENTAL=0 ../x check
 fi
 
+echo "::group::sccache stats"
 sccache --show-stats || true
+echo "::endgroup::"

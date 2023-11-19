@@ -38,7 +38,7 @@ can be broken down into several distinct phases:
 
 While type checking a function, the intermediate types for the
 expressions, blocks, and so forth contained within the function are
-stored in `fcx.node_types` and `fcx.node_substs`. These types
+stored in `fcx.node_types` and `fcx.node_args`. These types
 may contain unresolved type variables. After type checking is
 complete, the functions in the writeback module are used to take the
 types from this table, resolve them, and then write them into their
@@ -65,6 +65,7 @@ a type parameter).
 mod check;
 mod compare_impl_item;
 pub mod dropck;
+mod entry;
 pub mod intrinsic;
 pub mod intrinsicck;
 mod region;
@@ -72,23 +73,30 @@ pub mod wfcheck;
 
 pub use check::check_abi;
 
+use std::num::NonZeroU32;
+
 use check::check_mod_item_types;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_errors::{pluralize, struct_span_err, Diagnostic, DiagnosticBuilder};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::Visitor;
 use rustc_index::bit_set::BitSet;
-use rustc_middle::ty::query::Providers;
+use rustc_infer::infer::error_reporting::ObligationCauseExt as _;
+use rustc_infer::infer::outlives::env::OutlivesEnvironment;
+use rustc_infer::infer::{self, TyCtxtInferExt as _};
+use rustc_infer::traits::ObligationCause;
+use rustc_middle::query::Providers;
+use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_middle::ty::{InternalSubsts, SubstsRef};
+use rustc_middle::ty::{GenericArgs, GenericArgsRef};
 use rustc_session::parse::feature_err;
-use rustc_span::source_map::DUMMY_SP;
 use rustc_span::symbol::{kw, Ident};
-use rustc_span::{self, BytePos, Span, Symbol};
+use rustc_span::{self, def_id::CRATE_DEF_ID, BytePos, Span, Symbol, DUMMY_SP};
 use rustc_target::abi::VariantIdx;
 use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::traits::error_reporting::suggestions::ReturnsVisitor;
-use std::num::NonZeroU32;
+use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt as _;
+use rustc_trait_selection::traits::ObligationCtxt;
 
 use crate::errors;
 use crate::require_c_abi_if_c_variadic;
@@ -105,7 +113,7 @@ pub fn provide(providers: &mut Providers) {
         region_scope_tree,
         collect_return_position_impl_trait_in_trait_tys,
         compare_impl_const: compare_impl_item::compare_impl_const_raw,
-        check_generator_obligations: check::check_generator_obligations,
+        check_coroutine_obligations: check::check_coroutine_obligations,
         ..*providers
     };
 }
@@ -188,7 +196,7 @@ fn missing_items_err(
     full_impl_span: Span,
 ) {
     let missing_items =
-        missing_items.iter().filter(|trait_item| tcx.opt_rpitit_info(trait_item.def_id).is_none());
+        missing_items.iter().filter(|trait_item| !trait_item.is_impl_trait_in_trait());
 
     let missing_items_msg = missing_items
         .clone()
@@ -211,9 +219,9 @@ fn missing_items_err(
         let snippet = suggestion_signature(
             tcx,
             trait_item,
-            tcx.impl_trait_ref(impl_def_id).unwrap().subst_identity(),
+            tcx.impl_trait_ref(impl_def_id).unwrap().instantiate_identity(),
         );
-        let code = format!("{}{}\n{}", padding, snippet, padding);
+        let code = format!("{padding}{snippet}\n{padding}");
         if let Some(span) = tcx.hir().span_if_local(trait_item.def_id) {
             missing_trait_item_label
                 .push(errors::MissingTraitItemLabel { span, item: trait_item.name });
@@ -288,6 +296,7 @@ fn default_body_is_unstable(
         &tcx.sess.parse_sess,
         feature,
         rustc_feature::GateIssue::Library(issue),
+        false,
     );
 
     err.emit();
@@ -296,7 +305,7 @@ fn default_body_is_unstable(
 /// Re-sugar `ty::GenericPredicates` in a way suitable to be used in structured suggestions.
 fn bounds_from_generic_predicates<'tcx>(
     tcx: TyCtxt<'tcx>,
-    predicates: impl IntoIterator<Item = (ty::Predicate<'tcx>, Span)>,
+    predicates: impl IntoIterator<Item = (ty::Clause<'tcx>, Span)>,
 ) -> (String, String) {
     let mut types: FxHashMap<Ty<'tcx>, Vec<DefId>> = FxHashMap::default();
     let mut projections = vec![];
@@ -304,7 +313,7 @@ fn bounds_from_generic_predicates<'tcx>(
         debug!("predicate {:?}", predicate);
         let bound_predicate = predicate.kind();
         match bound_predicate.skip_binder() {
-            ty::PredicateKind::Clause(ty::Clause::Trait(trait_predicate)) => {
+            ty::ClauseKind::Trait(trait_predicate) => {
                 let entry = types.entry(trait_predicate.self_ty()).or_default();
                 let def_id = trait_predicate.def_id();
                 if Some(def_id) != tcx.lang_items().sized_trait() {
@@ -313,47 +322,58 @@ fn bounds_from_generic_predicates<'tcx>(
                     entry.push(trait_predicate.def_id());
                 }
             }
-            ty::PredicateKind::Clause(ty::Clause::Projection(projection_pred)) => {
+            ty::ClauseKind::Projection(projection_pred) => {
                 projections.push(bound_predicate.rebind(projection_pred));
             }
             _ => {}
         }
     }
-    let generics = if types.is_empty() {
-        "".to_string()
-    } else {
-        format!(
-            "<{}>",
-            types
-                .keys()
-                .filter_map(|t| match t.kind() {
-                    ty::Param(_) => Some(t.to_string()),
-                    // Avoid suggesting the following:
-                    // fn foo<T, <T as Trait>::Bar>(_: T) where T: Trait, <T as Trait>::Bar: Other {}
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
+
     let mut where_clauses = vec![];
+    let mut types_str = vec![];
     for (ty, bounds) in types {
-        where_clauses
-            .extend(bounds.into_iter().map(|bound| format!("{}: {}", ty, tcx.def_path_str(bound))));
+        if let ty::Param(_) = ty.kind() {
+            let mut bounds_str = vec![];
+            for bound in bounds {
+                let mut projections_str = vec![];
+                for projection in &projections {
+                    let p = projection.skip_binder();
+                    let alias_ty = p.projection_ty;
+                    if bound == tcx.parent(alias_ty.def_id) && alias_ty.self_ty() == ty {
+                        let name = tcx.item_name(alias_ty.def_id);
+                        projections_str.push(format!("{} = {}", name, p.term));
+                    }
+                }
+                let bound_def_path = tcx.def_path_str(bound);
+                if projections_str.is_empty() {
+                    where_clauses.push(format!("{}: {}", ty, bound_def_path));
+                } else {
+                    bounds_str.push(format!("{}<{}>", bound_def_path, projections_str.join(", ")));
+                }
+            }
+            if bounds_str.is_empty() {
+                types_str.push(ty.to_string());
+            } else {
+                types_str.push(format!("{}: {}", ty, bounds_str.join(" + ")));
+            }
+        } else {
+            // Avoid suggesting the following:
+            // fn foo<T, <T as Trait>::Bar>(_: T) where T: Trait, <T as Trait>::Bar: Other {}
+            where_clauses.extend(
+                bounds.into_iter().map(|bound| format!("{}: {}", ty, tcx.def_path_str(bound))),
+            );
+        }
     }
-    for projection in &projections {
-        let p = projection.skip_binder();
-        // FIXME: this is not currently supported syntax, we should be looking at the `types` and
-        // insert the associated types where they correspond, but for now let's be "lazy" and
-        // propose this instead of the following valid resugaring:
-        // `T: Trait, Trait::Assoc = K` → `T: Trait<Assoc = K>`
-        where_clauses.push(format!("{} = {}", tcx.def_path_str(p.projection_ty.def_id), p.term));
-    }
+
+    let generics =
+        if types_str.is_empty() { "".to_string() } else { format!("<{}>", types_str.join(", ")) };
+
     let where_clauses = if where_clauses.is_empty() {
-        String::new()
+        "".to_string()
     } else {
         format!(" where {}", where_clauses.join(", "))
     };
+
     (generics, where_clauses)
 }
 
@@ -362,7 +382,7 @@ fn fn_sig_suggestion<'tcx>(
     tcx: TyCtxt<'tcx>,
     sig: ty::FnSig<'tcx>,
     ident: Ident,
-    predicates: impl IntoIterator<Item = (ty::Predicate<'tcx>, Span)>,
+    predicates: impl IntoIterator<Item = (ty::Clause<'tcx>, Span)>,
     assoc: ty::AssocItem,
 ) -> String {
     let args = sig
@@ -403,7 +423,30 @@ fn fn_sig_suggestion<'tcx>(
         .flatten()
         .collect::<Vec<String>>()
         .join(", ");
-    let output = sig.output();
+    let mut output = sig.output();
+
+    let asyncness = if tcx.asyncness(assoc.def_id).is_async() {
+        output = if let ty::Alias(_, alias_ty) = *output.kind() {
+            tcx.explicit_item_bounds(alias_ty.def_id)
+                .iter_instantiated_copied(tcx, alias_ty.args)
+                .find_map(|(bound, _)| bound.as_projection_clause()?.no_bound_vars()?.term.ty())
+                .unwrap_or_else(|| {
+                    span_bug!(
+                        ident.span,
+                        "expected async fn to have `impl Future` output, but it returns {output}"
+                    )
+                })
+        } else {
+            span_bug!(
+                ident.span,
+                "expected async fn to have `impl Future` output, but it returns {output}"
+            )
+        };
+        "async "
+    } else {
+        ""
+    };
+
     let output = if !output.is_unit() { format!(" -> {output}") } else { String::new() };
 
     let unsafety = sig.unsafety.prefix_str();
@@ -414,7 +457,9 @@ fn fn_sig_suggestion<'tcx>(
     // lifetimes between the `impl` and the `trait`, but this should be good enough to
     // fill in a significant portion of the missing code, and other subsequent
     // suggestions can help the user fix the code.
-    format!("{unsafety}fn {ident}{generics}({args}){output}{where_clauses} {{ todo!() }}")
+    format!(
+        "{unsafety}{asyncness}fn {ident}{generics}({args}){output}{where_clauses} {{ todo!() }}"
+    )
 }
 
 pub fn ty_kind_suggestion(ty: Ty<'_>) -> Option<&'static str> {
@@ -436,35 +481,32 @@ fn suggestion_signature<'tcx>(
     assoc: ty::AssocItem,
     impl_trait_ref: ty::TraitRef<'tcx>,
 ) -> String {
-    let substs = ty::InternalSubsts::identity_for_item(tcx, assoc.def_id).rebase_onto(
+    let args = ty::GenericArgs::identity_for_item(tcx, assoc.def_id).rebase_onto(
         tcx,
         assoc.container_id(tcx),
-        impl_trait_ref.with_self_ty(tcx, tcx.types.self_param).substs,
+        impl_trait_ref.with_self_ty(tcx, tcx.types.self_param).args,
     );
 
     match assoc.kind {
-        ty::AssocKind::Fn => {
-            // We skip the binder here because the binder would deanonymize all
-            // late-bound regions, and we don't want method signatures to show up
-            // `as for<'r> fn(&'r MyType)`. Pretty-printing handles late-bound
-            // regions just fine, showing `fn(&MyType)`.
-            fn_sig_suggestion(
-                tcx,
-                tcx.fn_sig(assoc.def_id).subst(tcx, substs).skip_binder(),
-                assoc.ident(tcx),
-                tcx.predicates_of(assoc.def_id).instantiate_own(tcx, substs),
-                assoc,
-            )
-        }
+        ty::AssocKind::Fn => fn_sig_suggestion(
+            tcx,
+            tcx.liberate_late_bound_regions(
+                assoc.def_id,
+                tcx.fn_sig(assoc.def_id).instantiate(tcx, args),
+            ),
+            assoc.ident(tcx),
+            tcx.predicates_of(assoc.def_id).instantiate_own(tcx, args),
+            assoc,
+        ),
         ty::AssocKind::Type => {
             let (generics, where_clauses) = bounds_from_generic_predicates(
                 tcx,
-                tcx.predicates_of(assoc.def_id).instantiate_own(tcx, substs),
+                tcx.predicates_of(assoc.def_id).instantiate_own(tcx, args),
             );
             format!("type {}{generics} = /* Type */{where_clauses};", assoc.name)
         }
         ty::AssocKind::Const => {
-            let ty = tcx.type_of(assoc.def_id).subst_identity();
+            let ty = tcx.type_of(assoc.def_id).instantiate_identity();
             let val = ty_kind_suggestion(ty).unwrap_or("todo!()");
             format!("const {}: {} = {};", assoc.name, ty, val)
         }
@@ -521,4 +563,77 @@ fn bad_non_zero_sized_fields<'tcx>(
 // FIXME: Consider moving this method to a more fitting place.
 pub fn potentially_plural_count(count: usize, word: &str) -> String {
     format!("{} {}{}", count, word, pluralize!(count))
+}
+
+pub fn check_function_signature<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mut cause: ObligationCause<'tcx>,
+    fn_id: DefId,
+    expected_sig: ty::PolyFnSig<'tcx>,
+) {
+    let local_id = fn_id.as_local().unwrap_or(CRATE_DEF_ID);
+
+    let param_env = ty::ParamEnv::empty();
+
+    let infcx = &tcx.infer_ctxt().build();
+    let ocx = ObligationCtxt::new(infcx);
+
+    let actual_sig = tcx.fn_sig(fn_id).instantiate_identity();
+
+    let norm_cause = ObligationCause::misc(cause.span, local_id);
+    let actual_sig = ocx.normalize(&norm_cause, param_env, actual_sig);
+
+    match ocx.eq(&cause, param_env, expected_sig, actual_sig) {
+        Ok(()) => {
+            let errors = ocx.select_all_or_error();
+            if !errors.is_empty() {
+                infcx.err_ctxt().report_fulfillment_errors(errors);
+                return;
+            }
+        }
+        Err(err) => {
+            let err_ctxt = infcx.err_ctxt();
+            if fn_id.is_local() {
+                cause.span = extract_span_for_error_reporting(tcx, err, &cause, local_id);
+            }
+            let failure_code = cause.as_failure_code_diag(err, cause.span, vec![]);
+            let mut diag = tcx.sess.create_err(failure_code);
+            err_ctxt.note_type_err(
+                &mut diag,
+                &cause,
+                None,
+                Some(infer::ValuePairs::PolySigs(ExpectedFound {
+                    expected: expected_sig,
+                    found: actual_sig,
+                })),
+                err,
+                false,
+                false,
+            );
+            diag.emit();
+            return;
+        }
+    }
+
+    let outlives_env = OutlivesEnvironment::new(param_env);
+    let _ = ocx.resolve_regions_and_report_errors(local_id, &outlives_env);
+
+    fn extract_span_for_error_reporting<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        err: TypeError<'_>,
+        cause: &ObligationCause<'tcx>,
+        fn_id: LocalDefId,
+    ) -> rustc_span::Span {
+        let mut args = {
+            let node = tcx.hir().expect_owner(fn_id);
+            let decl = node.fn_decl().unwrap_or_else(|| bug!("expected fn decl, found {:?}", node));
+            decl.inputs.iter().map(|t| t.span).chain(std::iter::once(decl.output.span()))
+        };
+
+        match err {
+            TypeError::ArgumentMutability(i)
+            | TypeError::ArgumentSorts(ExpectedFound { .. }, i) => args.nth(i).unwrap(),
+            _ => cause.span(),
+        }
+    }
 }

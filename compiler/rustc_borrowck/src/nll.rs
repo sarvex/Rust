@@ -10,6 +10,7 @@ use rustc_middle::mir::{
     Body, ClosureOutlivesSubject, ClosureRegionRequirements, LocalKind, Location, Promoted,
     START_BLOCK,
 };
+use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, OpaqueHiddenType, TyCtxt};
 use rustc_span::symbol::sym;
 use std::env;
@@ -27,6 +28,7 @@ use rustc_mir_dataflow::ResultsCursor;
 use crate::{
     borrow_set::BorrowSet,
     constraint_generation,
+    consumers::ConsumerOptions,
     diagnostics::RegionErrors,
     facts::{AllFacts, AllFactsExt, RustcFacts},
     invalidation,
@@ -165,32 +167,41 @@ pub(crate) fn compute_regions<'cx, 'tcx>(
     move_data: &MoveData<'tcx>,
     borrow_set: &BorrowSet<'tcx>,
     upvars: &[Upvar<'tcx>],
-    use_polonius: bool,
+    consumer_options: Option<ConsumerOptions>,
 ) -> NllOutput<'tcx> {
+    let is_polonius_legacy_enabled = infcx.tcx.sess.opts.unstable_opts.polonius.is_legacy_enabled();
+    let polonius_input = consumer_options.map(|c| c.polonius_input()).unwrap_or_default()
+        || is_polonius_legacy_enabled;
+    let polonius_output = consumer_options.map(|c| c.polonius_output()).unwrap_or_default()
+        || is_polonius_legacy_enabled;
     let mut all_facts =
-        (use_polonius || AllFacts::enabled(infcx.tcx)).then_some(AllFacts::default());
+        (polonius_input || AllFacts::enabled(infcx.tcx)).then_some(AllFacts::default());
 
     let universal_regions = Rc::new(universal_regions);
 
     let elements = &Rc::new(RegionValueElements::new(&body));
 
     // Run the MIR type-checker.
-    let MirTypeckResults { constraints, universal_region_relations, opaque_type_values } =
-        type_check::type_check(
-            infcx,
-            param_env,
-            body,
-            promoted,
-            &universal_regions,
-            location_table,
-            borrow_set,
-            &mut all_facts,
-            flow_inits,
-            move_data,
-            elements,
-            upvars,
-            use_polonius,
-        );
+    let MirTypeckResults {
+        constraints,
+        universal_region_relations,
+        opaque_type_values,
+        live_loans,
+    } = type_check::type_check(
+        infcx,
+        param_env,
+        body,
+        promoted,
+        &universal_regions,
+        location_table,
+        borrow_set,
+        &mut all_facts,
+        flow_inits,
+        move_data,
+        elements,
+        upvars,
+        polonius_input,
+    );
 
     if let Some(all_facts) = &mut all_facts {
         let _prof_timer = infcx.tcx.prof.generic_activity("polonius_fact_generation");
@@ -268,6 +279,7 @@ pub(crate) fn compute_regions<'cx, 'tcx>(
         type_tests,
         liveness_constraints,
         elements,
+        live_loans,
     );
 
     // Generate various additional constraints.
@@ -284,7 +296,7 @@ pub(crate) fn compute_regions<'cx, 'tcx>(
             all_facts.write_to_dir(dir_path, location_table).unwrap();
         }
 
-        if use_polonius {
+        if polonius_output {
             let algorithm =
                 env::var("POLONIUS_ALGORITHM").unwrap_or_else(|_| String::from("Hybrid"));
             let algorithm = Algorithm::from_str(&algorithm).unwrap();
@@ -342,7 +354,7 @@ pub(super) fn dump_mir_results<'tcx>(
                     for_each_region_constraint(
                         infcx.tcx,
                         closure_region_requirements,
-                        &mut |msg| writeln!(out, "| {}", msg),
+                        &mut |msg| writeln!(out, "| {msg}"),
                     )?;
                     writeln!(out, "|")?;
                 }
@@ -421,7 +433,7 @@ pub(super) fn dump_annotation<'tcx>(
     };
 
     if !opaque_type_values.is_empty() {
-        err.note(format!("Inferred opaque type values:\n{:#?}", opaque_type_values));
+        err.note(format!("Inferred opaque type values:\n{opaque_type_values:#?}"));
     }
 
     errors.buffer_non_error_diag(err);
@@ -430,16 +442,19 @@ pub(super) fn dump_annotation<'tcx>(
 fn for_each_region_constraint<'tcx>(
     tcx: TyCtxt<'tcx>,
     closure_region_requirements: &ClosureRegionRequirements<'tcx>,
-    with_msg: &mut dyn FnMut(&str) -> io::Result<()>,
+    with_msg: &mut dyn FnMut(String) -> io::Result<()>,
 ) -> io::Result<()> {
     for req in &closure_region_requirements.outlives_requirements {
         let subject = match req.subject {
-            ClosureOutlivesSubject::Region(subject) => format!("{:?}", subject),
+            ClosureOutlivesSubject::Region(subject) => format!("{subject:?}"),
             ClosureOutlivesSubject::Ty(ty) => {
-                format!("{:?}", ty.instantiate(tcx, |vid| tcx.mk_re_var(vid)))
+                with_no_trimmed_paths!(format!(
+                    "{}",
+                    ty.instantiate(tcx, |vid| ty::Region::new_var(tcx, vid))
+                ))
             }
         };
-        with_msg(&format!("where {}: {:?}", subject, req.outlived_free_region,))?;
+        with_msg(format!("where {}: {:?}", subject, req.outlived_free_region,))?;
     }
     Ok(())
 }

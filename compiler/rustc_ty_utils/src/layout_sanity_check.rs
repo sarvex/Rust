@@ -19,6 +19,9 @@ pub(super) fn sanity_check_layout<'tcx>(
     if layout.size.bytes() % layout.align.abi.bytes() != 0 {
         bug!("size is not a multiple of align, in the following layout:\n{layout:#?}");
     }
+    if layout.size.bytes() >= cx.tcx.data_layout.obj_size_bound() {
+        bug!("size is too large, in the following layout:\n{layout:#?}");
+    }
 
     if !cfg!(debug_assertions) {
         // Stop here, the rest is kind of expensive.
@@ -52,7 +55,7 @@ pub(super) fn sanity_check_layout<'tcx>(
         let mut fields = non_zst_fields(cx, layout);
         let Some(first) = fields.next() else {
             // No fields here, so this could be a primitive or enum -- either way it's not a newtype around a thing
-            return *layout
+            return *layout;
         };
         if fields.next().is_none() {
             let (offset, first) = first;
@@ -77,7 +80,7 @@ pub(super) fn sanity_check_layout<'tcx>(
                 Abi::Uninhabited | Abi::Aggregate { .. },
                 "ABI unexpectedly missing alignment and/or size in {layout:#?}"
             );
-            return
+            return;
         };
         assert_eq!(
             layout.layout.align().abi,

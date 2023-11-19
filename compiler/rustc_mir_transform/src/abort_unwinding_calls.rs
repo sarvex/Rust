@@ -40,7 +40,7 @@ impl<'tcx> MirPass<'tcx> for AbortUnwindingCalls {
         let body_abi = match body_ty.kind() {
             ty::FnDef(..) => body_ty.fn_sig(tcx).abi(),
             ty::Closure(..) => Abi::RustCall,
-            ty::Generator(..) => Abi::Rust,
+            ty::Coroutine(..) => Abi::Rust,
             _ => span_bug!(body.span, "unexpected body ty: {:?}", body_ty),
         };
         let body_can_unwind = layout::fn_can_unwind(tcx, Some(def_id), body_abi);
@@ -104,7 +104,7 @@ impl<'tcx> MirPass<'tcx> for AbortUnwindingCalls {
 
         for id in calls_to_terminate {
             let cleanup = body.basic_blocks_mut()[id].terminator_mut().unwind_mut().unwrap();
-            *cleanup = UnwindAction::Terminate;
+            *cleanup = UnwindAction::Terminate(UnwindTerminateReason::Abi);
         }
 
         for id in cleanups_to_remove {
@@ -113,6 +113,6 @@ impl<'tcx> MirPass<'tcx> for AbortUnwindingCalls {
         }
 
         // We may have invalidated some `cleanup` blocks so clean those up now.
-        super::simplify::remove_dead_blocks(tcx, body);
+        super::simplify::remove_dead_blocks(body);
     }
 }

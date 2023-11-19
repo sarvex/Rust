@@ -3,6 +3,7 @@ use crate::attributes;
 use crate::common::Funclet;
 use crate::context::CodegenCx;
 use crate::llvm::{self, AtomicOrdering, AtomicRmwBinOp, BasicBlock, False, True};
+use crate::llvm_util;
 use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
@@ -24,6 +25,7 @@ use rustc_span::Span;
 use rustc_symbol_mangling::typeid::{kcfi_typeid_for_fnabi, typeid_for_fnabi, TypeIdOptions};
 use rustc_target::abi::{self, call::FnAbi, Align, Size, WrappingRange};
 use rustc_target::spec::{HasTargetSpec, SanitizerSet, Target};
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::ffi::CStr;
 use std::iter;
@@ -230,7 +232,10 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         let args = self.check_call("invoke", llty, llfn, args);
         let funclet_bundle = funclet.map(|funclet| funclet.bundle());
         let funclet_bundle = funclet_bundle.as_ref().map(|b| &*b.raw);
-        let mut bundles = vec![funclet_bundle];
+        let mut bundles: SmallVec<[_; 2]> = SmallVec::new();
+        if let Some(funclet_bundle) = funclet_bundle {
+            bundles.push(funclet_bundle);
+        }
 
         // Emit CFI pointer type membership test
         self.cfi_type_test(fn_attrs, fn_abi, llfn);
@@ -238,9 +243,10 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         // Emit KCFI operand bundle
         let kcfi_bundle = self.kcfi_operand_bundle(fn_attrs, fn_abi, llfn);
         let kcfi_bundle = kcfi_bundle.as_ref().map(|b| &*b.raw);
-        bundles.push(kcfi_bundle);
+        if let Some(kcfi_bundle) = kcfi_bundle {
+            bundles.push(kcfi_bundle);
+        }
 
-        bundles.retain(|bundle| bundle.is_some());
         let invoke = unsafe {
             llvm::LLVMRustBuildInvoke(
                 self.llbuilder,
@@ -486,7 +492,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         assert_eq!(place.llextra.is_some(), place.layout.is_unsized());
 
         if place.layout.is_zst() {
-            return OperandRef::new_zst(self, place.layout);
+            return OperandRef::zero_sized(place.layout);
         }
 
         #[instrument(level = "trace", skip(bx))]
@@ -577,8 +583,6 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     ) {
         let zero = self.const_usize(0);
         let count = self.const_usize(count);
-        let start = dest.project_index(self, zero).llval;
-        let end = dest.project_index(self, count).llval;
 
         let header_bb = self.append_sibling_block("repeat_loop_header");
         let body_bb = self.append_sibling_block("repeat_loop_body");
@@ -587,24 +591,18 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         self.br(header_bb);
 
         let mut header_bx = Self::build(self.cx, header_bb);
-        let current = header_bx.phi(self.val_ty(start), &[start], &[self.llbb()]);
+        let i = header_bx.phi(self.val_ty(zero), &[zero], &[self.llbb()]);
 
-        let keep_going = header_bx.icmp(IntPredicate::IntNE, current, end);
+        let keep_going = header_bx.icmp(IntPredicate::IntULT, i, count);
         header_bx.cond_br(keep_going, body_bb, next_bb);
 
         let mut body_bx = Self::build(self.cx, body_bb);
-        let align = dest.align.restrict_for_offset(dest.layout.field(self.cx(), 0).size);
-        cg_elem
-            .val
-            .store(&mut body_bx, PlaceRef::new_sized_aligned(current, cg_elem.layout, align));
+        let dest_elem = dest.project_index(&mut body_bx, i);
+        cg_elem.val.store(&mut body_bx, dest_elem);
 
-        let next = body_bx.inbounds_gep(
-            self.backend_type(cg_elem.layout),
-            current,
-            &[self.const_usize(1)],
-        );
+        let next = body_bx.unchecked_uadd(i, self.const_usize(1));
         body_bx.br(header_bb);
-        header_bx.add_incoming_to_phi(current, next, body_bb);
+        header_bx.add_incoming_to_phi(i, next, body_bb);
 
         *self = Self::build(self.cx, next_bb);
     }
@@ -655,7 +653,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         flags: MemFlags,
     ) -> &'ll Value {
         debug!("Store {:?} -> {:?} ({:?})", val, ptr, flags);
-        let ptr = self.check_store(val, ptr);
+        assert_eq!(self.cx.type_kind(self.cx.val_ty(ptr)), TypeKind::Pointer);
         unsafe {
             let store = llvm::LLVMBuildStore(self.llbuilder, val, ptr);
             let align =
@@ -685,7 +683,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         size: Size,
     ) {
         debug!("Store {:?} -> {:?}", val, ptr);
-        let ptr = self.check_store(val, ptr);
+        assert_eq!(self.cx.type_kind(self.cx.val_ty(ptr)), TypeKind::Pointer);
         unsafe {
             let store = llvm::LLVMRustBuildAtomicStore(
                 self.llbuilder,
@@ -876,8 +874,6 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         assert!(!flags.contains(MemFlags::NONTEMPORAL), "non-temporal memcpy not supported");
         let size = self.intcast(size, self.type_isize(), false);
         let is_volatile = flags.contains(MemFlags::VOLATILE);
-        let dst = self.pointercast(dst, self.type_i8p());
-        let src = self.pointercast(src, self.type_i8p());
         unsafe {
             llvm::LLVMRustBuildMemCpy(
                 self.llbuilder,
@@ -903,8 +899,6 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         assert!(!flags.contains(MemFlags::NONTEMPORAL), "non-temporal memmove not supported");
         let size = self.intcast(size, self.type_isize(), false);
         let is_volatile = flags.contains(MemFlags::VOLATILE);
-        let dst = self.pointercast(dst, self.type_i8p());
-        let src = self.pointercast(src, self.type_i8p());
         unsafe {
             llvm::LLVMRustBuildMemMove(
                 self.llbuilder,
@@ -927,7 +921,6 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         flags: MemFlags,
     ) {
         let is_volatile = flags.contains(MemFlags::VOLATILE);
-        let ptr = self.pointercast(ptr, self.type_i8p());
         unsafe {
             llvm::LLVMRustBuildMemSet(
                 self.llbuilder,
@@ -984,16 +977,23 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     }
 
     fn cleanup_landing_pad(&mut self, pers_fn: &'ll Value) -> (&'ll Value, &'ll Value) {
-        let ty = self.type_struct(&[self.type_i8p(), self.type_i32()], false);
-        let landing_pad = self.landing_pad(ty, pers_fn, 1 /* FIXME should this be 0? */);
+        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()], false);
+        let landing_pad = self.landing_pad(ty, pers_fn, 0);
         unsafe {
             llvm::LLVMSetCleanup(landing_pad, llvm::True);
         }
         (self.extract_value(landing_pad, 0), self.extract_value(landing_pad, 1))
     }
 
+    fn filter_landing_pad(&mut self, pers_fn: &'ll Value) -> (&'ll Value, &'ll Value) {
+        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()], false);
+        let landing_pad = self.landing_pad(ty, pers_fn, 1);
+        self.add_clause(landing_pad, self.const_array(self.type_ptr(), &[]));
+        (self.extract_value(landing_pad, 0), self.extract_value(landing_pad, 1))
+    }
+
     fn resume(&mut self, exn0: &'ll Value, exn1: &'ll Value) {
-        let ty = self.type_struct(&[self.type_i8p(), self.type_i32()], false);
+        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()], false);
         let mut exn = self.const_poison(ty);
         exn = self.insert_value(exn, exn0, 0);
         exn = self.insert_value(exn, exn1, 1);
@@ -1157,7 +1157,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
 
         let llfn = unsafe { llvm::LLVMRustGetInstrProfIncrementIntrinsic(self.cx().llmod) };
         let llty = self.cx.type_func(
-            &[self.cx.type_i8p(), self.cx.type_i64(), self.cx.type_i32(), self.cx.type_i32()],
+            &[self.cx.type_ptr(), self.cx.type_i64(), self.cx.type_i32(), self.cx.type_i32()],
             self.cx.type_void(),
         );
         let args = &[fn_name, hash, num_counters, index];
@@ -1190,7 +1190,10 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         let args = self.check_call("call", llty, llfn, args);
         let funclet_bundle = funclet.map(|funclet| funclet.bundle());
         let funclet_bundle = funclet_bundle.as_ref().map(|b| &*b.raw);
-        let mut bundles = vec![funclet_bundle];
+        let mut bundles: SmallVec<[_; 2]> = SmallVec::new();
+        if let Some(funclet_bundle) = funclet_bundle {
+            bundles.push(funclet_bundle);
+        }
 
         // Emit CFI pointer type membership test
         self.cfi_type_test(fn_attrs, fn_abi, llfn);
@@ -1198,9 +1201,10 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         // Emit KCFI operand bundle
         let kcfi_bundle = self.kcfi_operand_bundle(fn_attrs, fn_abi, llfn);
         let kcfi_bundle = kcfi_bundle.as_ref().map(|b| &*b.raw);
-        bundles.push(kcfi_bundle);
+        if let Some(kcfi_bundle) = kcfi_bundle {
+            bundles.push(kcfi_bundle);
+        }
 
-        bundles.retain(|bundle| bundle.is_some());
         let call = unsafe {
             llvm::LLVMRustBuildCall(
                 self.llbuilder,
@@ -1222,9 +1226,16 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         unsafe { llvm::LLVMBuildZExt(self.llbuilder, val, dest_ty, UNNAMED) }
     }
 
-    fn do_not_inline(&mut self, llret: &'ll Value) {
-        let noinline = llvm::AttributeKind::NoInline.create_attr(self.llcx);
-        attributes::apply_to_callsite(llret, llvm::AttributePlace::Function, &[noinline]);
+    fn apply_attrs_to_cleanup_callsite(&mut self, llret: &'ll Value) {
+        if llvm_util::get_version() < (17, 0, 2) {
+            // Work around https://github.com/llvm/llvm-project/issues/66984.
+            let noinline = llvm::AttributeKind::NoInline.create_attr(self.llcx);
+            attributes::apply_to_callsite(llret, llvm::AttributePlace::Function, &[noinline]);
+        } else {
+            // Cleanup is always the cold path.
+            let cold_inline = llvm::AttributeKind::Cold.create_attr(self.llcx);
+            attributes::apply_to_callsite(llret, llvm::AttributePlace::Function, &[cold_inline]);
+        }
     }
 }
 
@@ -1379,25 +1390,6 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         ret.expect("LLVM does not have support for catchret")
     }
 
-    fn check_store(&mut self, val: &'ll Value, ptr: &'ll Value) -> &'ll Value {
-        let dest_ptr_ty = self.cx.val_ty(ptr);
-        let stored_ty = self.cx.val_ty(val);
-        let stored_ptr_ty = self.cx.type_ptr_to(stored_ty);
-
-        assert_eq!(self.cx.type_kind(dest_ptr_ty), TypeKind::Pointer);
-
-        if dest_ptr_ty == stored_ptr_ty {
-            ptr
-        } else {
-            debug!(
-                "type mismatch in store. \
-                    Expected {:?}, got {:?}; inserting bitcast",
-                dest_ptr_ty, stored_ptr_ty
-            );
-            self.bitcast(ptr, stored_ptr_ty)
-        }
-    }
-
     fn check_call<'b>(
         &mut self,
         typ: &str,
@@ -1407,9 +1399,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
     ) -> Cow<'b, [&'ll Value]> {
         assert!(
             self.cx.type_kind(fn_ty) == TypeKind::Function,
-            "builder::{} not passed a function, but {:?}",
-            typ,
-            fn_ty
+            "builder::{typ} not passed a function, but {fn_ty:?}"
         );
 
         let param_tys = self.cx.func_params_types(fn_ty);
@@ -1460,7 +1450,6 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
             return;
         }
 
-        let ptr = self.pointercast(ptr, self.cx.type_i8p());
         self.call_intrinsic(intrinsic, &[self.cx.const_u64(size), ptr]);
     }
 
@@ -1501,12 +1490,9 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
 
         let instr = if signed { "fptosi" } else { "fptoui" };
         let name = if let Some(vector_length) = vector_length {
-            format!(
-                "llvm.{}.sat.v{}i{}.v{}f{}",
-                instr, vector_length, int_width, vector_length, float_width
-            )
+            format!("llvm.{instr}.sat.v{vector_length}i{int_width}.v{vector_length}f{float_width}")
         } else {
-            format!("llvm.{}.sat.i{}.f{}", instr, int_width, float_width)
+            format!("llvm.{instr}.sat.i{int_width}.f{float_width}")
         };
         let f = self.declare_cfn(&name, llvm::UnnamedAddr::No, self.type_func(&[src_ty], dest_ty));
         self.call(self.type_func(&[src_ty], dest_ty), None, None, f, &[val], None)
@@ -1534,9 +1520,14 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: &'ll Value,
     ) {
-        let is_indirect_call = unsafe { llvm::LLVMIsAFunction(llfn).is_none() };
-        if is_indirect_call && fn_abi.is_some() && self.tcx.sess.is_sanitizer_cfi_enabled() {
-            if fn_attrs.is_some() && fn_attrs.unwrap().no_sanitize.contains(SanitizerSet::CFI) {
+        let is_indirect_call = unsafe { llvm::LLVMRustIsNonGVFunctionPointerTy(llfn) };
+        if self.tcx.sess.is_sanitizer_cfi_enabled()
+            && let Some(fn_abi) = fn_abi
+            && is_indirect_call
+        {
+            if let Some(fn_attrs) = fn_attrs
+                && fn_attrs.no_sanitize.contains(SanitizerSet::CFI)
+            {
                 return;
             }
 
@@ -1548,7 +1539,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
                 options.insert(TypeIdOptions::NORMALIZE_INTEGERS);
             }
 
-            let typeid = typeid_for_fnabi(self.tcx, fn_abi.unwrap(), options);
+            let typeid = typeid_for_fnabi(self.tcx, fn_abi, options);
             let typeid_metadata = self.cx.typeid_metadata(typeid).unwrap();
 
             // Test whether the function pointer is associated with the type identifier.
@@ -1572,9 +1563,14 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: &'ll Value,
     ) -> Option<llvm::OperandBundleDef<'ll>> {
-        let is_indirect_call = unsafe { llvm::LLVMIsAFunction(llfn).is_none() };
-        let kcfi_bundle = if is_indirect_call && self.tcx.sess.is_sanitizer_kcfi_enabled() {
-            if fn_attrs.is_some() && fn_attrs.unwrap().no_sanitize.contains(SanitizerSet::KCFI) {
+        let is_indirect_call = unsafe { llvm::LLVMRustIsNonGVFunctionPointerTy(llfn) };
+        let kcfi_bundle = if self.tcx.sess.is_sanitizer_kcfi_enabled()
+            && let Some(fn_abi) = fn_abi
+            && is_indirect_call
+        {
+            if let Some(fn_attrs) = fn_attrs
+                && fn_attrs.no_sanitize.contains(SanitizerSet::KCFI)
+            {
                 return None;
             }
 
@@ -1586,7 +1582,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
                 options.insert(TypeIdOptions::NORMALIZE_INTEGERS);
             }
 
-            let kcfi_typeid = kcfi_typeid_for_fnabi(self.tcx, fn_abi.unwrap(), options);
+            let kcfi_typeid = kcfi_typeid_for_fnabi(self.tcx, fn_abi, options);
             Some(llvm::OperandBundleDef::new("kcfi", &[self.const_u32(kcfi_typeid)]))
         } else {
             None

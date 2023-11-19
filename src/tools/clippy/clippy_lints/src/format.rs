@@ -23,13 +23,13 @@ declare_clippy_lint! {
     /// if `foo: &str`.
     ///
     /// ### Examples
-    /// ```rust
+    /// ```no_run
     /// let foo = "foo";
     /// format!("{}", foo);
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let foo = "foo";
     /// foo.to_owned();
     /// ```
@@ -43,12 +43,10 @@ declare_lint_pass!(UselessFormat => [USELESS_FORMAT]);
 
 impl<'tcx> LateLintPass<'tcx> for UselessFormat {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        let Some(macro_call) = root_macro_call_first_node(cx, expr) else { return };
-        if !cx.tcx.is_diagnostic_item(sym::format_macro, macro_call.def_id) {
-            return;
-        }
-
-        find_format_args(cx, expr, macro_call.expn, |format_args| {
+        if let Some(macro_call) = root_macro_call_first_node(cx, expr)
+            && cx.tcx.is_diagnostic_item(sym::format_macro, macro_call.def_id)
+            && let Some(format_args) = find_format_args(cx, expr, macro_call.expn)
+        {
             let mut applicability = Applicability::MachineApplicable;
             let call_site = macro_call.span;
 
@@ -56,7 +54,9 @@ impl<'tcx> LateLintPass<'tcx> for UselessFormat {
                 ([], []) => span_useless_format_empty(cx, call_site, "String::new()".to_owned(), applicability),
                 ([], [_]) => {
                     // Simulate macro expansion, converting {{ and }} to { and }.
-                    let Some(snippet) = snippet_opt(cx, format_args.span) else { return };
+                    let Some(snippet) = snippet_opt(cx, format_args.span) else {
+                        return;
+                    };
                     let s_expand = snippet.replace("{{", "{").replace("}}", "}");
                     let sugg = format!("{s_expand}.to_string()");
                     span_useless_format(cx, call_site, sugg, applicability);
@@ -78,18 +78,19 @@ impl<'tcx> LateLintPass<'tcx> for UselessFormat {
                             _ => false,
                         };
                         let sugg = if is_new_string {
-                            snippet_with_context(cx, value.span, call_site.ctxt(), "..", &mut applicability).0.into_owned()
+                            snippet_with_context(cx, value.span, call_site.ctxt(), "..", &mut applicability)
+                                .0
+                                .into_owned()
                         } else {
                             let sugg = Sugg::hir_with_context(cx, value, call_site.ctxt(), "<arg>", &mut applicability);
                             format!("{}.to_string()", sugg.maybe_par())
                         };
                         span_useless_format(cx, call_site, sugg, applicability);
-
                     }
                 },
                 _ => {},
             }
-        });
+        }
     }
 }
 

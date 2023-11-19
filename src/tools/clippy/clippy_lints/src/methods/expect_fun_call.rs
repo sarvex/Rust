@@ -6,8 +6,8 @@ use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::source_map::Span;
 use rustc_span::symbol::sym;
+use rustc_span::Span;
 use std::borrow::Cow;
 
 use super::EXPECT_FUN_CALL;
@@ -70,7 +70,7 @@ pub(super) fn check<'tcx>(
                 if let hir::ExprKind::Path(ref p) = fun.kind {
                     match cx.qpath_res(p, fun.hir_id) {
                         hir::def::Res::Def(hir::def::DefKind::Fn | hir::def::DefKind::AssocFn, def_id) => matches!(
-                            cx.tcx.fn_sig(def_id).subst_identity().output().skip_binder().kind(),
+                            cx.tcx.fn_sig(def_id).instantiate_identity().output().skip_binder().kind(),
                             ty::Ref(re, ..) if re.is_static(),
                         ),
                         _ => false,
@@ -84,7 +84,7 @@ pub(super) fn check<'tcx>(
                     .type_dependent_def_id(arg.hir_id)
                     .map_or(false, |method_id| {
                         matches!(
-                            cx.tcx.fn_sig(method_id).subst_identity().output().skip_binder().kind(),
+                            cx.tcx.fn_sig(method_id).instantiate_identity().output().skip_binder().kind(),
                             ty::Ref(re, ..) if re.is_static()
                         )
                     })
@@ -131,24 +131,23 @@ pub(super) fn check<'tcx>(
 
     let mut applicability = Applicability::MachineApplicable;
 
-    //Special handling for `format!` as arg_root
+    // Special handling for `format!` as arg_root
     if let Some(macro_call) = root_macro_call_first_node(cx, arg_root) {
-        if !cx.tcx.is_diagnostic_item(sym::format_macro, macro_call.def_id) {
-            return;
-        }
-        find_format_args(cx, arg_root, macro_call.expn, |format_args| {
-            let span = format_args_inputs_span(format_args);
+        if cx.tcx.is_diagnostic_item(sym::format_macro, macro_call.def_id)
+            && let Some(format_args) = find_format_args(cx, arg_root, macro_call.expn)
+        {
+            let span = format_args_inputs_span(&format_args);
             let sugg = snippet_with_applicability(cx, span, "..", &mut applicability);
             span_lint_and_sugg(
                 cx,
                 EXPECT_FUN_CALL,
                 span_replace_word,
                 &format!("use of `{name}` followed by a function call"),
-                "try this",
+                "try",
                 format!("unwrap_or_else({closure_args} panic!({sugg}))"),
                 applicability,
             );
-        });
+        }
         return;
     }
 
@@ -162,7 +161,7 @@ pub(super) fn check<'tcx>(
         EXPECT_FUN_CALL,
         span_replace_word,
         &format!("use of `{name}` followed by a function call"),
-        "try this",
+        "try",
         format!("unwrap_or_else({closure_args} {{ panic!(\"{{}}\", {arg_root_snippet}) }})"),
         applicability,
     );

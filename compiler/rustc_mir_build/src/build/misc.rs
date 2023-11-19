@@ -15,9 +15,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// N.B., **No cleanup is scheduled for this temporary.** You should
     /// call `schedule_drop` once the temporary is initialized.
     pub(crate) fn temp(&mut self, ty: Ty<'tcx>, span: Span) -> Place<'tcx> {
-        // Mark this local as internal to avoid temporaries with types not present in the
-        // user's code resulting in ICEs from the generator transform.
-        let temp = self.local_decls.push(LocalDecl::new(ty, span).internal());
+        let temp = self.local_decls.push(LocalDecl::new(ty, span));
         let place = Place::from(temp);
         debug!("temp: created temp {:?} with type {:?}", place, self.local_decls[temp].ty);
         place
@@ -25,19 +23,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     /// Convenience function for creating a literal operand, one
     /// without any user type annotation.
-    pub(crate) fn literal_operand(
-        &mut self,
-        span: Span,
-        literal: ConstantKind<'tcx>,
-    ) -> Operand<'tcx> {
-        let constant = Box::new(Constant { span, user_ty: None, literal });
+    pub(crate) fn literal_operand(&mut self, span: Span, const_: Const<'tcx>) -> Operand<'tcx> {
+        let constant = Box::new(ConstOperand { span, user_ty: None, const_ });
         Operand::Constant(constant)
     }
 
     /// Returns a zero literal operand for the appropriate type, works for
     /// bool, char and integers.
     pub(crate) fn zero_literal(&mut self, span: Span, ty: Ty<'tcx>) -> Operand<'tcx> {
-        let literal = ConstantKind::from_bits(self.tcx, 0, ty::ParamEnv::empty().and(ty));
+        let literal = Const::from_bits(self.tcx, 0, ty::ParamEnv::empty().and(ty));
 
         self.literal_operand(span, literal)
     }
@@ -54,10 +48,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             block,
             source_info,
             temp,
-            Constant {
+            ConstOperand {
                 span: source_info.span,
                 user_ty: None,
-                literal: ConstantKind::from_usize(self.tcx, value),
+                const_: Const::from_usize(self.tcx, value),
             },
         );
         temp

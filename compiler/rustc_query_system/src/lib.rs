@@ -2,7 +2,6 @@
 #![feature(core_intrinsics)]
 #![feature(hash_raw_entry)]
 #![feature(min_specialization)]
-#![feature(extern_types)]
 #![feature(let_chains)]
 #![allow(rustc::potential_query_instability)]
 #![deny(rustc::untranslatable_diagnostic)]

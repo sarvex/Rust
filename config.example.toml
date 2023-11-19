@@ -19,11 +19,18 @@
 # Note that this has no default value (x.py uses the defaults in `config.example.toml`).
 #profile = <none>
 
-# Keeps track of the last version of `x.py` used.
-# If `changelog-seen` does not match the version that is currently running,
-# `x.py` will prompt you to update it and to read the changelog.
-# See `src/bootstrap/CHANGELOG.md` for more information.
-changelog-seen = 2
+# Keeps track of major changes made to this configuration.
+#
+# This value also represents ID of the PR that caused major changes. Meaning,
+# you can visit github.com/rust-lang/rust/pull/{change-id} to check for more details.
+#
+# A 'major change' includes any of the following
+#  - A new option
+#  - A change in the default values
+#
+# If `change-id` does not match the version that is currently running,
+# `x.py` will prompt you to update it and check the related PR for more details.
+change-id = 116881
 
 # =============================================================================
 # Tweaking how LLVM is compiled
@@ -35,14 +42,15 @@ changelog-seen = 2
 # Unless you're developing for a target where Rust CI doesn't build a compiler
 # toolchain or changing LLVM locally, you probably want to leave this enabled.
 #
-# All tier 1 targets are currently supported; set this to `"if-available"` if
-# you are not sure whether you're on a tier 1 target.
-#
-# We also currently only support this when building LLVM for the build triple.
+# Set this to `"if-unchanged"` to download only if the llvm-project has not
+# been modified. You can also use this if you are unsure whether you're on a
+# tier 1 target. All tier 1 targets are currently supported.
+
+# Currently, we only support this when building LLVM for the build triple.
 #
 # Note that many of the LLVM options are not currently supported for
 # downloading. Currently only the "assertions" option can be toggled.
-#download-ci-llvm = if rust.channel == "dev" { "if-available" } else { false }
+#download-ci-llvm = if rust.channel == "dev" { "if-unchanged" } else { false }
 
 # Indicates whether the LLVM build is a Release or Debug build
 #optimize = true
@@ -94,7 +102,7 @@ changelog-seen = 2
 # the same format as above, but since these targets are experimental, they are
 # not built by default and the experimental Rust compilation targets that depend
 # on them will not work unless the user opts in to building them.
-#experimental-targets = "AVR;M68k"
+#experimental-targets = "AVR;M68k;CSKY"
 
 # Cap the number of parallel linker invocations when compiling LLVM.
 # This can be useful when building LLVM with debug info, which significantly
@@ -250,6 +258,13 @@ changelog-seen = 2
 # target when running tests, otherwise this can be omitted.
 #nodejs = "node"
 
+# The npm executable to use. Note that this is used for rustdoc-gui tests,
+# otherwise this can be omitted.
+#
+# Under Windows this should be `npm.cmd` or path to it (verified on nodejs v18.06), or
+# error will be emitted.
+#npm = "npm"
+
 # Python interpreter to use for various tasks throughout the build, notably
 # rustdoc tests, the lldb python interpreter, and some dist bits and pieces.
 #
@@ -287,9 +302,11 @@ changelog-seen = 2
 
 # Enable a build of the extended Rust tool set which is not only the compiler
 # but also tools such as Cargo. This will also produce "combined installers"
-# which are used to install Rust and Cargo together. This is disabled by
-# default. The `tools` option (immediately below) specifies which tools should
-# be built if `extended = true`.
+# which are used to install Rust and Cargo together.
+# The `tools` (check `config.example.toml` to see its default value) option specifies
+# which tools should be built if `extended = true`.
+#
+# This is disabled by default.
 #extended = false
 
 # Set of tools to be included in the installation.
@@ -361,6 +378,9 @@ changelog-seen = 2
 # this is not intended to be used during local development.
 #metrics = false
 
+# Specify the location of the Android NDK. Used when targeting Android.
+#android-ndk = "/path/to/android-ndk-r25b"
+
 # =============================================================================
 # General install configuration options
 # =============================================================================
@@ -393,10 +413,20 @@ changelog-seen = 2
 # =============================================================================
 [rust]
 
-# Whether or not to optimize the compiler and standard library.
+# Whether or not to optimize when compiling the compiler and standard library,
+# and what level of optimization to use.
 # WARNING: Building with optimize = false is NOT SUPPORTED. Due to bootstrapping,
 # building without optimizations takes much longer than optimizing. Further, some platforms
 # fail to build without this optimization (c.f. #65352).
+# The valid options are:
+# true - Enable optimizations.
+# false - Disable optimizations.
+# 0 - Disable optimizations.
+# 1 - Basic optimizations.
+# 2 - Some optimizations.
+# 3 - All optimizations.
+# "s" - Optimize for binary size.
+# "z" - Optimize for binary size, but also turn off loop vectorization.
 #optimize = true
 
 # Indicates that the build should be configured for debugging Rust. A
@@ -439,7 +469,6 @@ changelog-seen = 2
 # Sets the number of codegen units to build the standard library with,
 # regardless of what the codegen-unit setting for the rest of the compiler is.
 # NOTE: building with anything other than 1 is known to occasionally have bugs.
-# See https://github.com/rust-lang/rust/issues/83600.
 #codegen-units-std = codegen-units
 
 # Whether or not debug assertions are enabled for the compiler and standard library.
@@ -525,10 +554,11 @@ changelog-seen = 2
 # Whether to always use incremental compilation when building rustc
 #incremental = false
 
-# Build a multi-threaded rustc
-# FIXME(#75760): Some UI tests fail when this option is enabled.
-# NOTE: This option is NOT SUPPORTED. See #48685.
-#parallel-compiler = false
+# Build a multi-threaded rustc. This allows users to use parallel rustc
+# via the unstable option `-Z threads=n`.
+# Since stable/beta channels only allow using stable features,
+# `parallel-compiler = false` should be set for these channels.
+#parallel-compiler = true
 
 # The default linker that will be hard-coded into the generated
 # compiler for targets that don't specify a default linker explicitly
@@ -673,10 +703,6 @@ changelog-seen = 2
 # Build compiler with the optimization enabled and -Zvalidate-mir, currently only for `std`
 #validate-mir-opts = 3
 
-# Copy the linker, DLLs, and various libraries from MinGW into the rustc toolchain.
-# Only applies when the host or target is pc-windows-gnu.
-#include-mingw-linker = true
-
 # =============================================================================
 # Options for specific targets
 #
@@ -735,20 +761,20 @@ changelog-seen = 2
 # it must link to `libgcc_eh.a` to get a working output, and this option have no effect.
 #llvm-libunwind = 'no' if Linux, 'in-tree' if Fuchsia
 
-# If this target is for Android, this option will be required to specify where
-# the NDK for the target lives. This is used to find the C compiler to link and
-# build native code.
-# See `src/bootstrap/cc_detect.rs` for details.
-#android-ndk = <none> (path)
-
 # Build the sanitizer runtimes for this target.
 # This option will override the same option under [build] section.
 #sanitizers = build.sanitizers (bool)
 
-# Build the profiler runtime for this target(required when compiling with options that depend
-# on this runtime, such as `-C profile-generate` or `-C instrument-coverage`).
+# When true, build the profiler runtime for this target (required when compiling
+# with options that depend on this runtime, such as `-C profile-generate` or
+# `-C instrument-coverage`). This may also be given a path to an existing build
+# of the profiling runtime library from LLVM's compiler-rt.
 # This option will override the same option under [build] section.
 #profiler = build.profiler (bool)
+
+# This option supports enable `rpath` in each target independently,
+# and will override the same option under [rust] section. It only works on Unix platforms
+#rpath = rust.rpath (bool)
 
 # Force static or dynamic linkage of the standard library for this target. If
 # this target is a host for rustc, this will also affect the linkage of the
@@ -823,3 +849,7 @@ changelog-seen = 2
 #
 # Available options: fast, balanced, best
 #compression-profile = "fast"
+
+# Copy the linker, DLLs, and various libraries from MinGW into the rustc toolchain.
+# Only applies when the host or target is pc-windows-gnu.
+#include-mingw-linker = true

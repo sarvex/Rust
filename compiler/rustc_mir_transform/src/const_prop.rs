@@ -2,8 +2,7 @@
 //! assertion failures
 
 use either::Right;
-
-use rustc_const_eval::const_eval::CheckAlignment;
+use rustc_const_eval::ReportErrorExt;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def::DefKind;
 use rustc_index::bit_set::BitSet;
@@ -13,17 +12,16 @@ use rustc_middle::mir::visit::{
 };
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::{LayoutError, LayoutOf, LayoutOfHelpers, TyAndLayout};
-use rustc_middle::ty::InternalSubsts;
-use rustc_middle::ty::{self, ConstKind, Instance, ParamEnv, Ty, TyCtxt, TypeVisitableExt};
-use rustc_span::{def_id::DefId, Span, DUMMY_SP};
-use rustc_target::abi::{self, Align, HasDataLayout, Size, TargetDataLayout};
+use rustc_middle::ty::{self, GenericArgs, Instance, ParamEnv, Ty, TyCtxt, TypeVisitableExt};
+use rustc_span::{def_id::DefId, Span};
+use rustc_target::abi::{self, HasDataLayout, Size, TargetDataLayout};
 use rustc_target::spec::abi::Abi as CallAbi;
 
+use crate::dataflow_const_prop::Patch;
 use crate::MirPass;
 use rustc_const_eval::interpret::{
-    self, compile_time_machine, AllocId, ConstAllocation, ConstValue, Frame, ImmTy, Immediate,
-    InterpCx, InterpResult, LocalValue, MemoryKind, OpTy, PlaceTy, Pointer, Scalar,
-    StackPopCleanup,
+    self, compile_time_machine, AllocId, ConstAllocation, FnArg, Frame, ImmTy, Immediate, InterpCx,
+    InterpResult, MemoryKind, OpTy, PlaceTy, Pointer, Scalar, StackPopCleanup,
 };
 
 /// The maximum number of bytes that we'll allocate space for a local or the return value.
@@ -33,21 +31,30 @@ const MAX_ALLOC_LIMIT: u64 = 1024;
 
 /// Macro for machine-specific `InterpError` without allocation.
 /// (These will never be shown to the user, but they help diagnose ICEs.)
-macro_rules! throw_machine_stop_str {
-    ($($tt:tt)*) => {{
-        // We make a new local type for it. The type itself does not carry any information,
-        // but its vtable (for the `MachineStopType` trait) does.
-        struct Zst;
-        // Printing this type shows the desired string.
-        impl std::fmt::Display for Zst {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, $($tt)*)
-            }
+pub(crate) macro throw_machine_stop_str($($tt:tt)*) {{
+    // We make a new local type for it. The type itself does not carry any information,
+    // but its vtable (for the `MachineStopType` trait) does.
+    #[derive(Debug)]
+    struct Zst;
+    // Printing this type shows the desired string.
+    impl std::fmt::Display for Zst {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, $($tt)*)
         }
-        impl rustc_middle::mir::interpret::MachineStopType for Zst {}
-        throw_machine_stop!(Zst)
-    }};
-}
+    }
+
+    impl rustc_middle::mir::interpret::MachineStopType for Zst {
+        fn diagnostic_message(&self) -> rustc_errors::DiagnosticMessage {
+            self.to_string().into()
+        }
+
+        fn add_args(
+            self: Box<Self>,
+            _: &mut dyn FnMut(std::borrow::Cow<'static, str>, rustc_errors::DiagnosticArgValue<'static>),
+        ) {}
+    }
+    throw_machine_stop!(Zst)
+}}
 
 pub struct ConstProp;
 
@@ -75,35 +82,31 @@ impl<'tcx> MirPass<'tcx> for ConstProp {
             return;
         }
 
-        let is_generator = tcx.type_of(def_id.to_def_id()).subst_identity().is_generator();
-        // FIXME(welseywiser) const prop doesn't work on generators because of query cycles
+        // FIXME(welseywiser) const prop doesn't work on coroutines because of query cycles
         // computing their layout.
-        if is_generator {
-            trace!("ConstProp skipped for generator {:?}", def_id);
+        let is_coroutine = def_kind == DefKind::Coroutine;
+        if is_coroutine {
+            trace!("ConstProp skipped for coroutine {:?}", def_id);
             return;
         }
 
         trace!("ConstProp starting for {:?}", def_id);
 
-        let dummy_body = &Body::new(
-            body.source,
-            (*body.basic_blocks).to_owned(),
-            body.source_scopes.clone(),
-            body.local_decls.clone(),
-            Default::default(),
-            body.arg_count,
-            Default::default(),
-            body.span,
-            body.generator_kind(),
-            body.tainted_by_errors,
-        );
-
         // FIXME(oli-obk, eddyb) Optimize locals (or even local paths) to hold
         // constants, instead of just checking for const-folding succeeding.
         // That would require a uniform one-def no-mutation analysis
         // and RPO (or recursing when needing the value of a local).
-        let mut optimization_finder = ConstPropagator::new(body, dummy_body, tcx);
-        optimization_finder.visit_body(body);
+        let mut optimization_finder = ConstPropagator::new(body, tcx);
+
+        // Traverse the body in reverse post-order, to ensure that `FullConstProp` locals are
+        // assigned before being read.
+        for &bb in body.basic_blocks.reverse_postorder() {
+            let data = &body.basic_blocks[bb];
+            optimization_finder.visit_basic_block_data(bb, data);
+        }
+
+        let mut patch = optimization_finder.patch;
+        patch.visit_body_preserves_cfg(body);
 
         trace!("ConstProp done for {:?}", def_id);
     }
@@ -128,31 +131,21 @@ impl ConstPropMachine<'_, '_> {
 
 impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for ConstPropMachine<'mir, 'tcx> {
     compile_time_machine!(<'mir, 'tcx>);
+
     const PANIC_ON_ALLOC_FAIL: bool = true; // all allocations are small (see `MAX_ALLOC_LIMIT`)
+
+    const POST_MONO_CHECKS: bool = false; // this MIR is still generic!
 
     type MemoryKind = !;
 
     #[inline(always)]
-    fn enforce_alignment(_ecx: &InterpCx<'mir, 'tcx, Self>) -> CheckAlignment {
-        // We do not check for alignment to avoid having to carry an `Align`
-        // in `ConstValue::ByRef`.
-        CheckAlignment::No
+    fn enforce_alignment(_ecx: &InterpCx<'mir, 'tcx, Self>) -> bool {
+        false // no reason to enforce alignment
     }
 
     #[inline(always)]
     fn enforce_validity(_ecx: &InterpCx<'mir, 'tcx, Self>, _layout: TyAndLayout<'tcx>) -> bool {
         false // for now, we don't enforce validity
-    }
-    fn alignment_check_failed(
-        ecx: &InterpCx<'mir, 'tcx, Self>,
-        _has: Align,
-        _required: Align,
-        _check: CheckAlignment,
-    ) -> InterpResult<'tcx, ()> {
-        span_bug!(
-            ecx.cur_span(),
-            "`alignment_check_failed` called when no alignment check requested"
-        )
     }
 
     fn load_mir(
@@ -162,11 +155,15 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for ConstPropMachine<'mir, 'tcx>
         throw_machine_stop_str!("calling functions isn't supported in ConstProp")
     }
 
+    fn panic_nounwind(_ecx: &mut InterpCx<'mir, 'tcx, Self>, _msg: &str) -> InterpResult<'tcx> {
+        throw_machine_stop_str!("panicking isn't supported in ConstProp")
+    }
+
     fn find_mir_or_eval_fn(
         _ecx: &mut InterpCx<'mir, 'tcx, Self>,
         _instance: ty::Instance<'tcx>,
         _abi: CallAbi,
-        _args: &[OpTy<'tcx>],
+        _args: &[FnArg<'tcx>],
         _destination: &PlaceTy<'tcx>,
         _target: Option<BasicBlock>,
         _unwind: UnwindAction,
@@ -198,16 +195,16 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for ConstPropMachine<'mir, 'tcx>
         _bin_op: BinOp,
         _left: &ImmTy<'tcx>,
         _right: &ImmTy<'tcx>,
-    ) -> InterpResult<'tcx, (Scalar, bool, Ty<'tcx>)> {
+    ) -> InterpResult<'tcx, (ImmTy<'tcx>, bool)> {
         // We can't do this because aliasing of memory can differ between const eval and llvm
         throw_machine_stop_str!("pointer arithmetic or comparisons aren't supported in ConstProp")
     }
 
-    fn access_local_mut<'a>(
+    fn before_access_local_mut<'a>(
         ecx: &'a mut InterpCx<'mir, 'tcx, Self>,
         frame: usize,
         local: Local,
-    ) -> InterpResult<'tcx, &'a mut interpret::Operand<Self::Provenance>> {
+    ) -> InterpResult<'tcx> {
         assert_eq!(frame, 0);
         match ecx.machine.can_const_prop[local] {
             ConstPropMode::NoPropagation => {
@@ -220,7 +217,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for ConstPropMachine<'mir, 'tcx>
             }
             ConstPropMode::FullConstProp => {}
         }
-        ecx.machine.stack[frame].locals[local].access_mut()
+        Ok(())
     }
 
     fn before_access_global(
@@ -280,6 +277,7 @@ struct ConstPropagator<'mir, 'tcx> {
     tcx: TyCtxt<'tcx>,
     param_env: ParamEnv<'tcx>,
     local_decls: &'mir IndexSlice<Local, LocalDecl<'tcx>>,
+    patch: Patch<'tcx>,
 }
 
 impl<'tcx> LayoutOfHelpers<'tcx> for ConstPropagator<'_, 'tcx> {
@@ -313,13 +311,9 @@ impl<'tcx> ty::layout::HasParamEnv<'tcx> for ConstPropagator<'_, 'tcx> {
 }
 
 impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
-    fn new(
-        body: &Body<'tcx>,
-        dummy_body: &'mir Body<'tcx>,
-        tcx: TyCtxt<'tcx>,
-    ) -> ConstPropagator<'mir, 'tcx> {
+    fn new(body: &'mir Body<'tcx>, tcx: TyCtxt<'tcx>) -> ConstPropagator<'mir, 'tcx> {
         let def_id = body.source.def_id();
-        let substs = &InternalSubsts::identity_for_item(tcx, def_id);
+        let args = &GenericArgs::identity_for_item(tcx, def_id);
         let param_env = tcx.param_env_reveal_all_normalized(def_id);
 
         let can_const_prop = CanConstProp::check(tcx, param_env, body);
@@ -331,7 +325,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         );
 
         let ret_layout = ecx
-            .layout_of(body.bound_return_ty().subst(tcx, substs))
+            .layout_of(body.bound_return_ty().instantiate(tcx, args))
             .ok()
             // Don't bother allocating memory for large values.
             // I don't know how return types can seem to be unsized but this happens in the
@@ -347,27 +341,41 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             .into();
 
         ecx.push_stack_frame(
-            Instance::new(def_id, substs),
-            dummy_body,
+            Instance::new(def_id, args),
+            body,
             &ret,
             StackPopCleanup::Root { cleanup: false },
         )
         .expect("failed to push initial stack frame");
 
-        ConstPropagator { ecx, tcx, param_env, local_decls: &dummy_body.local_decls }
+        for local in body.local_decls.indices() {
+            // Mark everything initially live.
+            // This is somewhat dicey since some of them might be unsized and it is incoherent to
+            // mark those as live... We rely on `local_to_place`/`local_to_op` in the interpreter
+            // stopping us before those unsized immediates can cause issues deeper in the
+            // interpreter.
+            ecx.frame_mut().locals[local].make_live_uninit();
+        }
+
+        let patch = Patch::new(tcx);
+        ConstPropagator { ecx, tcx, param_env, local_decls: &body.local_decls, patch }
     }
 
     fn get_const(&self, place: Place<'tcx>) -> Option<OpTy<'tcx>> {
         let op = match self.ecx.eval_place_to_op(place, None) {
             Ok(op) => {
-                if matches!(*op, interpret::Operand::Immediate(Immediate::Uninit)) {
+                if op
+                    .as_mplace_or_imm()
+                    .right()
+                    .is_some_and(|imm| matches!(*imm, Immediate::Uninit))
+                {
                     // Make sure nobody accidentally uses this value.
                     return None;
                 }
                 op
             }
             Err(e) => {
-                trace!("get_const failed: {}", e);
+                trace!("get_const failed: {:?}", e.into_kind().debug());
                 return None;
             }
         };
@@ -383,57 +391,8 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
     /// Remove `local` from the pool of `Locals`. Allows writing to them,
     /// but not reading from them anymore.
     fn remove_const(ecx: &mut InterpCx<'mir, 'tcx, ConstPropMachine<'mir, 'tcx>>, local: Local) {
-        ecx.frame_mut().locals[local].value =
-            LocalValue::Live(interpret::Operand::Immediate(interpret::Immediate::Uninit));
+        ecx.frame_mut().locals[local].make_live_uninit();
         ecx.machine.written_only_inside_own_block_locals.remove(&local);
-    }
-
-    /// Returns the value, if any, of evaluating `c`.
-    fn eval_constant(&mut self, c: &Constant<'tcx>) -> Option<OpTy<'tcx>> {
-        // FIXME we need to revisit this for #67176
-        if c.has_param() {
-            return None;
-        }
-
-        // No span, we don't want errors to be shown.
-        self.ecx.eval_mir_constant(&c.literal, None, None).ok()
-    }
-
-    /// Returns the value, if any, of evaluating `place`.
-    fn eval_place(&mut self, place: Place<'tcx>) -> Option<OpTy<'tcx>> {
-        trace!("eval_place(place={:?})", place);
-        self.ecx.eval_place_to_op(place, None).ok()
-    }
-
-    /// Returns the value, if any, of evaluating `op`. Calls upon `eval_constant`
-    /// or `eval_place`, depending on the variant of `Operand` used.
-    fn eval_operand(&mut self, op: &Operand<'tcx>) -> Option<OpTy<'tcx>> {
-        match *op {
-            Operand::Constant(ref c) => self.eval_constant(c),
-            Operand::Move(place) | Operand::Copy(place) => self.eval_place(place),
-        }
-    }
-
-    fn propagate_operand(&mut self, operand: &mut Operand<'tcx>) {
-        match *operand {
-            Operand::Copy(l) | Operand::Move(l) => {
-                if let Some(value) = self.get_const(l) && self.should_const_prop(&value) {
-                    // FIXME(felix91gr): this code only handles `Scalar` cases.
-                    // For now, we're not handling `ScalarPair` cases because
-                    // doing so here would require a lot of code duplication.
-                    // We should hopefully generalize `Operand` handling into a fn,
-                    // and use it to do const-prop here and everywhere else
-                    // where it makes sense.
-                    if let interpret::Operand::Immediate(interpret::Immediate::Scalar(
-                        scalar,
-                    )) = *value
-                    {
-                        *operand = self.operand_from_scalar(scalar, value.layout.ty);
-                    }
-                }
-            }
-            Operand::Constant(_) => (),
-        }
     }
 
     fn check_rvalue(&mut self, rvalue: &Rvalue<'tcx>) -> Option<()> {
@@ -551,102 +510,40 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         }
     }
 
-    /// Creates a new `Operand::Constant` from a `Scalar` value
-    fn operand_from_scalar(&self, scalar: Scalar, ty: Ty<'tcx>) -> Operand<'tcx> {
-        Operand::Constant(Box::new(Constant {
-            span: DUMMY_SP,
-            user_ty: None,
-            literal: ConstantKind::from_scalar(self.tcx, scalar, ty),
-        }))
-    }
-
-    fn replace_with_const(&mut self, place: Place<'tcx>, rval: &mut Rvalue<'tcx>) {
+    fn replace_with_const(&mut self, place: Place<'tcx>) -> Option<Const<'tcx>> {
         // This will return None if the above `const_prop` invocation only "wrote" a
-        // type whose creation requires no write. E.g. a generator whose initial state
+        // type whose creation requires no write. E.g. a coroutine whose initial state
         // consists solely of uninitialized memory (so it doesn't capture any locals).
-        let Some(ref value) = self.get_const(place) else { return };
-        if !self.should_const_prop(value) {
-            return;
+        let value = self.get_const(place)?;
+        if !self.tcx.consider_optimizing(|| format!("ConstantPropagation - {value:?}")) {
+            return None;
         }
-        trace!("replacing {:?}={:?} with {:?}", place, rval, value);
+        trace!("replacing {:?} with {:?}", place, value);
 
-        if let Rvalue::Use(Operand::Constant(c)) = rval {
-            match c.literal {
-                ConstantKind::Ty(c) if matches!(c.kind(), ConstKind::Unevaluated(..)) => {}
-                _ => {
-                    trace!("skipping replace of Rvalue::Use({:?} because it is already a const", c);
-                    return;
-                }
+        // FIXME: figure out what to do when read_immediate_raw fails
+        let imm = self.ecx.read_immediate_raw(&value).ok()?;
+
+        let Right(imm) = imm else { return None };
+        match *imm {
+            Immediate::Scalar(scalar) if scalar.try_to_int().is_ok() => {
+                Some(Const::from_scalar(self.tcx, scalar, value.layout.ty))
             }
-        }
+            Immediate::ScalarPair(l, r) if l.try_to_int().is_ok() && r.try_to_int().is_ok() => {
+                let alloc_id = self
+                    .ecx
+                    .intern_with_temp_alloc(value.layout, |ecx, dest| {
+                        ecx.write_immediate(*imm, dest)
+                    })
+                    .ok()?;
 
-        trace!("attempting to replace {:?} with {:?}", rval, value);
-        // FIXME> figure out what to do when read_immediate_raw fails
-        let imm = self.ecx.read_immediate_raw(value).ok();
-
-        if let Some(Right(imm)) = imm {
-            match *imm {
-                interpret::Immediate::Scalar(scalar) => {
-                    *rval = Rvalue::Use(self.operand_from_scalar(scalar, value.layout.ty));
-                }
-                Immediate::ScalarPair(..) => {
-                    // Found a value represented as a pair. For now only do const-prop if the type
-                    // of `rvalue` is also a tuple with two scalars.
-                    // FIXME: enable the general case stated above ^.
-                    let ty = value.layout.ty;
-                    // Only do it for tuples
-                    if let ty::Tuple(types) = ty.kind() {
-                        // Only do it if tuple is also a pair with two scalars
-                        if let [ty1, ty2] = types[..] {
-                            let ty_is_scalar = |ty| {
-                                self.ecx.layout_of(ty).ok().map(|layout| layout.abi.is_scalar())
-                                    == Some(true)
-                            };
-                            let alloc = if ty_is_scalar(ty1) && ty_is_scalar(ty2) {
-                                let alloc = self
-                                    .ecx
-                                    .intern_with_temp_alloc(value.layout, |ecx, dest| {
-                                        ecx.write_immediate(*imm, dest)
-                                    })
-                                    .unwrap();
-                                Some(alloc)
-                            } else {
-                                None
-                            };
-
-                            if let Some(alloc) = alloc {
-                                // Assign entire constant in a single statement.
-                                // We can't use aggregates, as we run after the aggregate-lowering `MirPhase`.
-                                let const_val = ConstValue::ByRef { alloc, offset: Size::ZERO };
-                                let literal = ConstantKind::Val(const_val, ty);
-                                *rval = Rvalue::Use(Operand::Constant(Box::new(Constant {
-                                    span: DUMMY_SP,
-                                    user_ty: None,
-                                    literal,
-                                })));
-                            }
-                        }
-                    }
-                }
-                // Scalars or scalar pairs that contain undef values are assumed to not have
-                // successfully evaluated and are thus not propagated.
-                _ => {}
+                Some(Const::Val(
+                    ConstValue::Indirect { alloc_id, offset: Size::ZERO },
+                    value.layout.ty,
+                ))
             }
-        }
-    }
-
-    /// Returns `true` if and only if this `op` should be const-propagated into.
-    fn should_const_prop(&mut self, op: &OpTy<'tcx>) -> bool {
-        if !self.tcx.consider_optimizing(|| format!("ConstantPropagation - OpTy: {:?}", op)) {
-            return false;
-        }
-
-        match **op {
-            interpret::Operand::Immediate(Immediate::Scalar(s)) => s.try_to_int().is_ok(),
-            interpret::Operand::Immediate(Immediate::ScalarPair(l, r)) => {
-                l.try_to_int().is_ok() && r.try_to_int().is_ok()
-            }
-            _ => false,
+            // Scalars or scalar pairs that contain undef values are assumed to not have
+            // successfully evaluated and are thus not propagated.
+            _ => None,
         }
     }
 
@@ -771,8 +668,7 @@ impl<'tcx> Visitor<'tcx> for CanConstProp {
             // These can't ever be propagated under any scheme, as we can't reason about indirect
             // mutation.
             | NonMutatingUse(NonMutatingUseContext::SharedBorrow)
-            | NonMutatingUse(NonMutatingUseContext::ShallowBorrow)
-            | NonMutatingUse(NonMutatingUseContext::UniqueBorrow)
+            | NonMutatingUse(NonMutatingUseContext::FakeBorrow)
             | NonMutatingUse(NonMutatingUseContext::AddressOf)
             | MutatingUse(MutatingUseContext::Borrow)
             | MutatingUse(MutatingUseContext::AddressOf) => {
@@ -785,33 +681,31 @@ impl<'tcx> Visitor<'tcx> for CanConstProp {
     }
 }
 
-impl<'tcx> MutVisitor<'tcx> for ConstPropagator<'_, 'tcx> {
-    fn tcx(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
-    fn visit_body(&mut self, body: &mut Body<'tcx>) {
-        for (bb, data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated_mut() {
-            self.visit_basic_block_data(bb, data);
-        }
-    }
-
-    fn visit_operand(&mut self, operand: &mut Operand<'tcx>, location: Location) {
+impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
+    fn visit_operand(&mut self, operand: &Operand<'tcx>, location: Location) {
         self.super_operand(operand, location);
-
-        // Only const prop copies and moves on `mir_opt_level=3` as doing so
-        // currently slightly increases compile time in some cases.
-        if self.tcx.sess.mir_opt_level() >= 3 {
-            self.propagate_operand(operand)
+        if let Some(place) = operand.place()
+            && let Some(value) = self.replace_with_const(place)
+        {
+            self.patch.before_effect.insert((location, place), value);
         }
     }
 
-    fn visit_assign(
+    fn visit_projection_elem(
         &mut self,
-        place: &mut Place<'tcx>,
-        rvalue: &mut Rvalue<'tcx>,
+        _: PlaceRef<'tcx>,
+        elem: PlaceElem<'tcx>,
+        _: PlaceContext,
         location: Location,
     ) {
+        if let PlaceElem::Index(local) = elem
+            && let Some(value) = self.replace_with_const(local.into())
+        {
+            self.patch.before_effect.insert((location, local.into()), value);
+        }
+    }
+
+    fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
         self.super_assign(place, rvalue, location);
 
         let Some(()) = self.check_rvalue(rvalue) else { return };
@@ -822,7 +716,17 @@ impl<'tcx> MutVisitor<'tcx> for ConstPropagator<'_, 'tcx> {
             ConstPropMode::NoPropagation => self.ensure_not_propagated(place.local),
             ConstPropMode::OnlyInsideOwnBlock | ConstPropMode::FullConstProp => {
                 if let Some(()) = self.eval_rvalue_with_identities(rvalue, *place) {
-                    self.replace_with_const(*place, rvalue);
+                    // If this was already an evaluated constant, keep it.
+                    if let Rvalue::Use(Operand::Constant(c)) = rvalue
+                        && let Const::Val(..) = c.const_
+                    {
+                        trace!(
+                            "skipping replace of Rvalue::Use({:?} because it is already a const",
+                            c
+                        );
+                    } else if let Some(operand) = self.replace_with_const(*place) {
+                        self.patch.assignments.insert(location, operand);
+                    }
                 } else {
                     // Const prop failed, so erase the destination, ensuring that whatever happens
                     // from here on, does not know about the previous value.
@@ -845,7 +749,7 @@ impl<'tcx> MutVisitor<'tcx> for ConstPropagator<'_, 'tcx> {
         }
     }
 
-    fn visit_statement(&mut self, statement: &mut Statement<'tcx>, location: Location) {
+    fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         trace!("visit_statement: {:?}", statement);
 
         // We want to evaluate operands before any change to the assigned-to value,
@@ -868,58 +772,28 @@ impl<'tcx> MutVisitor<'tcx> for ConstPropagator<'_, 'tcx> {
                 }
             }
             StatementKind::StorageLive(local) => {
-                let frame = self.ecx.frame_mut();
-                frame.locals[local].value =
-                    LocalValue::Live(interpret::Operand::Immediate(interpret::Immediate::Uninit));
+                Self::remove_const(&mut self.ecx, local);
             }
-            StatementKind::StorageDead(local) => {
-                let frame = self.ecx.frame_mut();
-                frame.locals[local].value = LocalValue::Dead;
-            }
+            // We do not need to mark dead locals as such. For `FullConstProp` locals,
+            // this allows to propagate the single assigned value in this case:
+            // ```
+            // let x = SOME_CONST;
+            // if a {
+            //   f(copy x);
+            //   StorageDead(x);
+            // } else {
+            //   g(copy x);
+            //   StorageDead(x);
+            // }
+            // ```
+            //
+            // This may propagate a constant where the local would be uninit or dead.
+            // In both cases, this does not matter, as those reads would be UB anyway.
             _ => {}
         }
     }
 
-    fn visit_terminator(&mut self, terminator: &mut Terminator<'tcx>, location: Location) {
-        self.super_terminator(terminator, location);
-
-        match &mut terminator.kind {
-            TerminatorKind::Assert { expected, ref mut cond, .. } => {
-                if let Some(ref value) = self.eval_operand(&cond)
-                    && let Ok(value_const) = self.ecx.read_scalar(&value)
-                    && self.should_const_prop(value)
-                {
-                    trace!("assertion on {:?} should be {:?}", value, expected);
-                    *cond = self.operand_from_scalar(value_const, self.tcx.types.bool);
-                }
-            }
-            TerminatorKind::SwitchInt { ref mut discr, .. } => {
-                // FIXME: This is currently redundant with `visit_operand`, but sadly
-                // always visiting operands currently causes a perf regression in LLVM codegen, so
-                // `visit_operand` currently only runs for propagates places for `mir_opt_level=4`.
-                self.propagate_operand(discr)
-            }
-            // None of these have Operands to const-propagate.
-            TerminatorKind::Goto { .. }
-            | TerminatorKind::Resume
-            | TerminatorKind::Terminate
-            | TerminatorKind::Return
-            | TerminatorKind::Unreachable
-            | TerminatorKind::Drop { .. }
-            | TerminatorKind::Yield { .. }
-            | TerminatorKind::GeneratorDrop
-            | TerminatorKind::FalseEdge { .. }
-            | TerminatorKind::FalseUnwind { .. }
-            | TerminatorKind::InlineAsm { .. } => {}
-            // Every argument in our function calls have already been propagated in `visit_operand`.
-            //
-            // NOTE: because LLVM codegen gives slight performance regressions with it, so this is
-            // gated on `mir_opt_level=3`.
-            TerminatorKind::Call { .. } => {}
-        }
-    }
-
-    fn visit_basic_block_data(&mut self, block: BasicBlock, data: &mut BasicBlockData<'tcx>) {
+    fn visit_basic_block_data(&mut self, block: BasicBlock, data: &BasicBlockData<'tcx>) {
         self.super_basic_block_data(block, data);
 
         // We remove all Locals which are restricted in propagation to their containing blocks and

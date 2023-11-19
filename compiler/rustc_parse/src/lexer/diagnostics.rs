@@ -46,7 +46,7 @@ pub fn report_missing_open_delim(
             };
             err.span_label(
                 unmatch_brace.found_span.shrink_to_lo(),
-                format!("missing open `{}` for this delimiter", missed_open),
+                format!("missing open `{missed_open}` for this delimiter"),
             );
             reported_missing_open = true;
         }
@@ -111,9 +111,10 @@ pub fn report_suspicious_mismatch_block(
         // If there is no suspicious span, give the last properly closed block may help
         if let Some(parent) = diag_info.matching_block_spans.last()
             && diag_info.open_braces.last().is_none()
-            && diag_info.empty_block_spans.iter().all(|&sp| sp != parent.0.to(parent.1)) {
-                err.span_label(parent.0, "this opening brace...");
-                err.span_label(parent.1, "...matches this closing brace");
+            && diag_info.empty_block_spans.iter().all(|&sp| sp != parent.0.to(parent.1))
+        {
+            err.span_label(parent.0, "this opening brace...");
+            err.span_label(parent.1, "...matches this closing brace");
         }
     }
 }

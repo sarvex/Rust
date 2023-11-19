@@ -9,10 +9,10 @@
 
 use rustc_attr as attr;
 use rustc_hir as hir;
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::def_id::{LocalDefId, LocalModDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_middle::hir::nested_filter;
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::parse::feature_err;
 use rustc_span::{sym, Span, Symbol};
@@ -45,7 +45,7 @@ impl NonConstExpr {
 
             Self::Loop(ForLoop) | Self::Match(ForLoopDesugar) => &[sym::const_for],
 
-            Self::Match(TryDesugar) => &[sym::const_try],
+            Self::Match(TryDesugar(_)) => &[sym::const_try],
 
             // All other expressions are allowed.
             Self::Loop(Loop | While) | Self::Match(Normal | FormatArgs) => &[],
@@ -55,7 +55,7 @@ impl NonConstExpr {
     }
 }
 
-fn check_mod_const_bodies(tcx: TyCtxt<'_>, module_def_id: LocalDefId) {
+fn check_mod_const_bodies(tcx: TyCtxt<'_>, module_def_id: LocalModDefId) {
     let mut vis = CheckConstVisitor::new(tcx);
     tcx.hir().visit_item_likes_in_module(module_def_id, &mut vis);
 }
@@ -86,7 +86,7 @@ impl<'tcx> CheckConstVisitor<'tcx> {
         let is_feature_allowed = |feature_gate| {
             // All features require that the corresponding gate be enabled,
             // even if the function has `#[rustc_allow_const_fn_unstable(the_gate)]`.
-            if !tcx.features().enabled(feature_gate) {
+            if !tcx.features().active(feature_gate) {
                 return false;
             }
 
@@ -134,7 +134,7 @@ impl<'tcx> CheckConstVisitor<'tcx> {
 
         let required_gates = required_gates.unwrap_or(&[]);
         let missing_gates: Vec<_> =
-            required_gates.iter().copied().filter(|&g| !features.enabled(g)).collect();
+            required_gates.iter().copied().filter(|&g| !features.active(g)).collect();
 
         match missing_gates.as_slice() {
             [] => {
@@ -157,10 +157,8 @@ impl<'tcx> CheckConstVisitor<'tcx> {
                 // is a pretty narrow case, however.
                 if tcx.sess.is_nightly_build() {
                     for gate in missing_secondary {
-                        let note = format!(
-                            "add `#![feature({})]` to the crate attributes to enable",
-                            gate,
-                        );
+                        let note =
+                            format!("add `#![feature({gate})]` to the crate attributes to enable",);
                         err.help(note);
                     }
                 }
@@ -195,8 +193,13 @@ impl<'tcx> Visitor<'tcx> for CheckConstVisitor<'tcx> {
     }
 
     fn visit_anon_const(&mut self, anon: &'tcx hir::AnonConst) {
-        let kind = Some(hir::ConstContext::Const);
+        let kind = Some(hir::ConstContext::Const { inline: false });
         self.recurse_into(kind, None, |this| intravisit::walk_anon_const(this, anon));
+    }
+
+    fn visit_inline_const(&mut self, block: &'tcx hir::ConstBlock) {
+        let kind = Some(hir::ConstContext::Const { inline: true });
+        self.recurse_into(kind, None, |this| intravisit::walk_inline_const(this, block));
     }
 
     fn visit_body(&mut self, body: &'tcx hir::Body<'tcx>) {

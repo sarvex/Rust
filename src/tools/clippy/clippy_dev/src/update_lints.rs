@@ -340,7 +340,10 @@ pub fn deprecate(name: &str, reason: Option<&String>) {
     let name_upper = name.to_uppercase();
 
     let (mut lints, deprecated_lints, renamed_lints) = gather_all();
-    let Some(lint) = lints.iter().find(|l| l.name == name_lower) else { eprintln!("error: failed to find lint `{name}`"); return; };
+    let Some(lint) = lints.iter().find(|l| l.name == name_lower) else {
+        eprintln!("error: failed to find lint `{name}`");
+        return;
+    };
 
     let mod_path = {
         let mut mod_path = PathBuf::from(format!("clippy_lints/src/{}", lint.module));
@@ -585,7 +588,7 @@ impl Lint {
             .collect()
     }
 
-    /// Returns all internal lints (not `internal_warn` lints)
+    /// Returns all internal lints
     #[must_use]
     fn internal_lints(lints: &[Self]) -> Vec<Self> {
         lints.iter().filter(|l| l.group == "internal").cloned().collect()
@@ -687,7 +690,6 @@ fn gen_deprecated_lints_test(lints: &[DeprecatedLint]) -> String {
 fn gen_renamed_lints_test(lints: &[RenamedLint]) -> String {
     let mut seen_lints = HashSet::new();
     let mut res: String = GENERATED_FILE_COMMENT.into();
-    res.push_str("//@run-rustfix\n\n");
     for lint in lints {
         if seen_lints.insert(&lint.new_name) {
             writeln!(res, "#![allow({})]", lint.new_name).unwrap();

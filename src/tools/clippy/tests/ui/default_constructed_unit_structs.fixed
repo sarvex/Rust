@@ -1,5 +1,3 @@
-//@run-rustfix
-
 #![allow(unused)]
 #![warn(clippy::default_constructed_unit_structs)]
 use std::marker::PhantomData;
@@ -101,10 +99,33 @@ struct EmptyStruct {}
 #[non_exhaustive]
 struct NonExhaustiveStruct;
 
+mod issue_10755 {
+    struct Sqlite {}
+
+    trait HasArguments<'q> {
+        type Arguments;
+    }
+
+    impl<'q> HasArguments<'q> for Sqlite {
+        type Arguments = std::marker::PhantomData<&'q ()>;
+    }
+
+    type SqliteArguments<'q> = <Sqlite as HasArguments<'q>>::Arguments;
+
+    fn foo() {
+        // should not lint
+        // type alias cannot be used as a constructor
+        let _ = <Sqlite as HasArguments>::Arguments::default();
+
+        let _ = SqliteArguments::default();
+    }
+}
+
 fn main() {
     // should lint
     let _ = PhantomData::<usize>;
     let _: PhantomData<i32> = PhantomData;
+    let _: PhantomData<i32> = std::marker::PhantomData;
     let _ = UnitStruct;
 
     // should not lint
@@ -116,4 +137,21 @@ fn main() {
     let _ = EmptyStruct::default();
     let _ = FakeDefault::default();
     let _ = <FakeDefault as Default>::default();
+
+    macro_rules! in_macro {
+        ($i:ident) => {{
+            let _ = UnitStruct::default();
+            let _ = $i::default();
+        }};
+    }
+
+    in_macro!(UnitStruct);
+
+    macro_rules! struct_from_macro {
+        () => {
+            UnitStruct
+        };
+    }
+
+    let _ = <struct_from_macro!()>::default();
 }

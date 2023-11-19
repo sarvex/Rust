@@ -13,7 +13,7 @@ declare_clippy_lint! {
     /// This pattern has no effect in almost all cases.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let mut v = Vec::<String>::new();
     /// v.iter_mut().filter(|&ref a| a.is_empty());
     ///
@@ -21,7 +21,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let mut v = Vec::<String>::new();
     /// v.iter_mut().filter(|a| a.is_empty());
     ///
@@ -52,7 +52,9 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBorrowedRef {
         }
 
         // Only lint immutable refs, because `&mut ref T` may be useful.
-        let PatKind::Ref(pat, Mutability::Not) = ref_pat.kind else { return };
+        let PatKind::Ref(pat, Mutability::Not) = ref_pat.kind else {
+            return;
+        };
 
         match pat.kind {
             // Check sub_pat got a `ref` keyword (excluding `ref mut`).

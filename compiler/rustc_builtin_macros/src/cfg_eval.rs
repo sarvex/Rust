@@ -31,10 +31,11 @@ pub(crate) fn expand(
 
 pub(crate) fn cfg_eval(
     sess: &Session,
-    features: Option<&Features>,
+    features: &Features,
     annotatable: Annotatable,
     lint_node_id: NodeId,
 ) -> Annotatable {
+    let features = Some(features);
     CfgEval { cfg: &mut StripUnconfigured { sess, features, config_tokens: true, lint_node_id } }
         .configure_annotatable(annotatable)
         // Since the item itself has already been configured by the `InvocationCollector`,
@@ -119,7 +120,7 @@ impl<'ast> visit::Visitor<'ast> for CfgFinder {
         self.has_cfg_or_cfg_attr = self.has_cfg_or_cfg_attr
             || attr
                 .ident()
-                .map_or(false, |ident| ident.name == sym::cfg || ident.name == sym::cfg_attr);
+                .is_some_and(|ident| ident.name == sym::cfg || ident.name == sym::cfg_attr);
     }
 }
 
@@ -166,7 +167,9 @@ impl CfgEval<'_, '_> {
                     ))
                 },
                 Annotatable::Stmt(_) => |parser| {
-                    Ok(Annotatable::Stmt(P(parser.parse_stmt(ForceCollect::Yes)?.unwrap())))
+                    Ok(Annotatable::Stmt(P(parser
+                        .parse_stmt_without_recovery(false, ForceCollect::Yes)?
+                        .unwrap())))
                 },
                 Annotatable::Expr(_) => {
                     |parser| Ok(Annotatable::Expr(parser.parse_expr_force_collect()?))

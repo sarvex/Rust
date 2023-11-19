@@ -119,21 +119,28 @@
 //! # Representation
 //!
 //! Rust guarantees to optimize the following types `T` such that
-//! [`Option<T>`] has the same size as `T`:
+//! [`Option<T>`] has the same size, alignment, and [function call ABI] as `T`. In some
+//! of these cases, Rust further guarantees that
+//! `transmute::<_, Option<T>>([0u8; size_of::<T>()])` is sound and
+//! produces `Option::<T>::None`. These cases are identified by the
+//! second column:
 //!
-//! * [`Box<U>`]
-//! * `&U`
-//! * `&mut U`
-//! * `fn`, `extern "C" fn`[^extern_fn]
-//! * [`num::NonZero*`]
-//! * [`ptr::NonNull<U>`]
-//! * `#[repr(transparent)]` struct around one of the types in this list.
+//! | `T`                                                                 | `transmute::<_, Option<T>>([0u8; size_of::<T>()])` sound? |
+//! |---------------------------------------------------------------------|----------------------------------------------------------------------|
+//! | [`Box<U>`] (specifically, only `Box<U, Global>`)                    | when `U: Sized`                                                      |
+//! | `&U`                                                                | when `U: Sized`                                                      |
+//! | `&mut U`                                                            | when `U: Sized`                                                      |
+//! | `fn`, `extern "C" fn`[^extern_fn]                                   | always                                                               |
+//! | [`num::NonZero*`]                                                   | always                                                               |
+//! | [`ptr::NonNull<U>`]                                                 | when `U: Sized`                                                      |
+//! | `#[repr(transparent)]` struct around one of the types in this list. | when it holds for the inner type                                     |
 //!
-//! [^extern_fn]: this remains true for any other ABI: `extern "abi" fn` (_e.g._, `extern "system" fn`)
+//! [^extern_fn]: this remains true for any argument/return types and any other ABI: `extern "abi" fn` (_e.g._, `extern "system" fn`)
 //!
 //! [`Box<U>`]: ../../std/boxed/struct.Box.html
 //! [`num::NonZero*`]: crate::num
 //! [`ptr::NonNull<U>`]: crate::ptr::NonNull
+//! [function call ABI]: ../primitive.fn.html#abi-compatibility
 //!
 //! This is called the "null pointer optimization" or NPO.
 //!
@@ -743,8 +750,6 @@ impl<T> Option<T> {
     /// # Examples
     ///
     /// ```rust
-    /// #![feature(option_as_slice)]
-    ///
     /// assert_eq!(
     ///     [Some(1234).as_slice(), None.as_slice()],
     ///     [&[1234][..], &[][..]],
@@ -755,15 +760,13 @@ impl<T> Option<T> {
     /// borrowing) [`[_]::first`](slice::first):
     ///
     /// ```rust
-    /// #![feature(option_as_slice)]
-    ///
     /// for i in [Some(1234_u16), None] {
     ///     assert_eq!(i.as_ref(), i.as_slice().first());
     /// }
     /// ```
     #[inline]
     #[must_use]
-    #[unstable(feature = "option_as_slice", issue = "108545")]
+    #[stable(feature = "option_as_slice", since = "1.75.0")]
     pub fn as_slice(&self) -> &[T] {
         // SAFETY: When the `Option` is `Some`, we're using the actual pointer
         // to the payload, with a length of 1, so this is equivalent to
@@ -777,7 +780,7 @@ impl<T> Option<T> {
         // `None` case it's just padding).
         unsafe {
             slice::from_raw_parts(
-                crate::intrinsics::option_payload_ptr(crate::ptr::from_ref(self)),
+                (self as *const Self).byte_add(core::mem::offset_of!(Self, Some.0)).cast(),
                 usize::from(self.is_some()),
             )
         }
@@ -794,8 +797,6 @@ impl<T> Option<T> {
     /// # Examples
     ///
     /// ```rust
-    /// #![feature(option_as_slice)]
-    ///
     /// assert_eq!(
     ///     [Some(1234).as_mut_slice(), None.as_mut_slice()],
     ///     [&mut [1234][..], &mut [][..]],
@@ -806,8 +807,6 @@ impl<T> Option<T> {
     /// our original `Option`:
     ///
     /// ```rust
-    /// #![feature(option_as_slice)]
-    ///
     /// let mut x = Some(1234);
     /// x.as_mut_slice()[0] += 1;
     /// assert_eq!(x, Some(1235));
@@ -817,13 +816,11 @@ impl<T> Option<T> {
     /// is [`[_]::first_mut`](slice::first_mut):
     ///
     /// ```rust
-    /// #![feature(option_as_slice)]
-    ///
     /// assert_eq!(Some(123).as_mut_slice().first_mut(), Some(&mut 123))
     /// ```
     #[inline]
     #[must_use]
-    #[unstable(feature = "option_as_slice", issue = "108545")]
+    #[stable(feature = "option_as_slice", since = "1.75.0")]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: When the `Option` is `Some`, we're using the actual pointer
         // to the payload, with a length of 1, so this is equivalent to
@@ -839,8 +836,7 @@ impl<T> Option<T> {
         // the `None` case it's just padding).
         unsafe {
             slice::from_raw_parts_mut(
-                crate::intrinsics::option_payload_ptr(crate::ptr::from_mut(self).cast_const())
-                    .cast_mut(),
+                (self as *mut Self).byte_add(core::mem::offset_of!(Self, Some.0)).cast(),
                 usize::from(self.is_some()),
             )
         }
@@ -969,6 +965,7 @@ impl<T> Option<T> {
     /// assert_eq!(None.unwrap_or_else(|| 2 * k), 20);
     /// ```
     #[inline]
+    #[track_caller]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn unwrap_or_else<F>(self, f: F) -> T
     where
@@ -1082,8 +1079,6 @@ impl<T> Option<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(result_option_inspect)]
-    ///
     /// let v = vec![1, 2, 3, 4, 5];
     ///
     /// // prints "got: 4"
@@ -1093,11 +1088,8 @@ impl<T> Option<T> {
     /// let x: Option<&usize> = v.get(5).inspect(|x| println!("got: {x}"));
     /// ```
     #[inline]
-    #[unstable(feature = "result_option_inspect", issue = "91345")]
-    pub fn inspect<F>(self, f: F) -> Self
-    where
-        F: FnOnce(&T),
-    {
+    #[stable(feature = "result_option_inspect", since = "CURRENT_RUSTC_VERSION")]
+    pub fn inspect<F: FnOnce(&T)>(self, f: F) -> Self {
         if let Some(ref x) = self {
             f(x);
         }
@@ -1125,6 +1117,7 @@ impl<T> Option<T> {
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[must_use = "if you don't need the returned value, use `if let` instead"]
     pub fn map_or<U, F>(self, default: U, f: F) -> U
     where
         F: FnOnce(T) -> U,
@@ -1138,7 +1131,7 @@ impl<T> Option<T> {
     /// Computes a default function result (if none), or
     /// applies a different function to the contained value (if any).
     ///
-    /// # Examples
+    /// # Basic examples
     ///
     /// ```
     /// let k = 21;
@@ -1148,6 +1141,25 @@ impl<T> Option<T> {
     ///
     /// let x: Option<&str> = None;
     /// assert_eq!(x.map_or_else(|| 2 * k, |v| v.len()), 42);
+    /// ```
+    ///
+    /// # Handling a Result-based fallback
+    ///
+    /// A somewhat common occurrence when dealing with optional values
+    /// in combination with [`Result<T, E>`] is the case where one wants to invoke
+    /// a fallible fallback if the option is not present.  This example
+    /// parses a command line argument (if present), or the contents of a file to
+    /// an integer.  However, unlike accessing the command line argument, reading
+    /// the file is fallible, so it must be wrapped with `Ok`.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let v: u64 = std::env::args()
+    ///    .nth(1)
+    ///    .map_or_else(|| std::fs::read_to_string("/etc/someconfig.conf"), Ok)?
+    ///    .parse()?;
+    /// #   Ok(())
+    /// # }
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -1383,6 +1395,7 @@ impl<T> Option<T> {
     /// let item_2_0 = arr_2d.get(2).and_then(|row| row.get(0));
     /// assert_eq!(item_2_0, None);
     /// ```
+    #[doc(alias = "flatmap")]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn and_then<U, F>(self, f: F) -> Option<U>
@@ -1464,7 +1477,7 @@ impl<T> Option<T> {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn or(self, optb: Option<T>) -> Option<T> {
         match self {
-            Some(x) => Some(x),
+            x @ Some(_) => x,
             None => optb,
         }
     }
@@ -1489,7 +1502,7 @@ impl<T> Option<T> {
         F: FnOnce() -> Option<T>,
     {
         match self {
-            Some(x) => Some(x),
+            x @ Some(_) => x,
             None => f(),
         }
     }
@@ -1519,8 +1532,8 @@ impl<T> Option<T> {
     #[stable(feature = "option_xor", since = "1.37.0")]
     pub fn xor(self, optb: Option<T>) -> Option<T> {
         match (self, optb) {
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
+            (a @ Some(_), None) => a,
+            (None, b @ Some(_)) => b,
             _ => None,
         }
     }
@@ -1675,6 +1688,41 @@ impl<T> Option<T> {
     pub const fn take(&mut self) -> Option<T> {
         // FIXME replace `mem::replace` by `mem::take` when the latter is const ready
         mem::replace(self, None)
+    }
+
+    /// Takes the value out of the option, but only if the predicate evaluates to
+    /// `true` on a mutable reference to the value.
+    ///
+    /// In other words, replaces `self` with `None` if the predicate returns `true`.
+    /// This method operates similar to [`Option::take`] but conditional.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(option_take_if)]
+    ///
+    /// let mut x = Some(42);
+    ///
+    /// let prev = x.take_if(|v| if *v == 42 {
+    ///     *v += 1;
+    ///     false
+    /// } else {
+    ///     false
+    /// });
+    /// assert_eq!(x, Some(43));
+    /// assert_eq!(prev, None);
+    ///
+    /// let prev = x.take_if(|v| *v == 43);
+    /// assert_eq!(x, None);
+    /// assert_eq!(prev, Some(43));
+    /// ```
+    #[inline]
+    #[unstable(feature = "option_take_if", issue = "98934")]
+    pub fn take_if<P>(&mut self, predicate: P) -> Option<T>
+    where
+        P: FnOnce(&mut T) -> bool,
+    {
+        if self.as_mut().map_or(false, predicate) { self.take() } else { None }
     }
 
     /// Replaces the actual value in the option by the value given in parameter,

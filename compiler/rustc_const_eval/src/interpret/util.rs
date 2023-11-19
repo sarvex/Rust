@@ -4,7 +4,7 @@ use rustc_middle::ty::{
 };
 use std::ops::ControlFlow;
 
-/// Checks whether a type contains generic parameters which require substitution.
+/// Checks whether a type contains generic parameters which must be instantiated.
 ///
 /// In case it does, returns a `TooGeneric` const eval error. Note that due to polymorphization
 /// types may be "concrete enough" even though they still contain generic parameters in
@@ -33,18 +33,19 @@ where
 
             match *ty.kind() {
                 ty::Param(_) => ControlFlow::Break(FoundParam),
-                ty::Closure(def_id, substs)
-                | ty::Generator(def_id, substs, ..)
-                | ty::FnDef(def_id, substs) => {
+                ty::Closure(def_id, args)
+                | ty::Coroutine(def_id, args, ..)
+                | ty::FnDef(def_id, args) => {
                     let instance = ty::InstanceDef::Item(def_id);
                     let unused_params = self.tcx.unused_generic_params(instance);
-                    for (index, subst) in substs.into_iter().enumerate() {
+                    for (index, subst) in args.into_iter().enumerate() {
                         let index = index
                             .try_into()
                             .expect("more generic parameters than can fit into a `u32`");
-                        // Only recurse when generic parameters in fns, closures and generators
-                        // are used and require substitution.
-                        // Just in case there are closures or generators within this subst,
+                        // Only recurse when generic parameters in fns, closures and coroutines
+                        // are used and have to be instantiated.
+                        //
+                        // Just in case there are closures or coroutines within this subst,
                         // recurse.
                         if unused_params.is_used(index) && subst.has_param() {
                             return subst.visit_with(self);

@@ -7,6 +7,7 @@ impl Session {
     pub fn timer(&self, what: &'static str) -> VerboseTimingGuard<'_> {
         self.prof.verbose_generic_activity(what)
     }
+    /// Used by `-Z self-profile`.
     pub fn time<R>(&self, what: &'static str, f: impl FnOnce() -> R) -> R {
         self.prof.verbose_generic_activity(what).run(f)
     }
@@ -108,5 +109,63 @@ impl CanonicalizedPath {
 
     pub fn original(&self) -> &PathBuf {
         &self.original
+    }
+}
+
+/// Gets a list of extra command-line flags provided by the user, as strings.
+///
+/// This function is used during ICEs to show more information useful for
+/// debugging, since some ICEs only happens with non-default compiler flags
+/// (and the users don't always report them).
+pub fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
+    const ICE_REPORT_COMPILER_FLAGS: &[&str] = &["-Z", "-C", "--crate-type"];
+
+    const ICE_REPORT_COMPILER_FLAGS_EXCLUDE: &[&str] = &["metadata", "extra-filename"];
+
+    const ICE_REPORT_COMPILER_FLAGS_STRIP_VALUE: &[&str] = &["incremental"];
+
+    let mut args = std::env::args_os().map(|arg| arg.to_string_lossy().to_string()).peekable();
+
+    let mut result = Vec::new();
+    let mut excluded_cargo_defaults = false;
+    while let Some(arg) = args.next() {
+        if let Some(a) = ICE_REPORT_COMPILER_FLAGS.iter().find(|a| arg.starts_with(*a)) {
+            let content = if arg.len() == a.len() {
+                // A space-separated option, like `-C incremental=foo` or `--crate-type rlib`
+                match args.next() {
+                    Some(arg) => arg.to_string(),
+                    None => continue,
+                }
+            } else if arg.get(a.len()..a.len() + 1) == Some("=") {
+                // An equals option, like `--crate-type=rlib`
+                arg[a.len() + 1..].to_string()
+            } else {
+                // A non-space option, like `-Cincremental=foo`
+                arg[a.len()..].to_string()
+            };
+            let option = content.split_once('=').map(|s| s.0).unwrap_or(&content);
+            if ICE_REPORT_COMPILER_FLAGS_EXCLUDE.iter().any(|exc| option == *exc) {
+                excluded_cargo_defaults = true;
+            } else {
+                result.push(a.to_string());
+                match ICE_REPORT_COMPILER_FLAGS_STRIP_VALUE.iter().find(|s| option == **s) {
+                    Some(s) => result.push(format!("{s}=[REDACTED]")),
+                    None => result.push(content),
+                }
+            }
+        }
+    }
+
+    if !result.is_empty() { Some((result, excluded_cargo_defaults)) } else { None }
+}
+
+pub(crate) fn is_ascii_ident(string: &str) -> bool {
+    let mut chars = string.chars();
+    if let Some(start) = chars.next()
+        && (start.is_ascii_alphabetic() || start == '_')
+    {
+        chars.all(|char| char.is_ascii_alphanumeric() || char == '_')
+    } else {
+        false
     }
 }

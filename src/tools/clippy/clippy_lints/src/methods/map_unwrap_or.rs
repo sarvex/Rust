@@ -1,5 +1,5 @@
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet;
 use clippy_utils::ty::is_type_diagnostic_item;
 use clippy_utils::usage::mutated_variables;
@@ -11,7 +11,8 @@ use rustc_span::symbol::sym;
 use super::MAP_UNWRAP_OR;
 
 /// lint use of `map().unwrap_or_else()` for `Option`s and `Result`s
-/// Return true if lint triggered
+///
+/// Returns true if the lint was emitted
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
     expr: &'tcx hir::Expr<'_>,
@@ -55,7 +56,7 @@ pub(super) fn check<'tcx>(
         // lint, with note if neither arg is > 1 line and both map() and
         // unwrap_or_else() have the same span
         let multiline = map_snippet.lines().count() > 1 || unwrap_snippet.lines().count() > 1;
-        let same_span = map_arg.span.ctxt() == unwrap_arg.span.ctxt();
+        let same_span = map_arg.span.eq_ctxt(unwrap_arg.span);
         if same_span && !multiline {
             let var_snippet = snippet(cx, recv.span, "..");
             span_lint_and_sugg(
@@ -63,7 +64,7 @@ pub(super) fn check<'tcx>(
                 MAP_UNWRAP_OR,
                 expr.span,
                 msg,
-                "try this",
+                "try",
                 format!("{var_snippet}.map_or_else({unwrap_snippet}, {map_snippet})"),
                 Applicability::MachineApplicable,
             );

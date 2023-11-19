@@ -1,11 +1,10 @@
-//@run-rustfix
 #![warn(clippy::option_if_let_else)]
 #![allow(
     unused_tuple_struct_fields,
-    clippy::redundant_closure,
     clippy::ref_option_ref,
     clippy::equatable_if_let,
-    clippy::let_unit_value
+    clippy::let_unit_value,
+    clippy::redundant_locals
 )]
 
 fn bad1(string: Option<&str>) -> (bool, &str) {
@@ -115,6 +114,15 @@ fn pattern_to_vec(pattern: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+// #10335
+fn test_result_impure_else(variable: Result<u32, &str>) {
+    if let Ok(binding) = variable {
+        println!("Ok {binding}");
+    } else {
+        println!("Err");
+    }
+}
+
 enum DummyEnum {
     One(u8),
     Two,
@@ -136,6 +144,7 @@ fn main() {
     unop_bad(&None, None);
     let _ = longer_body(None);
     test_map_or_else(None);
+    test_result_impure_else(Ok(42));
     let _ = negative_tests(None);
     let _ = impure_else(None);
 
@@ -238,4 +247,44 @@ fn issue9742() -> Option<&'static str> {
         Some(name) if name.starts_with("foo") => Some(name.trim()),
         _ => None,
     }
+}
+
+mod issue10729 {
+    #![allow(clippy::unit_arg, dead_code)]
+
+    pub fn reproduce(initial: &Option<String>) {
+        // 👇 needs `.as_ref()` because initial is an `&Option<_>`
+        match initial {
+            Some(value) => do_something(value),
+            None => {},
+        }
+    }
+
+    pub fn reproduce2(initial: &mut Option<String>) {
+        match initial {
+            Some(value) => do_something2(value),
+            None => {},
+        }
+    }
+
+    fn do_something(_value: &str) {}
+    fn do_something2(_value: &mut str) {}
+}
+
+fn issue11429() {
+    use std::collections::HashMap;
+
+    macro_rules! new_map {
+        () => {{ HashMap::new() }};
+    }
+
+    let opt: Option<HashMap<u8, u8>> = None;
+
+    let mut _hashmap = if let Some(hm) = &opt {
+        hm.clone()
+    } else {
+        HashMap::new()
+    };
+
+    let mut _hm = if let Some(hm) = &opt { hm.clone() } else { new_map!() };
 }

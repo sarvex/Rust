@@ -93,7 +93,17 @@ fn parse_count<'sess>(
     span: Span,
 ) -> PResult<'sess, MetaVarExpr> {
     let ident = parse_ident(iter, sess, span)?;
-    let depth = if try_eat_comma(iter) { Some(parse_depth(iter, sess, span)?) } else { None };
+    let depth = if try_eat_comma(iter) {
+        if iter.look_ahead(0).is_none() {
+            return Err(sess.span_diagnostic.struct_span_err(
+                span,
+                "`count` followed by a comma must have an associated index indicating its depth",
+            ));
+        }
+        Some(parse_depth(iter, sess, span)?)
+    } else {
+        None
+    };
     Ok(MetaVarExpr::Count(ident, depth))
 }
 
@@ -104,21 +114,17 @@ fn parse_depth<'sess>(
     span: Span,
 ) -> PResult<'sess, usize> {
     let Some(tt) = iter.next() else { return Ok(0) };
-    let TokenTree::Token(token::Token {
-        kind: token::TokenKind::Literal(lit), ..
-    }, _) = tt else {
-        return Err(sess.span_diagnostic.struct_span_err(
-            span,
-            "meta-variable expression depth must be a literal"
-        ));
+    let TokenTree::Token(token::Token { kind: token::TokenKind::Literal(lit), .. }, _) = tt else {
+        return Err(sess
+            .span_diagnostic
+            .struct_span_err(span, "meta-variable expression depth must be a literal"));
     };
     if let Ok(lit_kind) = LitKind::from_token_lit(*lit)
         && let LitKind::Int(n_u128, LitIntType::Unsuffixed) = lit_kind
         && let Ok(n_usize) = usize::try_from(n_u128)
     {
         Ok(n_usize)
-    }
-    else {
+    } else {
         let msg = "only unsuffixes integer literals are supported in meta-variable expressions";
         Err(sess.span_diagnostic.struct_span_err(span, msg))
     }
@@ -130,15 +136,16 @@ fn parse_ident<'sess>(
     sess: &'sess ParseSess,
     span: Span,
 ) -> PResult<'sess, Ident> {
-    if let Some(tt) = iter.next() && let TokenTree::Token(token, _) = tt {
+    if let Some(tt) = iter.next()
+        && let TokenTree::Token(token, _) = tt
+    {
         if let Some((elem, false)) = token.ident() {
             return Ok(elem);
         }
         let token_str = pprust::token_to_string(token);
-        let mut err = sess.span_diagnostic.struct_span_err(
-            span,
-            format!("expected identifier, found `{}`", &token_str)
-        );
+        let mut err = sess
+            .span_diagnostic
+            .struct_span_err(span, format!("expected identifier, found `{}`", &token_str));
         err.span_suggestion(
             token.span,
             format!("try removing `{}`", &token_str),

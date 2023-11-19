@@ -5,7 +5,7 @@
     extern_types, thread_local
 )]
 #![no_core]
-#![allow(dead_code, non_camel_case_types)]
+#![allow(dead_code, internal_features, non_camel_case_types)]
 
 extern crate mini_core;
 
@@ -152,7 +152,8 @@ fn main() {
     let slice = &[0, 1] as &[i32];
     let slice_ptr = slice as *const [i32] as *const i32;
 
-    assert_eq!(slice_ptr as usize % 4, 0);
+    let align = intrinsics::min_align_of::<*const i32>();
+    assert_eq!(slice_ptr as usize % align, 0);
 
     //return;
 
@@ -168,6 +169,9 @@ fn main() {
         world as Box<dyn SomeTrait>;
 
         assert_eq!(intrinsics::bitreverse(0b10101000u8), 0b00010101u8);
+        assert_eq!(intrinsics::bitreverse(0xddccu16), 0x33bbu16);
+        assert_eq!(intrinsics::bitreverse(0xffee_ddccu32), 0x33bb77ffu32);
+        assert_eq!(intrinsics::bitreverse(0x1234_5678_ffee_ddccu64), 0x33bb77ff1e6a2c48u64);
 
         assert_eq!(intrinsics::bswap(0xabu8), 0xabu8);
         assert_eq!(intrinsics::bswap(0xddccu16), 0xccddu16);
@@ -183,7 +187,10 @@ fn main() {
         let a: &dyn SomeTrait = &"abc\0";
         a.object_safe();
 
+        #[cfg(target_arch="x86_64")]
         assert_eq!(intrinsics::size_of_val(a) as u8, 16);
+        #[cfg(target_arch="m68k")]
+        assert_eq!(intrinsics::size_of_val(a) as u8, 8);
         assert_eq!(intrinsics::size_of_val(&0u32) as u8, 4);
 
         assert_eq!(intrinsics::min_align_of::<u16>() as u8, 2);

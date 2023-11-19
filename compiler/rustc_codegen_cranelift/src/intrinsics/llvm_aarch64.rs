@@ -1,14 +1,14 @@
 //! Emulate AArch64 LLVM intrinsics
 
+use rustc_middle::ty::GenericArgsRef;
+
 use crate::intrinsics::*;
 use crate::prelude::*;
-
-use rustc_middle::ty::subst::SubstsRef;
 
 pub(crate) fn codegen_aarch64_llvm_intrinsic_call<'tcx>(
     fx: &mut FunctionCx<'_, '_, 'tcx>,
     intrinsic: &str,
-    _substs: SubstsRef<'tcx>,
+    _args: GenericArgsRef<'tcx>,
     args: &[mir::Operand<'tcx>],
     ret: CPlace<'tcx>,
     target: Option<BasicBlock>,
@@ -44,7 +44,9 @@ pub(crate) fn codegen_aarch64_llvm_intrinsic_call<'tcx>(
             });
         }
 
-        _ if intrinsic.starts_with("llvm.aarch64.neon.sqadd.v") => {
+        _ if intrinsic.starts_with("llvm.aarch64.neon.sqadd.v")
+            || intrinsic.starts_with("llvm.aarch64.neon.uqadd.v") =>
+        {
             intrinsic_args!(fx, args => (x, y); intrinsic);
 
             simd_pair_for_each_lane_typed(fx, x, y, ret, &|fx, x_lane, y_lane| {
@@ -52,7 +54,9 @@ pub(crate) fn codegen_aarch64_llvm_intrinsic_call<'tcx>(
             });
         }
 
-        _ if intrinsic.starts_with("llvm.aarch64.neon.sqsub.v") => {
+        _ if intrinsic.starts_with("llvm.aarch64.neon.sqsub.v")
+            || intrinsic.starts_with("llvm.aarch64.neon.uqsub.v") =>
+        {
             intrinsic_args!(fx, args => (x, y); intrinsic);
 
             simd_pair_for_each_lane_typed(fx, x, y, ret, &|fx, x_lane, y_lane| {
@@ -154,6 +158,106 @@ pub(crate) fn codegen_aarch64_llvm_intrinsic_call<'tcx>(
                 let gt = fx.bcx.ins().icmp(IntCC::UnsignedLessThan, a, b);
                 fx.bcx.ins().select(gt, a, b)
             });
+        }
+
+        _ if intrinsic.starts_with("llvm.aarch64.neon.umaxp.v") => {
+            intrinsic_args!(fx, args => (x, y); intrinsic);
+
+            simd_horizontal_pair_for_each_lane(
+                fx,
+                x,
+                y,
+                ret,
+                &|fx, _lane_ty, _res_lane_ty, x_lane, y_lane| fx.bcx.ins().umax(x_lane, y_lane),
+            );
+        }
+
+        _ if intrinsic.starts_with("llvm.aarch64.neon.smaxp.v") => {
+            intrinsic_args!(fx, args => (x, y); intrinsic);
+
+            simd_horizontal_pair_for_each_lane(
+                fx,
+                x,
+                y,
+                ret,
+                &|fx, _lane_ty, _res_lane_ty, x_lane, y_lane| fx.bcx.ins().smax(x_lane, y_lane),
+            );
+        }
+
+        _ if intrinsic.starts_with("llvm.aarch64.neon.uminp.v") => {
+            intrinsic_args!(fx, args => (x, y); intrinsic);
+
+            simd_horizontal_pair_for_each_lane(
+                fx,
+                x,
+                y,
+                ret,
+                &|fx, _lane_ty, _res_lane_ty, x_lane, y_lane| fx.bcx.ins().umin(x_lane, y_lane),
+            );
+        }
+
+        _ if intrinsic.starts_with("llvm.aarch64.neon.sminp.v") => {
+            intrinsic_args!(fx, args => (x, y); intrinsic);
+
+            simd_horizontal_pair_for_each_lane(
+                fx,
+                x,
+                y,
+                ret,
+                &|fx, _lane_ty, _res_lane_ty, x_lane, y_lane| fx.bcx.ins().smin(x_lane, y_lane),
+            );
+        }
+
+        _ if intrinsic.starts_with("llvm.aarch64.neon.fminp.v") => {
+            intrinsic_args!(fx, args => (x, y); intrinsic);
+
+            simd_horizontal_pair_for_each_lane(
+                fx,
+                x,
+                y,
+                ret,
+                &|fx, _lane_ty, _res_lane_ty, x_lane, y_lane| fx.bcx.ins().fmin(x_lane, y_lane),
+            );
+        }
+
+        _ if intrinsic.starts_with("llvm.aarch64.neon.fmaxp.v") => {
+            intrinsic_args!(fx, args => (x, y); intrinsic);
+
+            simd_horizontal_pair_for_each_lane(
+                fx,
+                x,
+                y,
+                ret,
+                &|fx, _lane_ty, _res_lane_ty, x_lane, y_lane| fx.bcx.ins().fmax(x_lane, y_lane),
+            );
+        }
+
+        _ if intrinsic.starts_with("llvm.aarch64.neon.addp.v") => {
+            intrinsic_args!(fx, args => (x, y); intrinsic);
+
+            simd_horizontal_pair_for_each_lane(
+                fx,
+                x,
+                y,
+                ret,
+                &|fx, _lane_ty, _res_lane_ty, x_lane, y_lane| fx.bcx.ins().iadd(x_lane, y_lane),
+            );
+        }
+
+        // FIXME generalize vector types
+        "llvm.aarch64.neon.tbl1.v16i8" => {
+            intrinsic_args!(fx, args => (t, idx); intrinsic);
+
+            let zero = fx.bcx.ins().iconst(types::I8, 0);
+            for i in 0..16 {
+                let idx_lane = idx.value_lane(fx, i).load_scalar(fx);
+                let is_zero =
+                    fx.bcx.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, idx_lane, 16);
+                let t_idx = fx.bcx.ins().uextend(fx.pointer_type, idx_lane);
+                let t_lane = t.value_lane_dyn(fx, t_idx).load_scalar(fx);
+                let res = fx.bcx.ins().select(is_zero, zero, t_lane);
+                ret.place_lane(fx, i).to_ptr().store(fx, res, MemFlags::trusted());
+            }
         }
 
         /*

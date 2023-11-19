@@ -20,9 +20,10 @@ use rustc_hir::lang_items::{extract, GenericRequirement};
 use rustc_hir::{LangItem, LanguageItems, Target};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::cstore::ExternCrate;
-use rustc_span::{symbol::kw::Empty, Span};
+use rustc_span::symbol::kw::Empty;
+use rustc_span::{sym, Span};
 
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 
 pub(crate) enum Duplicate {
     Plain,
@@ -148,7 +149,7 @@ impl<'tcx> LanguageItemCollector<'tcx> {
         // Now check whether the lang_item has the expected number of generic
         // arguments. Generally speaking, binary and indexing operations have
         // one (for the RHS/index), unary operations have none, the closure
-        // traits have one for the argument list, generators have one for the
+        // traits have one for the argument list, coroutines have one for the
         // resume argument, and ordering/equality relations have one for the RHS
         // Some other types like Box and various functions like drop_in_place
         // have minimum requirements.
@@ -157,7 +158,14 @@ impl<'tcx> LanguageItemCollector<'tcx> {
             self.tcx.hir().get_by_def_id(item_def_id)
         {
             let (actual_num, generics_span) = match kind.generics() {
-                Some(generics) => (generics.params.len(), generics.span),
+                Some(generics) => (
+                    generics
+                        .params
+                        .iter()
+                        .filter(|p| !self.tcx.has_attr(p.def_id, sym::rustc_host))
+                        .count(),
+                    generics.span,
+                ),
                 None => (0, *item_span),
             };
 

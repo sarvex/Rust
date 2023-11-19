@@ -8,19 +8,21 @@ use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::traits::{ImplSource, Obligation, ObligationCause};
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
-use rustc_middle::ty::subst::{GenericArgKind, InternalSubsts};
-use rustc_middle::ty::{self, adjustment::PointerCast, Instance, InstanceDef, Ty, TyCtxt};
-use rustc_middle::ty::{Binder, TraitRef, TypeVisitableExt};
+use rustc_middle::traits::BuiltinImplSource;
+use rustc_middle::ty::GenericArgs;
+use rustc_middle::ty::{self, adjustment::PointerCoercion, Instance, InstanceDef, Ty, TyCtxt};
+use rustc_middle::ty::{TraitRef, TypeVisitableExt};
 use rustc_mir_dataflow::{self, Analysis};
 use rustc_span::{sym, Span, Symbol};
 use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt as _;
 use rustc_trait_selection::traits::{self, ObligationCauseCode, ObligationCtxt, SelectionContext};
+use rustc_type_ir::visit::{TypeSuperVisitable, TypeVisitor};
 
 use std::mem;
-use std::ops::Deref;
+use std::ops::{ControlFlow, Deref};
 
 use super::ops::{self, NonConstOp, Status};
-use super::qualifs::{self, CustomEq, HasMutInterior, NeedsDrop, NeedsNonConstDrop};
+use super::qualifs::{self, CustomEq, HasMutInterior, NeedsDrop};
 use super::resolver::FlowSensitiveAnalysis;
 use super::{ConstCx, Qualif};
 use crate::const_eval::is_unstable_const_fn;
@@ -33,7 +35,7 @@ type QualifResults<'mir, 'tcx, Q> =
 pub struct Qualifs<'mir, 'tcx> {
     has_mut_interior: Option<QualifResults<'mir, 'tcx, HasMutInterior>>,
     needs_drop: Option<QualifResults<'mir, 'tcx, NeedsDrop>>,
-    needs_non_const_drop: Option<QualifResults<'mir, 'tcx, NeedsNonConstDrop>>,
+    // needs_non_const_drop: Option<QualifResults<'mir, 'tcx, NeedsNonConstDrop>>,
 }
 
 impl<'mir, 'tcx> Qualifs<'mir, 'tcx> {
@@ -76,15 +78,17 @@ impl<'mir, 'tcx> Qualifs<'mir, 'tcx> {
         local: Local,
         location: Location,
     ) -> bool {
+        // FIXME(effects) replace with `NeedsNonconstDrop` after const traits work again
+        /*
         let ty = ccx.body.local_decls[local].ty;
-        if !NeedsNonConstDrop::in_any_value_of_ty(ccx, ty) {
+        if !NeedsDrop::in_any_value_of_ty(ccx, ty) {
             return false;
         }
 
         let needs_non_const_drop = self.needs_non_const_drop.get_or_insert_with(|| {
             let ConstCx { tcx, body, .. } = *ccx;
 
-            FlowSensitiveAnalysis::new(NeedsNonConstDrop, ccx)
+            FlowSensitiveAnalysis::new(NeedsDrop, ccx)
                 .into_engine(tcx, &body)
                 .iterate_to_fixpoint()
                 .into_results_cursor(&body)
@@ -92,6 +96,9 @@ impl<'mir, 'tcx> Qualifs<'mir, 'tcx> {
 
         needs_non_const_drop.seek_before_primary_effect(location);
         needs_non_const_drop.get().contains(local)
+        */
+
+        self.needs_drop(ccx, local, location)
     }
 
     /// Returns `true` if `local` is `HasMutInterior` at the given `Location`.
@@ -161,7 +168,7 @@ impl<'mir, 'tcx> Qualifs<'mir, 'tcx> {
                 false
             }
 
-            hir::ConstContext::Const | hir::ConstContext::Static(_) => {
+            hir::ConstContext::Const { .. } | hir::ConstContext::Static(_) => {
                 let mut cursor = FlowSensitiveAnalysis::new(CustomEq, ccx)
                     .into_engine(ccx.tcx, &ccx.body)
                     .iterate_to_fixpoint()
@@ -178,6 +185,24 @@ impl<'mir, 'tcx> Qualifs<'mir, 'tcx> {
             has_mut_interior: self.has_mut_interior(ccx, RETURN_PLACE, return_loc),
             custom_eq,
             tainted_by_errors,
+        }
+    }
+}
+
+struct LocalReturnTyVisitor<'ck, 'mir, 'tcx> {
+    kind: LocalKind,
+    checker: &'ck mut Checker<'mir, 'tcx>,
+}
+
+impl<'ck, 'mir, 'tcx> TypeVisitor<TyCtxt<'tcx>> for LocalReturnTyVisitor<'ck, 'mir, 'tcx> {
+    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
+        match t.kind() {
+            ty::FnPtr(_) => ControlFlow::Continue(()),
+            ty::Ref(_, _, hir::Mutability::Mut) => {
+                self.checker.check_op(ops::ty::MutRef(self.kind));
+                t.super_visit_with(self)
+            }
+            _ => t.super_visit_with(self),
         }
     }
 }
@@ -222,7 +247,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
 
         // `async` functions cannot be `const fn`. This is checked during AST lowering, so there's
         // no need to emit duplicate errors here.
-        if self.ccx.is_async() || body.generator.is_some() {
+        if self.ccx.is_async() || body.coroutine.is_some() {
             tcx.sess.delay_span_bug(body.span, "`async` functions cannot be `const fn`");
             return;
         }
@@ -231,7 +256,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
         if self.const_kind() == hir::ConstContext::ConstFn {
             for (idx, local) in body.local_decls.iter_enumerated() {
                 // Handle the return place below.
-                if idx == RETURN_PLACE || local.internal {
+                if idx == RETURN_PLACE {
                     continue;
                 }
 
@@ -298,7 +323,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
         let gate = match op.status_in_item(self.ccx) {
             Status::Allowed => return,
 
-            Status::Unstable(gate) if self.tcx.features().enabled(gate) => {
+            Status::Unstable(gate) if self.tcx.features().active(gate) => {
                 let unstable_in_stable = self.ccx.is_const_stable_const_fn()
                     && !super::rustc_allow_const_fn_unstable(self.tcx, self.def_id(), gate);
                 if unstable_in_stable {
@@ -340,20 +365,9 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
     fn check_local_or_return_ty(&mut self, ty: Ty<'tcx>, local: Local) {
         let kind = self.body.local_kind(local);
 
-        for ty in ty.walk() {
-            let ty = match ty.unpack() {
-                GenericArgKind::Type(ty) => ty,
+        let mut visitor = LocalReturnTyVisitor { kind, checker: self };
 
-                // No constraints on lifetimes or constants, except potentially
-                // constants' types, but `walk` will get to them as well.
-                GenericArgKind::Lifetime(_) | GenericArgKind::Const(_) => continue,
-            };
-
-            match *ty.kind() {
-                ty::Ref(_, _, hir::Mutability::Mut) => self.check_op(ops::ty::MutRef(kind)),
-                _ => {}
-            }
-        }
+        visitor.visit_ty(ty);
     }
 
     fn check_mut_borrow(&mut self, local: Local, kind: hir::BorrowKind) {
@@ -409,11 +423,8 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                         BorrowKind::Shared => {
                             PlaceContext::NonMutatingUse(NonMutatingUseContext::SharedBorrow)
                         }
-                        BorrowKind::Shallow => {
-                            PlaceContext::NonMutatingUse(NonMutatingUseContext::ShallowBorrow)
-                        }
-                        BorrowKind::Unique => {
-                            PlaceContext::NonMutatingUse(NonMutatingUseContext::UniqueBorrow)
+                        BorrowKind::Fake => {
+                            PlaceContext::NonMutatingUse(NonMutatingUseContext::FakeBorrow)
                         }
                         BorrowKind::Mut { .. } => {
                             PlaceContext::MutatingUse(MutatingUseContext::Borrow)
@@ -452,14 +463,15 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             | Rvalue::Len(_) => {}
 
             Rvalue::Aggregate(kind, ..) => {
-                if let AggregateKind::Generator(def_id, ..) = kind.as_ref()
-                    && let Some(generator_kind @ hir::GeneratorKind::Async(..)) = self.tcx.generator_kind(def_id)
+                if let AggregateKind::Coroutine(def_id, ..) = kind.as_ref()
+                    && let Some(coroutine_kind @ hir::CoroutineKind::Async(..)) =
+                        self.tcx.coroutine_kind(def_id)
                 {
-                    self.check_op(ops::Generator(generator_kind));
+                    self.check_op(ops::Coroutine(coroutine_kind));
                 }
             }
 
-            Rvalue::Ref(_, kind @ (BorrowKind::Mut { .. } | BorrowKind::Unique), place) => {
+            Rvalue::Ref(_, BorrowKind::Mut { .. }, place) => {
                 let ty = place.ty(self.body, self.tcx).ty;
                 let is_allowed = match ty.kind() {
                     // Inside a `static mut`, `&mut [...]` is allowed.
@@ -480,11 +492,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 };
 
                 if !is_allowed {
-                    if let BorrowKind::Mut { .. } = kind {
-                        self.check_mut_borrow(place.local, hir::BorrowKind::Ref)
-                    } else {
-                        self.check_op(ops::CellBorrow);
-                    }
+                    self.check_mut_borrow(place.local, hir::BorrowKind::Ref)
                 }
             }
 
@@ -492,7 +500,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 self.check_mut_borrow(place.local, hir::BorrowKind::Raw)
             }
 
-            Rvalue::Ref(_, BorrowKind::Shared | BorrowKind::Shallow, place)
+            Rvalue::Ref(_, BorrowKind::Shared | BorrowKind::Fake, place)
             | Rvalue::AddressOf(Mutability::Not, place) => {
                 let borrowed_place_has_mut_interior = qualifs::in_place::<HasMutInterior, _>(
                     &self.ccx,
@@ -528,12 +536,12 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             }
 
             Rvalue::Cast(
-                CastKind::Pointer(
-                    PointerCast::MutToConstPointer
-                    | PointerCast::ArrayToPointer
-                    | PointerCast::UnsafeFnPointer
-                    | PointerCast::ClosureFnPointer(_)
-                    | PointerCast::ReifyFnPointer,
+                CastKind::PointerCoercion(
+                    PointerCoercion::MutToConstPointer
+                    | PointerCoercion::ArrayToPointer
+                    | PointerCoercion::UnsafeFnPointer
+                    | PointerCoercion::ClosureFnPointer(_)
+                    | PointerCoercion::ReifyFnPointer,
                 ),
                 _,
                 _,
@@ -541,7 +549,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 // These are all okay; they only change the type, not the data.
             }
 
-            Rvalue::Cast(CastKind::Pointer(PointerCast::Unsize), _, _) => {
+            Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::Unsize), _, _) => {
                 // Unsizing is implemented for CTFE.
             }
 
@@ -572,8 +580,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 }
             }
 
-            Rvalue::BinaryOp(op, box (lhs, rhs))
-            | Rvalue::CheckedBinaryOp(op, box (lhs, rhs)) => {
+            Rvalue::BinaryOp(op, box (lhs, rhs)) | Rvalue::CheckedBinaryOp(op, box (lhs, rhs)) => {
                 let lhs_ty = lhs.ty(self.body, self.tcx);
                 let rhs_ty = rhs.ty(self.body, self.tcx);
 
@@ -581,18 +588,16 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     // Int, bool, and char operations are fine.
                 } else if lhs_ty.is_fn_ptr() || lhs_ty.is_unsafe_ptr() {
                     assert_eq!(lhs_ty, rhs_ty);
-                    assert!(
-                        matches!(
-                            op,
-                            BinOp::Eq
+                    assert!(matches!(
+                        op,
+                        BinOp::Eq
                             | BinOp::Ne
                             | BinOp::Le
                             | BinOp::Lt
                             | BinOp::Ge
                             | BinOp::Gt
                             | BinOp::Offset
-                        )
-                    );
+                    ));
 
                     self.check_op(ops::RawPtrComparison);
                 } else if lhs_ty.is_floating_point() || rhs_ty.is_floating_point() {
@@ -619,30 +624,28 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
     }
     fn visit_projection_elem(
         &mut self,
-        place_local: Local,
-        proj_base: &[PlaceElem<'tcx>],
+        place_ref: PlaceRef<'tcx>,
         elem: PlaceElem<'tcx>,
         context: PlaceContext,
         location: Location,
     ) {
         trace!(
-            "visit_projection_elem: place_local={:?} proj_base={:?} elem={:?} \
+            "visit_projection_elem: place_ref={:?} elem={:?} \
             context={:?} location={:?}",
-            place_local,
-            proj_base,
+            place_ref,
             elem,
             context,
             location,
         );
 
-        self.super_projection_elem(place_local, proj_base, elem, context, location);
+        self.super_projection_elem(place_ref, elem, context, location);
 
         match elem {
             ProjectionElem::Deref => {
-                let base_ty = Place::ty_from(place_local, proj_base, self.body, self.tcx).ty;
+                let base_ty = place_ref.ty(self.body, self.tcx).ty;
                 if base_ty.is_unsafe_ptr() {
-                    if proj_base.is_empty() {
-                        let decl = &self.body.local_decls[place_local];
+                    if place_ref.projection.is_empty() {
+                        let decl = &self.body.local_decls[place_ref.local];
                         if let LocalInfo::StaticRef { def_id, .. } = *decl.local_info() {
                             let span = decl.source_info.span;
                             self.check_static(def_id, span);
@@ -667,6 +670,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             | ProjectionElem::Downcast(..)
             | ProjectionElem::OpaqueCast(..)
             | ProjectionElem::Subslice { .. }
+            | ProjectionElem::Subtype(..)
             | ProjectionElem::Field(..)
             | ProjectionElem::Index(_) => {}
         }
@@ -704,14 +708,14 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
         self.super_terminator(terminator, location);
 
         match &terminator.kind {
-            TerminatorKind::Call { func, args, fn_span, from_hir_call, .. } => {
+            TerminatorKind::Call { func, args, fn_span, call_source, .. } => {
                 let ConstCx { tcx, body, param_env, .. } = *self.ccx;
                 let caller = self.def_id();
 
                 let fn_ty = func.ty(body, tcx);
 
-                let (mut callee, mut substs) = match *fn_ty.kind() {
-                    ty::FnDef(def_id, substs) => (def_id, substs),
+                let (mut callee, mut fn_args) = match *fn_ty.kind() {
+                    ty::FnDef(def_id, fn_args) => (def_id, fn_args),
 
                     ty::FnPtr(_) => {
                         self.check_op(ops::FnCallIndirect);
@@ -730,7 +734,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 let infcx = tcx.infer_ctxt().build();
                 let ocx = ObligationCtxt::new(&infcx);
 
-                let predicates = tcx.predicates_of(callee).instantiate(tcx, substs);
+                let predicates = tcx.predicates_of(callee).instantiate(tcx, fn_args);
                 let cause = ObligationCause::new(
                     terminator.source_info.span,
                     self.body.source.def_id().expect_local(),
@@ -745,29 +749,28 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
                 let errors = ocx.select_all_or_error();
                 if !errors.is_empty() {
-                    infcx.err_ctxt().report_fulfillment_errors(&errors);
+                    infcx.err_ctxt().report_fulfillment_errors(errors);
                 }
 
                 // Attempting to call a trait method?
+                // FIXME(effects) do we need this?
                 if let Some(trait_id) = tcx.trait_of_item(callee) {
                     trace!("attempting to call a trait method");
                     if !self.tcx.features().const_trait_impl {
                         self.check_op(ops::FnCallNonConst {
                             caller,
                             callee,
-                            substs,
+                            args: fn_args,
                             span: *fn_span,
-                            from_hir_call: *from_hir_call,
+                            call_source: *call_source,
                             feature: Some(sym::const_trait_impl),
                         });
                         return;
                     }
 
-                    let trait_ref = TraitRef::from_method(tcx, trait_id, substs);
-                    let poly_trait_pred =
-                        Binder::dummy(trait_ref).with_constness(ty::BoundConstness::ConstIfConst);
+                    let trait_ref = TraitRef::from_method(tcx, trait_id, fn_args);
                     let obligation =
-                        Obligation::new(tcx, ObligationCause::dummy(), param_env, poly_trait_pred);
+                        Obligation::new(tcx, ObligationCause::dummy(), param_env, trait_ref);
 
                     let implsrc = {
                         let infcx = tcx.infer_ctxt().build();
@@ -776,21 +779,29 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     };
 
                     match implsrc {
-                        Ok(Some(ImplSource::Param(_, ty::BoundConstness::ConstIfConst))) => {
+                        Ok(Some(ImplSource::Param(_))) if tcx.features().effects => {
                             debug!(
                                 "const_trait_impl: provided {:?} via where-clause in {:?}",
                                 trait_ref, param_env
                             );
                             return;
                         }
-                        Ok(Some(ImplSource::Closure(data))) => {
-                            if !tcx.is_const_fn_raw(data.closure_def_id) {
+                        // Closure: Fn{Once|Mut}
+                        Ok(Some(ImplSource::Builtin(BuiltinImplSource::Misc, _)))
+                            if trait_ref.self_ty().is_closure()
+                                && tcx.fn_trait_kind_from_def_id(trait_id).is_some() =>
+                        {
+                            let ty::Closure(closure_def_id, fn_args) = *trait_ref.self_ty().kind()
+                            else {
+                                unreachable!()
+                            };
+                            if !tcx.is_const_fn_raw(closure_def_id) {
                                 self.check_op(ops::FnCallNonConst {
                                     caller,
                                     callee,
-                                    substs,
+                                    args: fn_args,
                                     span: *fn_span,
-                                    from_hir_call: *from_hir_call,
+                                    call_source: *call_source,
                                     feature: None,
                                 });
 
@@ -799,27 +810,28 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                         }
                         Ok(Some(ImplSource::UserDefined(data))) => {
                             let callee_name = tcx.item_name(callee);
-                            if let Some(&did) = tcx
-                                .associated_item_def_ids(data.impl_def_id)
-                                .iter()
-                                .find(|did| tcx.item_name(**did) == callee_name)
-                            {
-                                // using internal substs is ok here, since this is only
-                                // used for the `resolve` call below
-                                substs = InternalSubsts::identity_for_item(tcx, did);
-                                callee = did;
-                            }
 
                             if let hir::Constness::NotConst = tcx.constness(data.impl_def_id) {
                                 self.check_op(ops::FnCallNonConst {
                                     caller,
                                     callee,
-                                    substs,
+                                    args: fn_args,
                                     span: *fn_span,
-                                    from_hir_call: *from_hir_call,
+                                    call_source: *call_source,
                                     feature: None,
                                 });
                                 return;
+                            }
+
+                            if let Some(&did) = tcx
+                                .associated_item_def_ids(data.impl_def_id)
+                                .iter()
+                                .find(|did| tcx.item_name(**did) == callee_name)
+                            {
+                                // using internal args is ok here, since this is only
+                                // used for the `resolve` call below
+                                fn_args = GenericArgs::identity_for_item(tcx, did);
+                                callee = did;
                             }
                         }
                         _ if !tcx.is_const_fn_raw(callee) => {
@@ -830,7 +842,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                                 && tcx.has_attr(callee_trait, sym::const_trait)
                                 && Some(callee_trait) == tcx.trait_of_item(caller.to_def_id())
                                 // Can only call methods when it's `<Self as TheTrait>::f`.
-                                && tcx.types.self_param == substs.type_at(0)
+                                && tcx.types.self_param == fn_args.type_at(0)
                             {
                                 nonconst_call_permission = true;
                             }
@@ -840,7 +852,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                                     tcx,
                                     ObligationCause::dummy_with_span(*fn_span),
                                     param_env,
-                                    poly_trait_pred,
+                                    trait_ref,
                                 );
 
                                 // improve diagnostics by showing what failed. Our requirements are stricter this time
@@ -857,9 +869,9 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                                 self.check_op(ops::FnCallNonConst {
                                     caller,
                                     callee,
-                                    substs,
+                                    args: fn_args,
                                     span: *fn_span,
-                                    from_hir_call: *from_hir_call,
+                                    call_source: *call_source,
                                     feature: None,
                                 });
                                 return;
@@ -870,7 +882,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
                     // Resolve a trait method call to its concrete implementation, which may be in a
                     // `const` trait impl.
-                    let instance = Instance::resolve(tcx, param_env, callee, substs);
+                    let instance = Instance::resolve(tcx, param_env, callee, fn_args);
                     debug!("Resolving ({:?}) -> {:?}", callee, instance);
                     if let Ok(Some(func)) = instance {
                         if let InstanceDef::Item(def) = func.def {
@@ -881,7 +893,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
                 // At this point, we are calling a function, `callee`, whose `DefId` is known...
 
-                // `begin_panic` and `panic_display` are generic functions that accept
+                // `begin_panic` and `#[rustc_const_panic_str]` functions accept generic
                 // types other than str. Check to enforce that only str can be used in
                 // const-eval.
 
@@ -893,8 +905,8 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     }
                 }
 
-                // const-eval of the `panic_display` fn assumes the argument is `&&str`
-                if Some(callee) == tcx.lang_items().panic_display() {
+                // const-eval of `#[rustc_const_panic_str]` functions assumes the argument is `&&str`
+                if tcx.has_attr(callee, sym::rustc_const_panic_str) {
                     match args[0].ty(&self.ccx.body.local_decls, tcx).kind() {
                         ty::Ref(_, ty, _) if matches!(ty.kind(), ty::Ref(_, ty, _) if ty.is_str()) =>
                         {
@@ -917,9 +929,9 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                         self.check_op(ops::FnCallNonConst {
                             caller,
                             callee,
-                            substs,
+                            args: fn_args,
                             span: *fn_span,
-                            from_hir_call: *from_hir_call,
+                            call_source: *call_source,
                             feature: None,
                         });
                         return;
@@ -933,7 +945,9 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     if self.span.allows_unstable(gate) {
                         return;
                     }
-                    if let Some(implied_by_gate) = implied_by && self.span.allows_unstable(implied_by_gate) {
+                    if let Some(implied_by_gate) = implied_by
+                        && self.span.allows_unstable(implied_by_gate)
+                    {
                         return;
                     }
 
@@ -944,7 +958,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                         tcx.features().declared_lib_features.iter().any(|&(sym, _)| sym == gate)
                     };
                     let feature_gate_declared = gate_declared(gate);
-                    let implied_gate_declared = implied_by.map(gate_declared).unwrap_or(false);
+                    let implied_gate_declared = implied_by.is_some_and(gate_declared);
                     if !feature_gate_declared && !implied_gate_declared {
                         self.check_op(ops::FnCallUnstable(callee, Some(gate)));
                         return;
@@ -971,7 +985,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 // have no `rustc_const_stable` attributes to be const-unstable as well. This
                 // should be fixed later.
                 let callee_is_unstable_unmarked = tcx.lookup_const_stability(callee).is_none()
-                    && tcx.lookup_stability(callee).map_or(false, |s| s.is_unstable());
+                    && tcx.lookup_stability(callee).is_some_and(|s| s.is_unstable());
                 if callee_is_unstable_unmarked {
                     trace!("callee_is_unstable_unmarked");
                     // We do not use `const` modifiers for intrinsic "functions", as intrinsics are
@@ -997,8 +1011,9 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 let mut err_span = self.span;
                 let ty_of_dropped_place = dropped_place.ty(self.body, self.tcx).ty;
 
+                // FIXME(effects) replace with `NeedsNonConstDrop` once we fix const traits
                 let ty_needs_non_const_drop =
-                    qualifs::NeedsNonConstDrop::in_any_value_of_ty(self.ccx, ty_of_dropped_place);
+                    qualifs::NeedsDrop::in_any_value_of_ty(self.ccx, ty_of_dropped_place);
 
                 debug!(?ty_of_dropped_place, ?ty_needs_non_const_drop);
 
@@ -1027,11 +1042,11 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
             TerminatorKind::InlineAsm { .. } => self.check_op(ops::InlineAsm),
 
-            TerminatorKind::GeneratorDrop | TerminatorKind::Yield { .. } => {
-                self.check_op(ops::Generator(hir::GeneratorKind::Gen))
+            TerminatorKind::CoroutineDrop | TerminatorKind::Yield { .. } => {
+                self.check_op(ops::Coroutine(hir::CoroutineKind::Coroutine))
             }
 
-            TerminatorKind::Terminate => {
+            TerminatorKind::UnwindTerminate(_) => {
                 // Cleanup blocks are skipped for const checking (see `visit_basic_block_data`).
                 span_bug!(self.span, "`Terminate` terminator outside of cleanup block")
             }
@@ -1040,7 +1055,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. }
             | TerminatorKind::Goto { .. }
-            | TerminatorKind::Resume
+            | TerminatorKind::UnwindResume
             | TerminatorKind::Return
             | TerminatorKind::SwitchInt { .. }
             | TerminatorKind::Unreachable => {}

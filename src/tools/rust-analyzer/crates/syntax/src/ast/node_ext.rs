@@ -61,6 +61,14 @@ impl ast::BlockExpr {
     pub fn tail_expr(&self) -> Option<ast::Expr> {
         self.stmt_list()?.tail_expr()
     }
+    /// Block expressions accept outer and inner attributes, but only when they are the outer
+    /// expression of an expression statement or the final expression of another block expression.
+    pub fn may_carry_attributes(&self) -> bool {
+        matches!(
+            self.syntax().parent().map(|it| it.kind()),
+            Some(SyntaxKind::BLOCK_EXPR | SyntaxKind::EXPR_STMT)
+        )
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -350,6 +358,15 @@ impl ast::Impl {
         } else {
             None
         }
+    }
+}
+
+// [#15778](https://github.com/rust-lang/rust-analyzer/issues/15778)
+impl ast::PathSegment {
+    pub fn qualifying_trait(&self) -> Option<ast::PathType> {
+        let mut path_types = support::children(self.syntax());
+        let first = path_types.next()?;
+        path_types.next().or(Some(first))
     }
 }
 

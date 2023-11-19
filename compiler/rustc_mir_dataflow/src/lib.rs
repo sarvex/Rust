@@ -23,17 +23,18 @@ use rustc_span::symbol::{sym, Symbol};
 
 pub use self::drop_flag_effects::{
     drop_flag_effects_for_function_entry, drop_flag_effects_for_location,
-    move_path_children_matching, on_all_children_bits, on_all_drop_children_bits,
-    on_lookup_result_bits,
+    move_path_children_matching, on_all_children_bits, on_lookup_result_bits,
 };
 pub use self::framework::{
-    fmt, graphviz, lattice, visit_results, Analysis, AnalysisDomain, Backward, CallReturnPlaces,
-    Direction, Engine, Forward, GenKill, GenKillAnalysis, JoinSemiLattice, Results, ResultsCursor,
-    ResultsRefCursor, ResultsVisitable, ResultsVisitor, SwitchIntEdgeEffects,
+    fmt, graphviz, lattice, visit_results, Analysis, AnalysisDomain, AnalysisResults, Backward,
+    CloneAnalysis, Direction, Engine, Forward, GenKill, GenKillAnalysis, JoinSemiLattice,
+    MaybeReachable, Results, ResultsCloned, ResultsClonedCursor, ResultsCursor, ResultsRefCursor,
+    ResultsVisitable, ResultsVisitor, SwitchIntEdgeEffects,
 };
 
 use self::move_paths::MoveData;
 
+pub mod debuginfo;
 pub mod drop_flag_effects;
 pub mod elaborate_drops;
 mod errors;

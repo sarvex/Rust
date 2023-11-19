@@ -26,6 +26,13 @@ pub(crate) struct UnknownCTargetFeature<'a> {
     pub rust_feature: PossibleFeature<'a>,
 }
 
+#[derive(Diagnostic)]
+#[diag(codegen_llvm_unstable_ctarget_feature)]
+#[note]
+pub(crate) struct UnstableCTargetFeature<'a> {
+    pub feature: &'a str,
+}
+
 #[derive(Subdiagnostic)]
 pub(crate) enum PossibleFeature<'a> {
     #[help(codegen_llvm_possible_feature)]
@@ -50,9 +57,15 @@ pub(crate) struct SymbolAlreadyDefined<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_invalid_minimum_alignment)]
-pub(crate) struct InvalidMinimumAlignment {
-    pub err: String,
+#[diag(codegen_llvm_invalid_minimum_alignment_not_power_of_two)]
+pub(crate) struct InvalidMinimumAlignmentNotPowerOfTwo {
+    pub align: u64,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_llvm_invalid_minimum_alignment_too_large)]
+pub(crate) struct InvalidMinimumAlignmentTooLarge {
+    pub align: u64,
 }
 
 #[derive(Diagnostic)]
@@ -75,6 +88,8 @@ pub(crate) struct ErrorCallingDllTool<'a> {
 #[derive(Diagnostic)]
 #[diag(codegen_llvm_dlltool_fail_import_library)]
 pub(crate) struct DlltoolFailImportLibrary<'a> {
+    pub dlltool_path: Cow<'a, str>,
+    pub dlltool_args: String,
     pub stdout: Cow<'a, str>,
     pub stderr: Cow<'a, str>,
 }
@@ -129,6 +144,10 @@ pub(crate) struct LtoDisallowed;
 #[derive(Diagnostic)]
 #[diag(codegen_llvm_lto_dylib)]
 pub(crate) struct LtoDylib;
+
+#[derive(Diagnostic)]
+#[diag(codegen_llvm_lto_proc_macro)]
+pub(crate) struct LtoProcMacro;
 
 #[derive(Diagnostic)]
 #[diag(codegen_llvm_lto_bitcode_from_rlib)]
@@ -217,4 +236,10 @@ pub(crate) struct WriteBytecode<'a> {
 #[diag(codegen_llvm_copy_bitcode)]
 pub(crate) struct CopyBitcode {
     pub err: std::io::Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_llvm_unknown_debuginfo_compression)]
+pub struct UnknownCompression {
+    pub algorithm: &'static str,
 }

@@ -2,7 +2,8 @@
 #![feature(rustc_attrs)]
 
 // @matches 'foo/index.html' '//h1' 'Crate foo'
-// @matches 'foo/index.html' '//h2[@class="location"]' 'Crate foo'
+// @matches 'foo/index.html' '//div[@class="sidebar-crate"]/h2/a' 'foo'
+// @count 'foo/index.html' '//h2[@class="location"]' 0
 
 // @matches 'foo/foo_mod/index.html' '//h1' 'Module foo::foo_mod'
 // @matches 'foo/foo_mod/index.html' '//h2[@class="location"]' 'Module foo_mod'
@@ -30,7 +31,7 @@ pub struct FooStruct;
 // @matches 'foo/enum.FooEnum.html' '//h2[@class="location"]' 'FooEnum'
 pub enum FooEnum {}
 
-// @matches 'foo/type.FooType.html' '//h1' 'Type Definition foo::FooType'
+// @matches 'foo/type.FooType.html' '//h1' 'Type Alias foo::FooType'
 // @matches 'foo/type.FooType.html' '//h2[@class="location"]' 'FooType'
 pub type FooType = FooStruct;
 

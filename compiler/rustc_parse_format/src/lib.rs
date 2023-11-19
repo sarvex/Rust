@@ -11,8 +11,8 @@
 )]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
-// We want to be able to build this crate with a stable compiler, so no
-// `#![feature]` attributes should be added.
+// WARNING: We want to be able to build this crate with a stable compiler,
+//          so no `#![feature]` attributes should be added!
 
 use rustc_lexer::unescape;
 pub use Alignment::*;
@@ -109,6 +109,8 @@ pub struct Argument<'a> {
 pub struct FormatSpec<'a> {
     /// Optionally specified character to fill alignment with.
     pub fill: Option<char>,
+    /// Span of the optionally specified fill character.
+    pub fill_span: Option<InnerSpan>,
     /// Optionally specified alignment.
     pub align: Alignment,
     /// The `+` or `-` flag.
@@ -208,7 +210,17 @@ pub struct ParseError {
     pub label: string::String,
     pub span: InnerSpan,
     pub secondary_label: Option<(string::String, InnerSpan)>,
-    pub should_be_replaced_with_positional_argument: bool,
+    pub suggestion: Suggestion,
+}
+
+pub enum Suggestion {
+    None,
+    /// Replace inline argument with positional argument:
+    /// `format!("{foo.bar}")` -> `format!("{}", foo.bar)`
+    UsePositional,
+    /// Remove `r#` from identifier:
+    /// `format!("{r#foo}")` -> `format!("{foo}")`
+    RemoveRawIdent(InnerSpan),
 }
 
 /// The parser structure for interpreting the input format string. This is
@@ -264,7 +276,7 @@ impl<'a> Iterator for Parser<'a> {
                         Some(String(self.string(pos + 1)))
                     } else {
                         let arg = self.argument(lbrace_end);
-                        if let Some(rbrace_pos) = self.must_consume('}') {
+                        if let Some(rbrace_pos) = self.consume_closing_brace(&arg) {
                             if self.is_source_literal {
                                 let lbrace_byte_pos = self.to_span_index(pos);
                                 let rbrace_byte_pos = self.to_span_index(rbrace_pos);
@@ -363,7 +375,7 @@ impl<'a> Parser<'a> {
             label: label.into(),
             span,
             secondary_label: None,
-            should_be_replaced_with_positional_argument: false,
+            suggestion: Suggestion::None,
         });
     }
 
@@ -387,7 +399,7 @@ impl<'a> Parser<'a> {
             label: label.into(),
             span,
             secondary_label: None,
-            should_be_replaced_with_positional_argument: false,
+            suggestion: Suggestion::None,
         });
     }
 
@@ -450,69 +462,51 @@ impl<'a> Parser<'a> {
 
     /// Forces consumption of the specified character. If the character is not
     /// found, an error is emitted.
-    fn must_consume(&mut self, c: char) -> Option<usize> {
+    fn consume_closing_brace(&mut self, arg: &Argument<'_>) -> Option<usize> {
         self.ws();
 
-        if let Some(&(pos, maybe)) = self.cur.peek() {
-            if c == maybe {
+        let pos;
+        let description;
+
+        if let Some(&(peek_pos, maybe)) = self.cur.peek() {
+            if maybe == '}' {
                 self.cur.next();
-                Some(pos)
-            } else {
-                let pos = self.to_span_index(pos);
-                let description = format!("expected `'}}'`, found `{maybe:?}`");
-                let label = "expected `}`".to_owned();
-                let (note, secondary_label) = if c == '}' {
-                    (
-                        Some(
-                            "if you intended to print `{`, you can escape it using `{{`".to_owned(),
-                        ),
-                        self.last_opening_brace
-                            .map(|sp| ("because of this opening brace".to_owned(), sp)),
-                    )
-                } else {
-                    (None, None)
-                };
-                self.errors.push(ParseError {
-                    description,
-                    note,
-                    label,
-                    span: pos.to(pos),
-                    secondary_label,
-                    should_be_replaced_with_positional_argument: false,
-                });
-                None
+                return Some(peek_pos);
             }
+
+            pos = peek_pos;
+            description = format!("expected `'}}'`, found `{maybe:?}`");
         } else {
-            let description = format!("expected `{c:?}` but string was terminated");
+            description = "expected `'}'` but string was terminated".to_owned();
             // point at closing `"`
-            let pos = self.input.len() - if self.append_newline { 1 } else { 0 };
-            let pos = self.to_span_index(pos);
-            if c == '}' {
-                let label = format!("expected `{c:?}`");
-                let (note, secondary_label) = if c == '}' {
-                    (
-                        Some(
-                            "if you intended to print `{`, you can escape it using `{{`".to_owned(),
-                        ),
-                        self.last_opening_brace
-                            .map(|sp| ("because of this opening brace".to_owned(), sp)),
-                    )
-                } else {
-                    (None, None)
-                };
-                self.errors.push(ParseError {
-                    description,
-                    note,
-                    label,
-                    span: pos.to(pos),
-                    secondary_label,
-                    should_be_replaced_with_positional_argument: false,
-                });
-            } else {
-                self.err(description, format!("expected `{c:?}`"), pos.to(pos));
-            }
-            None
+            pos = self.input.len() - if self.append_newline { 1 } else { 0 };
         }
+
+        let pos = self.to_span_index(pos);
+
+        let label = "expected `'}'`".to_owned();
+        let (note, secondary_label) = if arg.format.fill == Some('}') {
+            (
+                Some("the character `'}'` is interpreted as a fill character because of the `:` that precedes it".to_owned()),
+                arg.format.fill_span.map(|sp| ("this is not interpreted as a formatting closing brace".to_owned(), sp)),
+            )
+        } else {
+            (
+                Some("if you intended to print `{`, you can escape it using `{{`".to_owned()),
+                self.last_opening_brace.map(|sp| ("because of this opening brace".to_owned(), sp)),
+            )
+        };
+
+        self.errors.push(ParseError {
+            description,
+            note,
+            label,
+            span: pos.to(pos),
+            secondary_label,
+            suggestion: Suggestion::None,
+        });
+
+        None
     }
 
     /// Consumes all whitespace characters until the first non-whitespace character
@@ -589,7 +583,37 @@ impl<'a> Parser<'a> {
             Some(ArgumentIs(i))
         } else {
             match self.cur.peek() {
-                Some(&(_, c)) if rustc_lexer::is_id_start(c) => Some(ArgumentNamed(self.word())),
+                Some(&(lo, c)) if rustc_lexer::is_id_start(c) => {
+                    let word = self.word();
+
+                    // Recover from `r#ident` in format strings.
+                    // FIXME: use a let chain
+                    if word == "r" {
+                        if let Some((pos, '#')) = self.cur.peek() {
+                            if self.input[pos + 1..]
+                                .chars()
+                                .next()
+                                .is_some_and(rustc_lexer::is_id_start)
+                            {
+                                self.cur.next();
+                                let word = self.word();
+                                let prefix_span = self.span(lo, lo + 2);
+                                let full_span = self.span(lo, lo + 2 + word.len());
+                                self.errors.insert(0, ParseError {
+                                    description: "raw identifiers are not supported".to_owned(),
+                                    note: Some("identifiers in format strings can be keywords and don't need to be prefixed with `r#`".to_string()),
+                                    label: "raw identifier used here".to_owned(),
+                                    span: full_span,
+                                    secondary_label: None,
+                                    suggestion: Suggestion::RemoveRawIdent(prefix_span),
+                                });
+                                return Some(ArgumentNamed(word));
+                            }
+                        }
+                    }
+
+                    Some(ArgumentNamed(word))
+                }
 
                 // This is an `ArgumentNext`.
                 // Record the fact and do the resolution after parsing the
@@ -608,6 +632,7 @@ impl<'a> Parser<'a> {
     fn format(&mut self) -> FormatSpec<'a> {
         let mut spec = FormatSpec {
             fill: None,
+            fill_span: None,
             align: AlignUnknown,
             sign: None,
             alternate: false,
@@ -625,9 +650,10 @@ impl<'a> Parser<'a> {
         }
 
         // fill character
-        if let Some(&(_, c)) = self.cur.peek() {
+        if let Some(&(idx, c)) = self.cur.peek() {
             if let Some((_, '>' | '<' | '^')) = self.cur.clone().nth(1) {
                 spec.fill = Some(c);
+                spec.fill_span = Some(self.span(idx, idx + 1));
                 self.cur.next();
             }
         }
@@ -722,6 +748,7 @@ impl<'a> Parser<'a> {
     fn inline_asm(&mut self) -> FormatSpec<'a> {
         let mut spec = FormatSpec {
             fill: None,
+            fill_span: None,
             align: AlignUnknown,
             sign: None,
             alternate: false,
@@ -854,7 +881,7 @@ impl<'a> Parser<'a> {
                     label: "expected `?` to occur after `:`".to_owned(),
                     span: pos.to(pos),
                     secondary_label: None,
-                    should_be_replaced_with_positional_argument: false,
+                    suggestion: Suggestion::None,
                 },
             );
         }
@@ -880,7 +907,7 @@ impl<'a> Parser<'a> {
                             label: "not supported".to_string(),
                             span: InnerSpan::new(arg.position_span.start, field.position_span.end),
                             secondary_label: None,
-                            should_be_replaced_with_positional_argument: true,
+                            suggestion: Suggestion::UsePositional,
                         },
                     );
                 }
@@ -1024,7 +1051,7 @@ fn unescape_string(string: &str) -> Option<string::String> {
 
 // Assert a reasonable size for `Piece`
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-rustc_data_structures::static_assert_size!(Piece<'_>, 16);
+rustc_index::static_assert_size!(Piece<'_>, 16);
 
 #[cfg(test)]
 mod tests;

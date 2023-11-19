@@ -7,7 +7,9 @@
 use std::fmt;
 
 use rustc_ast::ast;
+use rustc_attr::DeprecatedSince;
 use rustc_hir::{def::CtorKind, def::DefKind, def_id::DefId};
+use rustc_metadata::rendered_const;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::symbol::sym;
 use rustc_span::{Pos, Symbol};
@@ -15,9 +17,9 @@ use rustc_target::spec::abi::Abi as RustcAbi;
 
 use rustdoc_json_types::*;
 
-use crate::clean::utils::print_const_expr;
 use crate::clean::{self, ItemId};
 use crate::formats::item_type::ItemType;
+use crate::formats::FormatRenderer;
 use crate::json::JsonRenderer;
 use crate::passes::collect_intra_doc_links::UrlFragment;
 
@@ -40,8 +42,8 @@ impl JsonRenderer<'_> {
                 (String::from(&**link), id_from_item_default(id.into(), self.tcx))
             })
             .collect();
-        let docs = item.attrs.collapsed_doc_value();
-        let attrs = item.attributes(self.tcx, true);
+        let docs = item.opt_doc_value();
+        let attrs = item.attributes(self.tcx, self.cache(), true);
         let span = item.span(self.tcx);
         let visibility = item.visibility(self.tcx);
         let clean::Item { name, item_id, .. } = item;
@@ -137,9 +139,14 @@ where
 }
 
 pub(crate) fn from_deprecation(deprecation: rustc_attr::Deprecation) -> Deprecation {
-    #[rustfmt::skip]
-    let rustc_attr::Deprecation { since, note, is_since_rustc_version: _, suggestion: _ } = deprecation;
-    Deprecation { since: since.map(|s| s.to_string()), note: note.map(|s| s.to_string()) }
+    let rustc_attr::Deprecation { since, note, suggestion: _ } = deprecation;
+    let since = match since {
+        DeprecatedSince::RustcVersion(version) => Some(version.to_string()),
+        DeprecatedSince::Future => Some("TBD".to_owned()),
+        DeprecatedSince::NonStandard(since) => Some(since.to_string()),
+        DeprecatedSince::Unspecified | DeprecatedSince::Err => None,
+    };
+    Deprecation { since, note: note.map(|s| s.to_string()) }
 }
 
 impl FromWithTcx<clean::GenericArgs> for GenericArgs {
@@ -171,11 +178,12 @@ impl FromWithTcx<clean::GenericArg> for GenericArg {
 }
 
 impl FromWithTcx<clean::Constant> for Constant {
+    // FIXME(generic_const_items): Add support for generic const items.
     fn from_tcx(constant: clean::Constant, tcx: TyCtxt<'_>) -> Self {
         let expr = constant.expr(tcx);
         let value = constant.value(tcx);
         let is_literal = constant.is_literal(tcx);
-        Constant { type_: constant.type_.into_tcx(tcx), expr, value, is_literal }
+        Constant { type_: (*constant.type_).into_tcx(tcx), expr, value, is_literal }
     }
 }
 
@@ -242,15 +250,16 @@ pub(crate) fn id_from_item_inner(
                     // their parent module, which isn't present in the output JSON items. So
                     // instead, we directly get the primitive symbol and convert it to u32 to
                     // generate the ID.
-                    if matches!(tcx.def_kind(def_id), DefKind::Mod) &&
-                        let Some(prim) = tcx.get_attrs(*def_id, sym::rustc_doc_primitive)
-                            .find_map(|attr| attr.value_str()) {
+                    if matches!(tcx.def_kind(def_id), DefKind::Mod)
+                        && let Some(prim) = tcx
+                            .get_attrs(*def_id, sym::rustc_doc_primitive)
+                            .find_map(|attr| attr.value_str())
+                    {
                         format!(":{}", prim.as_u32())
                     } else {
-                        tcx
-                        .opt_item_name(*def_id)
-                        .map(|n| format!(":{}", n.as_u32()))
-                        .unwrap_or_default()
+                        tcx.opt_item_name(*def_id)
+                            .map(|n| format!(":{}", n.as_u32()))
+                            .unwrap_or_default()
                     }
                 }
             };
@@ -310,7 +319,7 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
         StaticItem(s) => ItemEnum::Static(s.into_tcx(tcx)),
         ForeignStaticItem(s) => ItemEnum::Static(s.into_tcx(tcx)),
         ForeignTypeItem => ItemEnum::ForeignType,
-        TypedefItem(t) => ItemEnum::Typedef(t.into_tcx(tcx)),
+        TypeAliasItem(t) => ItemEnum::TypeAlias(t.into_tcx(tcx)),
         OpaqueTyItem(t) => ItemEnum::OpaqueTy(t.into_tcx(tcx)),
         ConstantItem(c) => ItemEnum::Constant(c.into_tcx(tcx)),
         MacroItem(m) => ItemEnum::Macro(m.source),
@@ -321,9 +330,13 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
                 impls: Vec::new(), // Added in JsonRenderer::item
             })
         }
-        TyAssocConstItem(ty) => ItemEnum::AssocConst { type_: ty.into_tcx(tcx), default: None },
-        AssocConstItem(ty, default) => {
-            ItemEnum::AssocConst { type_: ty.into_tcx(tcx), default: Some(default.expr(tcx)) }
+        // FIXME(generic_const_items): Add support for generic associated consts.
+        TyAssocConstItem(_generics, ty) => {
+            ItemEnum::AssocConst { type_: (*ty).into_tcx(tcx), default: None }
+        }
+        // FIXME(generic_const_items): Add support for generic associated consts.
+        AssocConstItem(_generics, ty, default) => {
+            ItemEnum::AssocConst { type_: (*ty).into_tcx(tcx), default: Some(default.expr(tcx)) }
         }
         TyAssocTypeItem(g, b) => ItemEnum::AssocType {
             generics: g.into_tcx(tcx),
@@ -448,7 +461,7 @@ impl FromWithTcx<clean::GenericParamDefKind> for GenericParamDefKind {
                 default: default.map(|x| (*x).into_tcx(tcx)),
                 synthetic,
             },
-            Const { ty, default } => GenericParamDefKind::Const {
+            Const { ty, default, is_host_effect: _ } => GenericParamDefKind::Const {
                 type_: (*ty).into_tcx(tcx),
                 default: default.map(|x| *x),
             },
@@ -486,12 +499,14 @@ impl FromWithTcx<clean::WherePredicate> for WherePredicate {
                                 default: default.map(|ty| (*ty).into_tcx(tcx)),
                                 synthetic,
                             },
-                            clean::GenericParamDefKind::Const { ty, default } => {
-                                GenericParamDefKind::Const {
-                                    type_: (*ty).into_tcx(tcx),
-                                    default: default.map(|d| *d),
-                                }
-                            }
+                            clean::GenericParamDefKind::Const {
+                                ty,
+                                default,
+                                is_host_effect: _,
+                            } => GenericParamDefKind::Const {
+                                type_: (*ty).into_tcx(tcx),
+                                default: default.map(|d| *d),
+                            },
                         };
                         GenericParamDef { name, kind }
                     })
@@ -501,9 +516,8 @@ impl FromWithTcx<clean::WherePredicate> for WherePredicate {
                 lifetime: convert_lifetime(lifetime),
                 bounds: bounds.into_tcx(tcx),
             },
-            // FIXME(fmease): Convert bound parameters as well.
-            EqPredicate { lhs, rhs, bound_params: _ } => {
-                WherePredicate::EqPredicate { lhs: (*lhs).into_tcx(tcx), rhs: (*rhs).into_tcx(tcx) }
+            EqPredicate { lhs, rhs } => {
+                WherePredicate::EqPredicate { lhs: lhs.into_tcx(tcx), rhs: rhs.into_tcx(tcx) }
             }
         }
     }
@@ -574,7 +588,7 @@ impl FromWithTcx<clean::Type> for Type {
                 name: assoc.name.to_string(),
                 args: Box::new(assoc.args.into_tcx(tcx)),
                 self_type: Box::new(self_type.into_tcx(tcx)),
-                trait_: trait_.into_tcx(tcx),
+                trait_: trait_.map(|trait_| trait_.into_tcx(tcx)),
             },
         }
     }
@@ -624,10 +638,7 @@ impl FromWithTcx<clean::FnDecl> for FnDecl {
                 .into_iter()
                 .map(|arg| (arg.name.to_string(), arg.type_.into_tcx(tcx)))
                 .collect(),
-            output: match output {
-                clean::FnRetTy::Return(t) => Some(t.into_tcx(tcx)),
-                clean::FnRetTy::DefaultReturn => None,
-            },
+            output: if output.is_unit() { None } else { Some(output.into_tcx(tcx)) },
             c_variadic,
         }
     }
@@ -743,7 +754,7 @@ impl FromWithTcx<clean::Discriminant> for Discriminant {
             // `rustc_middle` types, not `rustc_hir`, but because JSON never inlines
             // the expr is always some.
             expr: disr.expr(tcx).unwrap(),
-            value: disr.value(tcx),
+            value: disr.value(tcx, false),
         }
     }
 }
@@ -785,10 +796,10 @@ pub(crate) fn from_macro_kind(kind: rustc_span::hygiene::MacroKind) -> MacroKind
     }
 }
 
-impl FromWithTcx<Box<clean::Typedef>> for Typedef {
-    fn from_tcx(typedef: Box<clean::Typedef>, tcx: TyCtxt<'_>) -> Self {
-        let clean::Typedef { type_, generics, item_type: _ } = *typedef;
-        Typedef { type_: type_.into_tcx(tcx), generics: generics.into_tcx(tcx) }
+impl FromWithTcx<Box<clean::TypeAlias>> for TypeAlias {
+    fn from_tcx(type_alias: Box<clean::TypeAlias>, tcx: TyCtxt<'_>) -> Self {
+        let clean::TypeAlias { type_, generics, item_type: _, inner_type: _ } = *type_alias;
+        TypeAlias { type_: type_.into_tcx(tcx), generics: generics.into_tcx(tcx) }
     }
 }
 
@@ -803,7 +814,7 @@ impl FromWithTcx<clean::Static> for Static {
         Static {
             type_: stat.type_.into_tcx(tcx),
             mutable: stat.mutability == ast::Mutability::Mut,
-            expr: stat.expr.map(|e| print_const_expr(tcx, e)).unwrap_or_default(),
+            expr: stat.expr.map(|e| rendered_const(tcx, e)).unwrap_or_default(),
         }
     }
 }
@@ -825,7 +836,7 @@ impl FromWithTcx<ItemType> for ItemKind {
             Union => ItemKind::Union,
             Enum => ItemKind::Enum,
             Function | TyMethod | Method => ItemKind::Function,
-            Typedef => ItemKind::Typedef,
+            TypeAlias => ItemKind::TypeAlias,
             OpaqueTy => ItemKind::OpaqueTy,
             Static => ItemKind::Static,
             Constant => ItemKind::Constant,

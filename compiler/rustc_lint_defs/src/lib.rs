@@ -23,8 +23,9 @@ pub mod builtin;
 
 #[macro_export]
 macro_rules! pluralize {
+    // Pluralize based on count (e.g., apples)
     ($x:expr) => {
-        if $x != 1 { "s" } else { "" }
+        if $x == 1 { "" } else { "s" }
     };
     ("has", $x:expr) => {
         if $x == 1 { "has" } else { "have" }
@@ -320,7 +321,7 @@ pub struct Lint {
 
     pub future_incompatible: Option<FutureIncompatibleInfo>,
 
-    pub is_plugin: bool,
+    pub is_loaded: bool,
 
     /// `Some` if this lint is feature gated, otherwise `None`.
     pub feature_gate: Option<Symbol>,
@@ -346,12 +347,18 @@ pub struct FutureIncompatibleInfo {
 /// The reason for future incompatibility
 #[derive(Copy, Clone, Debug)]
 pub enum FutureIncompatibilityReason {
-    /// This will be an error in a future release
-    /// for all editions
-    FutureReleaseError,
+    /// This will be an error in a future release for all editions
+    ///
+    /// This will *not* show up in cargo's future breakage report.
+    /// The warning will hence only be seen in local crates, not in dependencies.
+    FutureReleaseErrorDontReportInDeps,
     /// This will be an error in a future release, and
     /// Cargo should create a report even for dependencies
-    FutureReleaseErrorReportNow,
+    ///
+    /// This is the *only* reason that will make future incompatibility warnings show up in cargo's
+    /// reports. All other future incompatibility warnings are not visible when they occur in a
+    /// dependency.
+    FutureReleaseErrorReportInDeps,
     /// Code that changes meaning in some way in a
     /// future release.
     FutureReleaseSemanticsChange,
@@ -379,7 +386,7 @@ impl FutureIncompatibleInfo {
     pub const fn default_fields_for_macro() -> Self {
         FutureIncompatibleInfo {
             reference: "",
-            reason: FutureIncompatibilityReason::FutureReleaseError,
+            reason: FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps,
             explain_reason: true,
         }
     }
@@ -392,7 +399,7 @@ impl Lint {
             default_level: Level::Forbid,
             desc: "",
             edition_lint_opts: None,
-            is_plugin: false,
+            is_loaded: false,
             report_in_external_macro: false,
             future_incompatible: None,
             feature_gate: None,
@@ -467,6 +474,21 @@ impl<HCX> ToStableHashKey<HCX> for LintId {
     }
 }
 
+#[derive(Debug)]
+pub struct AmbiguityErrorDiag {
+    pub msg: String,
+    pub span: Span,
+    pub label_span: Span,
+    pub label_msg: String,
+    pub note_msg: String,
+    pub b1_span: Span,
+    pub b1_note_msg: String,
+    pub b1_help_msgs: Vec<String>,
+    pub b2_span: Span,
+    pub b2_note_msg: String,
+    pub b2_help_msgs: Vec<String>,
+}
+
 // This could be a closure, but then implementing derive trait
 // becomes hacky (and it gets allocated).
 #[derive(Debug)]
@@ -530,6 +552,9 @@ pub enum BuiltinLintDiagnostics {
         vis_span: Span,
         ident_span: Span,
     },
+    AmbiguousGlobImports {
+        diag: AmbiguityErrorDiag,
+    },
     AmbiguousGlobReexports {
         /// The name for which collision(s) have occurred.
         name: String,
@@ -539,6 +564,24 @@ pub enum BuiltinLintDiagnostics {
         first_reexport_span: Span,
         /// Span where the same name is also re-exported.
         duplicate_reexport_span: Span,
+    },
+    HiddenGlobReexports {
+        /// The name of the local binding which shadows the glob re-export.
+        name: String,
+        /// The namespace for which the shadowing occurred in.
+        namespace: String,
+        /// The glob reexport that is shadowed by the local binding.
+        glob_reexport_span: Span,
+        /// The local binding that shadows the glob reexport.
+        private_item_span: Span,
+    },
+    UnusedQualifications {
+        /// The span of the unnecessarily-qualified path to remove.
+        removal_span: Span,
+    },
+    AssociatedConstElidedLifetime {
+        elided: bool,
+        span: Span,
     },
 }
 
@@ -681,35 +724,27 @@ macro_rules! declare_lint {
     );
     ($(#[$attr:meta])* $vis: vis $NAME: ident, $Level: ident, $desc: expr,
      $(@feature_gate = $gate:expr;)?
-     $(@future_incompatible = FutureIncompatibleInfo { $($field:ident : $val:expr),* $(,)*  }; )?
+     $(@future_incompatible = FutureIncompatibleInfo {
+        reason: $reason:expr,
+        $($field:ident : $val:expr),* $(,)*
+     }; )?
+     $(@edition $lint_edition:ident => $edition_level:ident;)?
      $($v:ident),*) => (
         $(#[$attr])*
         $vis static $NAME: &$crate::Lint = &$crate::Lint {
             name: stringify!($NAME),
             default_level: $crate::$Level,
             desc: $desc,
-            edition_lint_opts: None,
-            is_plugin: false,
+            is_loaded: false,
             $($v: true,)*
-            $(feature_gate: Some($gate),)*
+            $(feature_gate: Some($gate),)?
             $(future_incompatible: Some($crate::FutureIncompatibleInfo {
+                reason: $reason,
                 $($field: $val,)*
                 ..$crate::FutureIncompatibleInfo::default_fields_for_macro()
-            }),)*
+            }),)?
+            $(edition_lint_opts: Some(($crate::Edition::$lint_edition, $crate::$edition_level)),)?
             ..$crate::Lint::default_fields_for_macro()
-        };
-    );
-    ($(#[$attr:meta])* $vis: vis $NAME: ident, $Level: ident, $desc: expr,
-     $lint_edition: expr => $edition_level: ident
-    ) => (
-        $(#[$attr])*
-        $vis static $NAME: &$crate::Lint = &$crate::Lint {
-            name: stringify!($NAME),
-            default_level: $crate::$Level,
-            desc: $desc,
-            edition_lint_opts: Some(($lint_edition, $crate::Level::$edition_level)),
-            report_in_external_macro: false,
-            is_plugin: false,
         };
     );
 }
@@ -742,7 +777,7 @@ macro_rules! declare_tool_lint {
             edition_lint_opts: None,
             report_in_external_macro: $external,
             future_incompatible: None,
-            is_plugin: true,
+            is_loaded: true,
             $(feature_gate: Some($gate),)?
             crate_level_only: false,
             ..$crate::Lint::default_fields_for_macro()
@@ -750,16 +785,7 @@ macro_rules! declare_tool_lint {
     );
 }
 
-/// Declares a static `LintArray` and return it as an expression.
-#[macro_export]
-macro_rules! lint_array {
-    ($( $lint:expr ),* ,) => { lint_array!( $($lint),* ) };
-    ($( $lint:expr ),*) => {{
-        vec![$($lint),*]
-    }}
-}
-
-pub type LintArray = Vec<&'static Lint>;
+pub type LintVec = Vec<&'static Lint>;
 
 pub trait LintPass {
     fn name(&self) -> &'static str;
@@ -773,7 +799,7 @@ macro_rules! impl_lint_pass {
             fn name(&self) -> &'static str { stringify!($ty) }
         }
         impl $ty {
-            pub fn get_lints() -> $crate::LintArray { $crate::lint_array!($($lint),*) }
+            pub fn get_lints() -> $crate::LintVec { vec![$($lint),*] }
         }
     };
 }

@@ -15,6 +15,10 @@ declare_clippy_lint! {
     /// A good custom message should be more about why the failure of the assertion is problematic
     /// and not what is failed because the assertion already conveys that.
     ///
+    /// Although the same reasoning applies to testing functions, this lint ignores them as they would be too noisy.
+    /// Also, in most cases understanding the test failure would be easier
+    /// compared to understanding a complex invariant distributed around the codebase.
+    ///
     /// ### Known problems
     /// This lint cannot check the quality of the custom panic messages.
     /// Hence, you can suppress this lint simply by adding placeholder messages
@@ -23,20 +27,20 @@ declare_clippy_lint! {
     /// don't provide any extra information.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # struct Service { ready: bool }
     /// fn call(service: Service) {
     ///     assert!(service.ready);
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # struct Service { ready: bool }
     /// fn call(service: Service) {
     ///     assert!(service.ready, "`service.poll_ready()` must be called first to ensure that service is ready to receive requests");
     /// }
     /// ```
-    #[clippy::version = "1.69.0"]
+    #[clippy::version = "1.70.0"]
     pub MISSING_ASSERT_MESSAGE,
     restriction,
     "checks assertions without a custom panic message"
@@ -46,7 +50,9 @@ declare_lint_pass!(MissingAssertMessage => [MISSING_ASSERT_MESSAGE]);
 
 impl<'tcx> LateLintPass<'tcx> for MissingAssertMessage {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        let Some(macro_call) = root_macro_call_first_node(cx, expr) else { return };
+        let Some(macro_call) = root_macro_call_first_node(cx, expr) else {
+            return;
+        };
         let single_argument = match cx.tcx.get_diagnostic_name(macro_call.def_id) {
             Some(sym::assert_macro | sym::debug_assert_macro) => true,
             Some(
@@ -61,10 +67,14 @@ impl<'tcx> LateLintPass<'tcx> for MissingAssertMessage {
         }
 
         let panic_expn = if single_argument {
-            let Some((_, panic_expn)) = find_assert_args(cx, expr, macro_call.expn) else { return };
+            let Some((_, panic_expn)) = find_assert_args(cx, expr, macro_call.expn) else {
+                return;
+            };
             panic_expn
         } else {
-            let Some((_, _, panic_expn)) = find_assert_eq_args(cx, expr, macro_call.expn) else { return };
+            let Some((_, _, panic_expn)) = find_assert_eq_args(cx, expr, macro_call.expn) else {
+                return;
+            };
             panic_expn
         };
 

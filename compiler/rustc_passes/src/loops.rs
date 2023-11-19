@@ -1,30 +1,32 @@
 use Context::*;
 
 use rustc_hir as hir;
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::def_id::{LocalDefId, LocalModDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Destination, Movability, Node};
 use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter;
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_span::hygiene::DesugaringKind;
-use rustc_span::Span;
+use rustc_span::{BytePos, Span};
 
 use crate::errors::{
     BreakInsideAsyncBlock, BreakInsideClosure, BreakNonLoop, ContinueLabeledBlock, OutsideLoop,
-    UnlabeledCfInWhileCondition, UnlabeledInLabeledBlock,
+    OutsideLoopSuggestion, UnlabeledCfInWhileCondition, UnlabeledInLabeledBlock,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Context {
     Normal,
+    Fn,
     Loop(hir::LoopSource),
     Closure(Span),
     AsyncClosure(Span),
+    UnlabeledBlock(Span),
     LabeledBlock,
-    AnonConst,
+    Constant,
 }
 
 #[derive(Copy, Clone)]
@@ -34,7 +36,7 @@ struct CheckLoopVisitor<'a, 'hir> {
     cx: Context,
 }
 
-fn check_mod_loops(tcx: TyCtxt<'_>, module_def_id: LocalDefId) {
+fn check_mod_loops(tcx: TyCtxt<'_>, module_def_id: LocalModDefId) {
     tcx.hir().visit_item_likes_in_module(
         module_def_id,
         &mut CheckLoopVisitor { sess: &tcx.sess, hir_map: tcx.hir(), cx: Normal },
@@ -53,7 +55,30 @@ impl<'a, 'hir> Visitor<'hir> for CheckLoopVisitor<'a, 'hir> {
     }
 
     fn visit_anon_const(&mut self, c: &'hir hir::AnonConst) {
-        self.with_context(AnonConst, |v| intravisit::walk_anon_const(v, c));
+        self.with_context(Constant, |v| intravisit::walk_anon_const(v, c));
+    }
+
+    fn visit_inline_const(&mut self, c: &'hir hir::ConstBlock) {
+        self.with_context(Constant, |v| intravisit::walk_inline_const(v, c));
+    }
+
+    fn visit_fn(
+        &mut self,
+        fk: hir::intravisit::FnKind<'hir>,
+        fd: &'hir hir::FnDecl<'hir>,
+        b: hir::BodyId,
+        _: Span,
+        id: LocalDefId,
+    ) {
+        self.with_context(Fn, |v| intravisit::walk_fn(v, fk, fd, b, id));
+    }
+
+    fn visit_trait_item(&mut self, trait_item: &'hir hir::TraitItem<'hir>) {
+        self.with_context(Fn, |v| intravisit::walk_trait_item(v, trait_item));
+    }
+
+    fn visit_impl_item(&mut self, impl_item: &'hir hir::ImplItem<'hir>) {
+        self.with_context(Fn, |v| intravisit::walk_impl_item(v, impl_item));
     }
 
     fn visit_expr(&mut self, e: &'hir hir::Expr<'hir>) {
@@ -78,6 +103,14 @@ impl<'a, 'hir> Visitor<'hir> for CheckLoopVisitor<'a, 'hir> {
             }
             hir::ExprKind::Block(ref b, Some(_label)) => {
                 self.with_context(LabeledBlock, |v| v.visit_block(&b));
+            }
+            hir::ExprKind::Block(ref b, None) if matches!(self.cx, Fn) => {
+                self.with_context(Normal, |v| v.visit_block(&b));
+            }
+            hir::ExprKind::Block(ref b, None)
+                if matches!(self.cx, Normal | Constant | UnlabeledBlock(_)) =>
+            {
+                self.with_context(UnlabeledBlock(b.span.shrink_to_lo()), |v| v.visit_block(&b));
             }
             hir::ExprKind::Break(break_label, ref opt_expr) => {
                 if let Some(e) = opt_expr {
@@ -143,7 +176,12 @@ impl<'a, 'hir> Visitor<'hir> for CheckLoopVisitor<'a, 'hir> {
                     }
                 }
 
-                self.require_break_cx("break", e.span);
+                let sp_lo = e.span.with_lo(e.span.lo() + BytePos("break".len() as u32));
+                let label_sp = match break_label.label {
+                    Some(label) => sp_lo.with_hi(label.ident.span.hi()),
+                    None => sp_lo.shrink_to_lo(),
+                };
+                self.require_break_cx("break", e.span, label_sp);
             }
             hir::ExprKind::Continue(destination) => {
                 self.require_label_in_labeled_block(e.span, &destination, "continue");
@@ -165,7 +203,7 @@ impl<'a, 'hir> Visitor<'hir> for CheckLoopVisitor<'a, 'hir> {
                     }
                     Err(_) => {}
                 }
-                self.require_break_cx("continue", e.span)
+                self.require_break_cx("continue", e.span, e.span)
             }
             _ => intravisit::walk_expr(self, e),
         }
@@ -183,7 +221,8 @@ impl<'a, 'hir> CheckLoopVisitor<'a, 'hir> {
         self.cx = old_cx;
     }
 
-    fn require_break_cx(&self, name: &str, span: Span) {
+    fn require_break_cx(&self, name: &str, span: Span, break_span: Span) {
+        let is_break = name == "break";
         match self.cx {
             LabeledBlock | Loop(_) => {}
             Closure(closure_span) => {
@@ -192,8 +231,12 @@ impl<'a, 'hir> CheckLoopVisitor<'a, 'hir> {
             AsyncClosure(closure_span) => {
                 self.sess.emit_err(BreakInsideAsyncBlock { span, closure_span, name });
             }
-            Normal | AnonConst => {
-                self.sess.emit_err(OutsideLoop { span, name, is_break: name == "break" });
+            UnlabeledBlock(block_span) if is_break && block_span.eq_ctxt(break_span) => {
+                let suggestion = Some(OutsideLoopSuggestion { block_span, break_span });
+                self.sess.emit_err(OutsideLoop { span, name, is_break, suggestion });
+            }
+            Normal | Constant | Fn | UnlabeledBlock(_) => {
+                self.sess.emit_err(OutsideLoop { span, name, is_break, suggestion: None });
             }
         }
     }

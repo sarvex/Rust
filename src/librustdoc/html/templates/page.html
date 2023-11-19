@@ -10,13 +10,11 @@
     <link rel="preload" as="font" type="font/woff2" crossorigin href="{{static_root_path|safe}}{{files.fira_sans_regular}}"> {# #}
     <link rel="preload" as="font" type="font/woff2" crossorigin href="{{static_root_path|safe}}{{files.fira_sans_medium}}"> {# #}
     <link rel="preload" as="font" type="font/woff2" crossorigin href="{{static_root_path|safe}}{{files.source_code_pro_regular}}"> {# #}
-    <link rel="preload" as="font" type="font/woff2" crossorigin href="{{static_root_path|safe}}{{files.source_serif_4_bold}}"> {# #}
     <link rel="preload" as="font" type="font/woff2" crossorigin href="{{static_root_path|safe}}{{files.source_code_pro_semibold}}"> {# #}
     <link rel="stylesheet" {#+ #}
           href="{{static_root_path|safe}}{{files.normalize_css}}"> {# #}
     <link rel="stylesheet" {#+ #}
-          href="{{static_root_path|safe}}{{files.rustdoc_css}}" {#+ #}
-          id="mainThemeStyle"> {# #}
+          href="{{static_root_path|safe}}{{files.rustdoc_css}}"> {# #}
     {% if !layout.default_settings.is_empty() %}
     <script id="default-settings" {#+ #}
       {%~ for (k, v) in layout.default_settings ~%}
@@ -24,41 +22,33 @@
       {% endfor %}
     ></script> {# #}
     {% endif %}
-    <div id="rustdoc-vars" {#+ #}
+    <meta name="rustdoc-vars" {#+ #}
          data-root-path="{{page.root_path|safe}}" {#+ #}
          data-static-root-path="{{static_root_path|safe}}" {#+ #}
          data-current-crate="{{layout.krate}}" {#+ #}
          data-themes="{{themes|join(",") }}" {#+ #}
          data-resource-suffix="{{page.resource_suffix}}" {#+ #}
          data-rustdoc-version="{{rustdoc_version}}" {#+ #}
+         data-channel="{{rust_channel}}" {#+ #}
          data-search-js="{{files.search_js}}" {#+ #}
          data-settings-js="{{files.settings_js}}" {#+ #}
-         data-settings-css="{{files.settings_css}}" {#+ #}
-         data-theme-light-css="{{files.theme_light_css}}" {#+ #}
-         data-theme-dark-css="{{files.theme_dark_css}}" {#+ #}
-         data-theme-ayu-css="{{files.theme_ayu_css}}" {#+ #}
     > {# #}
-    </div> {# #}
     <script src="{{static_root_path|safe}}{{files.storage_js}}"></script> {# #}
     {% if page.css_class.contains("crate") %}
     <script defer src="{{page.root_path|safe}}crates{{page.resource_suffix}}.js"></script> {# #}
-    {% else if page.css_class == "source" %}
-    <script defer src="{{static_root_path|safe}}{{files.source_script_js}}"></script> {# #}
-    <script defer src="{{page.root_path|safe}}source-files{{page.resource_suffix}}.js"></script> {# #}
+    {% else if page.css_class == "src" %}
+    <script defer src="{{static_root_path|safe}}{{files.src_script_js}}"></script> {# #}
+    <script defer src="{{page.root_path|safe}}src-files{{page.resource_suffix}}.js"></script> {# #}
     {% else if !page.css_class.contains("mod") %}
     <script defer src="sidebar-items{{page.resource_suffix}}.js"></script> {# #}
+    {% else if !page.css_class.contains("sys") %}
+    <script defer src="../sidebar-items{{page.resource_suffix}}.js"></script> {# #}
     {% endif %}
     <script defer src="{{static_root_path|safe}}{{files.main_js}}"></script> {# #}
     {% if layout.scrape_examples_extension %}
     <script defer src="{{static_root_path|safe}}{{files.scrape_examples_js}}"></script> {# #}
     {% endif %}
     <noscript> {# #}
-        <link rel="stylesheet" {#+ #}
-           media="(prefers-color-scheme:light)" {#+ #}
-           href="{{static_root_path|safe}}{{files.theme_light_css}}"> {# #}
-        <link rel="stylesheet" {#+ #}
-           media="(prefers-color-scheme:dark)" {#+ #}
-           href="{{static_root_path|safe}}{{files.theme_dark_css}}"> {# #}
         <link rel="stylesheet" {#+ #}
            href="{{static_root_path|safe}}{{files.noscript_css}}"> {# #}
     </noscript> {# #}
@@ -85,40 +75,54 @@
     </div> {# #}
     <![endif]--> {# #}
     {{ layout.external_html.before_content|safe }}
-    {% if page.css_class != "source" %}
+    {% if page.css_class != "src" %}
     <nav class="mobile-topbar"> {# #}
         <button class="sidebar-menu-toggle">&#9776;</button> {# #}
-        <a class="logo-container" href="{{page.root_path|safe}}{{krate_with_trailing_slash|safe}}index.html"> {# #}
-        {% if !layout.logo.is_empty() %}
-            <img src="{{layout.logo}}" alt="logo"> {# #}
-        {% else %}
-            <img class="rust-logo" src="{{static_root_path|safe}}{{files.rust_logo_svg}}" alt="logo"> {# #}
+        {% if !layout.logo.is_empty() || page.rust_logo %}
+        <a class="logo-container" href="{{page.root_path|safe}}{{display_krate_with_trailing_slash|safe}}index.html"> {# #}
+        {% if page.rust_logo %}
+            <img class="rust-logo" src="{{static_root_path|safe}}{{files.rust_logo_svg}}" alt=""> {# #}
+        {% else if !layout.logo.is_empty() %}
+            <img src="{{layout.logo}}" alt=""> {# #}
         {% endif %}
         </a> {# #}
-        <h2></h2> {# #}
-    </nav> {# #}
+        {% endif %}
+    </nav>
     {% endif %}
     <nav class="sidebar"> {# #}
-        {% if page.css_class != "source" %}
-        <a class="logo-container" href="{{page.root_path|safe}}{{krate_with_trailing_slash|safe}}index.html"> {# #}
-            {% if !layout.logo.is_empty() %}
-                <img src="{{layout.logo}}" alt="logo"> {# #}
-            {% else %}
-                <img class="rust-logo" src="{{static_root_path|safe}}{{files.rust_logo_svg}}" alt="logo"> {# #}
+        {% if page.css_class != "src" %}
+        <div class="sidebar-crate">
+            {% if !layout.logo.is_empty() || page.rust_logo %}
+            <a class="logo-container" href="{{page.root_path|safe}}{{display_krate_with_trailing_slash|safe}}index.html"> {# #}
+                {% if page.rust_logo %}
+                    <img class="rust-logo" src="{{static_root_path|safe}}{{files.rust_logo_svg}}" alt="logo"> {# #}
+                {% else if !layout.logo.is_empty() %}
+                    <img src="{{layout.logo}}" alt="logo"> {# #}
+                {% endif %}
+            </a> {# #}
             {% endif %}
-        </a> {# #}
+            <h2> {# #}
+                <a href="{{page.root_path|safe}}{{display_krate_with_trailing_slash|safe}}index.html">{{display_krate}}</a> {# #}
+                {% if !display_krate_version_number.is_empty() %}
+                    <span class="version">{{+ display_krate_version_number}}</span>
+                {% endif %}
+            </h2> {# #}
+        </div> {# #}
+        {% if !display_krate_version_extra.is_empty() %}
+        <div class="version">{{+ display_krate_version_extra}}</div> {# #}
+        {% endif %}
         {% endif %}
         {{ sidebar|safe }}
     </nav> {# #}
     <main> {# #}
-        {% if page.css_class != "source" %}<div class="width-limiter">{% endif %}
+        {% if page.css_class != "src" %}<div class="width-limiter">{% endif %}
             <nav class="sub"> {# #}
-                {% if page.css_class == "source" %}
-                <a class="sub-logo-container" href="{{page.root_path|safe}}{{krate_with_trailing_slash|safe}}index.html"> {# #}
-                    {% if !layout.logo.is_empty() %}
-                        <img src="{{layout.logo}}" alt="logo"> {# #}
-                    {% else %}
-                        <img class="rust-logo" src="{{static_root_path|safe}}{{files.rust_logo_svg}}" alt="logo"> {# #}
+                {% if page.css_class == "src" && (!layout.logo.is_empty() || page.rust_logo) %}
+                <a class="sub-logo-container" href="{{page.root_path|safe}}{{display_krate_with_trailing_slash|safe}}index.html"> {# #}
+                    {% if page.rust_logo %}
+                    <img class="rust-logo" src="{{static_root_path|safe}}{{files.rust_logo_svg}}" alt="{{display_krate}}"> {# #}
+                    {% else if !layout.logo.is_empty() %}
+                        <img src="{{layout.logo}}" alt="{{display_krate}}"> {# #}
                     {% endif %}
                 </a> {# #}
                 {% endif %}
@@ -144,7 +148,7 @@
                 </form> {# #}
             </nav> {# #}
             <section id="main-content" class="content">{{ content|safe }}</section> {# #}
-        {% if page.css_class != "source" %}</div>{% endif %}
+        {% if page.css_class != "src" %}</div>{% endif %}
     </main> {# #}
     {{ layout.external_html.after_content|safe }}
 </body> {# #}

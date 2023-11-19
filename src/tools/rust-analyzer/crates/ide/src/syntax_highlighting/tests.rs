@@ -48,6 +48,7 @@ fn macros() {
     check_highlighting(
         r#"
 //- proc_macros: mirror
+//- /lib.rs crate:lib
 proc_macros::mirror! {
     {
         ,i32 :x pub
@@ -95,11 +96,23 @@ macro without_args {
     }
 }
 
+#[rustc_builtin_macro]
+macro_rules! concat {}
+#[rustc_builtin_macro]
+macro_rules! include {}
+#[rustc_builtin_macro]
+macro_rules! format_args {}
+
+include!(concat!("foo/", "foo.rs"));
+
 fn main() {
-    println!("Hello, {}!", 92);
+    format_args!("Hello, {}!", 92);
     dont_color_me_braces!();
     noop!(noop!(1));
 }
+//- /foo/foo.rs crate:foo
+mod foo {}
+use self::foo as bar;
 "#,
         expect_file!["./test_data/highlight_macros.html"],
         false,
@@ -388,17 +401,12 @@ fn test_string_highlighting() {
     // thus, we have to copy the macro definition from `std`
     check_highlighting(
         r#"
+//- minicore: fmt
 macro_rules! println {
     ($($arg:tt)*) => ({
-        $crate::io::_print($crate::format_args_nl!($($arg)*));
+        $crate::io::_print(format_args_nl!($($arg)*));
     })
 }
-#[rustc_builtin_macro]
-#[macro_export]
-macro_rules! format_args {}
-#[rustc_builtin_macro]
-#[macro_export]
-macro_rules! const_format_args {}
 #[rustc_builtin_macro]
 #[macro_export]
 macro_rules! format_args_nl {}
@@ -420,7 +428,7 @@ mod panic {
             $crate::panicking::panic_display(&$arg)
         ),
         ($fmt:expr, $($arg:tt)+) => (
-            $crate::panicking::panic_fmt($crate::const_format_args!($fmt, $($arg)+))
+            $crate::panicking::panic_fmt(const_format_args!($fmt, $($arg)+))
         ),
     }
 }
@@ -432,13 +440,27 @@ macro_rules! panic {}
 macro_rules! assert {}
 #[rustc_builtin_macro]
 macro_rules! asm {}
+#[rustc_builtin_macro]
+macro_rules! concat {}
 
 macro_rules! toho {
     () => ($crate::panic!("not yet implemented"));
-    ($($arg:tt)+) => ($crate::panic!("not yet implemented: {}", $crate::format_args!($($arg)+)));
+    ($($arg:tt)+) => ($crate::panic!("not yet implemented: {}", format_args!($($arg)+)));
 }
 
 fn main() {
+    let a = '\n';
+    let a = '\t';
+    let a = '\e'; // invalid escape
+    let a = 'e';
+    let a = ' ';
+    let a = '\u{48}';
+    let a = '\u{4823}';
+    let a = '\x65';
+    let a = '\x00';
+
+    let a = b'\xFF';
+
     println!("Hello {{Hello}}");
     // from https://doc.rust-lang.org/std/fmt/index.html
     println!("Hello");                 // => "Hello"
@@ -493,8 +515,10 @@ fn main() {
     println!("Hello\nWorld");
     println!("\u{48}\x65\x6C\x6C\x6F World");
 
-    let _ = "\x28\x28\x00\x63\n";
-    let _ = b"\x28\x28\x00\x63\n";
+    let _ = "\x28\x28\x00\x63\xFF\u{FF}\n"; // invalid non-UTF8 escape sequences
+    let _ = b"\x28\x28\x00\x63\xFF\u{FF}\n"; // valid bytes, invalid unicodes
+    let _ = c"\u{FF}\xFF"; // valid bytes, valid unicodes
+    let backslash = r"\\";
 
     println!("{\x41}", A = 92);
     println!("{ничоси}", ничоси = 92);
@@ -505,8 +529,17 @@ fn main() {
     assert!(true, "{}", 1);
     assert!(true, "{} asdasd", 1);
     toho!("{}fmt", 0);
-    asm!("mov eax, {0}");
+    let i: u64 = 3;
+    let o: u64;
+    asm!(
+        "mov {0}, {1}",
+        "add {0}, 5",
+        out(reg) o,
+        in(reg) i,
+    );
+
     format_args!(concat!("{}"), "{}");
+    format_args!("{} {} {} {} {} {}", backslash, format_args!("{}", 0), foo, "bar", toho!(), backslash);
 }"#,
         expect_file!["./test_data/highlight_strings.html"],
         false,
@@ -774,6 +807,7 @@ fn test_extern_crate() {
 //- /main.rs crate:main deps:std,alloc
 extern crate std;
 extern crate alloc as abc;
+extern crate unresolved as definitely_unresolved;
 //- /std/lib.rs crate:std
 pub struct S;
 //- /alloc/lib.rs crate:alloc
@@ -1126,5 +1160,5 @@ fn benchmark_syntax_highlighting_parser() {
             .filter(|it| it.highlight.tag == HlTag::Symbol(SymbolKind::Function))
             .count()
     };
-    assert_eq!(hash, 1608);
+    assert_eq!(hash, 1169);
 }

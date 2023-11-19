@@ -1,11 +1,8 @@
 use super::*;
 
-use crate::clean::collapse_doc_fragments;
-
 use rustc_resolve::rustdoc::{unindent_doc_fragments, DocFragment, DocFragmentKind};
-use rustc_span::create_default_session_globals_then;
-use rustc_span::source_map::DUMMY_SP;
 use rustc_span::symbol::Symbol;
+use rustc_span::{create_default_session_globals_then, DUMMY_SP};
 
 fn create_doc_fragment(s: &str) -> Vec<DocFragment> {
     vec![DocFragment {
@@ -22,7 +19,8 @@ fn run_test(input: &str, expected: &str) {
     create_default_session_globals_then(|| {
         let mut s = create_doc_fragment(input);
         unindent_doc_fragments(&mut s);
-        assert_eq!(collapse_doc_fragments(&s), expected);
+        let attrs = Attributes { doc_strings: s, other_attrs: Default::default() };
+        assert_eq!(attrs.doc_value(), expected);
     });
 }
 
@@ -74,7 +72,7 @@ fn should_not_trim() {
 fn is_same_generic() {
     use crate::clean::types::{PrimitiveType, Type};
     use crate::formats::cache::Cache;
-    let cache = Cache::new(false);
+    let cache = Cache::new(false, false);
     let generic = Type::Generic(rustc_span::symbol::sym::Any);
     let unit = Type::Primitive(PrimitiveType::Unit);
     assert!(!generic.is_doc_subtype_of(&unit, &cache));

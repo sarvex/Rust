@@ -52,8 +52,9 @@ pub(crate) fn render_example_with_highlighting(
     out: &mut Buffer,
     tooltip: Tooltip,
     playground_button: Option<&str>,
+    extra_classes: &[String],
 ) {
-    write_header(out, "rust-example-rendered", None, tooltip);
+    write_header(out, "rust-example-rendered", None, tooltip, extra_classes);
     write_code(out, src, None, None);
     write_footer(out, playground_button);
 }
@@ -65,7 +66,13 @@ pub(crate) fn render_item_decl_with_highlighting(src: &str, out: &mut Buffer) {
     write!(out, "</pre>");
 }
 
-fn write_header(out: &mut Buffer, class: &str, extra_content: Option<Buffer>, tooltip: Tooltip) {
+fn write_header(
+    out: &mut Buffer,
+    class: &str,
+    extra_content: Option<Buffer>,
+    tooltip: Tooltip,
+    extra_classes: &[String],
+) {
     write!(
         out,
         "<div class=\"example-wrap{}\">",
@@ -100,9 +107,19 @@ fn write_header(out: &mut Buffer, class: &str, extra_content: Option<Buffer>, to
         out.push_buffer(extra);
     }
     if class.is_empty() {
-        write!(out, "<pre class=\"rust\">");
+        write!(
+            out,
+            "<pre class=\"rust{}{}\">",
+            if extra_classes.is_empty() { "" } else { " " },
+            extra_classes.join(" "),
+        );
     } else {
-        write!(out, "<pre class=\"rust {class}\">");
+        write!(
+            out,
+            "<pre class=\"rust {class}{}{}\">",
+            if extra_classes.is_empty() { "" } else { " " },
+            extra_classes.join(" "),
+        );
     }
     write!(out, "<code>");
 }
@@ -168,8 +185,8 @@ impl<'a, 'tcx, F: Write> TokenHandler<'a, 'tcx, F> {
         if self.pending_elems.is_empty() {
             return false;
         }
-        if let Some((_, parent_class)) = self.closing_tags.last() &&
-            can_merge(current_class, Some(*parent_class), "")
+        if let Some((_, parent_class)) = self.closing_tags.last()
+            && can_merge(current_class, Some(*parent_class), "")
         {
             for (text, class) in self.pending_elems.iter() {
                 string(self.out, Escape(text), *class, &self.href_context, false);
@@ -177,7 +194,9 @@ impl<'a, 'tcx, F: Write> TokenHandler<'a, 'tcx, F> {
         } else {
             // We only want to "open" the tag ourselves if we have more than one pending and if the
             // current parent tag is not the same as our pending content.
-            let close_tag = if self.pending_elems.len() > 1 && let Some(current_class) = current_class {
+            let close_tag = if self.pending_elems.len() > 1
+                && let Some(current_class) = current_class
+            {
                 Some(enter_span(self.out, current_class, &self.href_context))
             } else {
                 None
@@ -243,10 +262,12 @@ pub(super) fn write_code(
             Highlight::Token { text, class } => {
                 // If we received a `ExitSpan` event and then have a non-compatible `Class`, we
                 // need to close the `<span>`.
-                let need_current_class_update = if let Some(pending) = token_handler.pending_exit_span &&
-                    !can_merge(Some(pending), class, text) {
-                        token_handler.handle_exit_span();
-                        true
+                let need_current_class_update = if let Some(pending) =
+                    token_handler.pending_exit_span
+                    && !can_merge(Some(pending), class, text)
+                {
+                    token_handler.handle_exit_span();
+                    true
                 // If the two `Class` are different, time to flush the current content and start
                 // a new one.
                 } else if !can_merge(token_handler.current_class, class, text) {
@@ -276,7 +297,8 @@ pub(super) fn write_code(
                     }
                 }
                 if should_add {
-                    let closing_tag = enter_span(token_handler.out, class, &token_handler.href_context);
+                    let closing_tag =
+                        enter_span(token_handler.out, class, &token_handler.href_context);
                     token_handler.closing_tags.push((closing_tag, class));
                 }
 
@@ -285,8 +307,14 @@ pub(super) fn write_code(
             }
             Highlight::ExitSpan => {
                 token_handler.current_class = None;
-                token_handler.pending_exit_span =
-                    Some(token_handler.closing_tags.last().as_ref().expect("ExitSpan without EnterSpan").1);
+                token_handler.pending_exit_span = Some(
+                    token_handler
+                        .closing_tags
+                        .last()
+                        .as_ref()
+                        .expect("ExitSpan without EnterSpan")
+                        .1,
+                );
             }
         };
     });
@@ -449,7 +477,9 @@ impl<'a> PeekIter<'a> {
     }
     /// Returns the next item after the current one. It doesn't interfere with `peek_next` output.
     fn peek(&mut self) -> Option<&(TokenKind, &'a str)> {
-        if self.stored.is_empty() && let Some(next) = self.iter.next() {
+        if self.stored.is_empty()
+            && let Some(next) = self.iter.next()
+        {
             self.stored.push_back(next);
         }
         self.stored.front()
@@ -928,18 +958,16 @@ fn string_without_closing_tag<T: Display>(
     href_context: &Option<HrefContext<'_, '_>>,
     open_tag: bool,
 ) -> Option<&'static str> {
-    let Some(klass) = klass
-    else {
-        write!(out, "{}", text).unwrap();
+    let Some(klass) = klass else {
+        write!(out, "{text}").unwrap();
         return None;
     };
-    let Some(def_span) = klass.get_span()
-    else {
+    let Some(def_span) = klass.get_span() else {
         if !open_tag {
-            write!(out, "{}", text).unwrap();
+            write!(out, "{text}").unwrap();
             return None;
         }
-        write!(out, "<span class=\"{}\">{}", klass.as_html(), text).unwrap();
+        write!(out, "<span class=\"{klass}\">{text}", klass = klass.as_html()).unwrap();
         return Some("</span>");
     };
 
@@ -949,14 +977,17 @@ fn string_without_closing_tag<T: Display>(
             match t {
                 "self" | "Self" => write!(
                     &mut path,
-                    "<span class=\"{}\">{}</span>",
-                    Class::Self_(DUMMY_SP).as_html(),
-                    t
+                    "<span class=\"{klass}\">{t}</span>",
+                    klass = Class::Self_(DUMMY_SP).as_html(),
                 ),
                 "crate" | "super" => {
-                    write!(&mut path, "<span class=\"{}\">{}</span>", Class::KeyWord.as_html(), t)
+                    write!(
+                        &mut path,
+                        "<span class=\"{klass}\">{t}</span>",
+                        klass = Class::KeyWord.as_html(),
+                    )
                 }
-                t => write!(&mut path, "{}", t),
+                t => write!(&mut path, "{t}"),
             }
             .expect("Failed to build source HTML path");
             path
@@ -988,19 +1019,24 @@ fn string_without_closing_tag<T: Display>(
                     )
                     .ok()
                     .map(|(url, _, _)| url),
+                    LinkFromSrc::Doc(def_id) => {
+                        format::href_with_root_path(*def_id, context, Some(&href_context.root_path))
+                            .ok()
+                            .map(|(doc_link, _, _)| doc_link)
+                    }
                 }
             })
         {
             if !open_tag {
                 // We're already inside an element which has the same klass, no need to give it
                 // again.
-                write!(out, "<a href=\"{}\">{}", href, text_s).unwrap();
+                write!(out, "<a href=\"{href}\">{text_s}").unwrap();
             } else {
                 let klass_s = klass.as_html();
                 if klass_s.is_empty() {
-                    write!(out, "<a href=\"{}\">{}", href, text_s).unwrap();
+                    write!(out, "<a href=\"{href}\">{text_s}").unwrap();
                 } else {
-                    write!(out, "<a class=\"{}\" href=\"{}\">{}", klass_s, href, text_s).unwrap();
+                    write!(out, "<a class=\"{klass_s}\" href=\"{href}\">{text_s}").unwrap();
                 }
             }
             return Some("</a>");
@@ -1015,7 +1051,7 @@ fn string_without_closing_tag<T: Display>(
         out.write_str(&text_s).unwrap();
         Some("")
     } else {
-        write!(out, "<span class=\"{}\">{}", klass_s, text_s).unwrap();
+        write!(out, "<span class=\"{klass_s}\">{text_s}").unwrap();
         Some("</span>")
     }
 }

@@ -15,7 +15,6 @@
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/JSON.h"
-#include "llvm/Support/Host.h"
 #include "llvm/Support/Memory.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
@@ -26,7 +25,6 @@
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Vectorize.h"
 
 #define LLVM_VERSION_GE(major, minor)                                          \
   (LLVM_VERSION_MAJOR > (major) ||                                             \
@@ -92,10 +90,9 @@ enum LLVMRustAttribute {
   NoCfCheck = 35,
   ShadowCallStack = 36,
   AllocSize = 37,
-#if LLVM_VERSION_GE(15, 0)
   AllocatedPointer = 38,
   AllocAlign = 39,
-#endif
+  SanitizeSafeStack = 40,
 };
 
 typedef struct OpaqueRustString *RustStringRef;

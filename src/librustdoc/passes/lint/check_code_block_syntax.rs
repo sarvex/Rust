@@ -6,6 +6,7 @@ use rustc_errors::{
     Applicability, Diagnostic, Handler, LazyFallbackBundle,
 };
 use rustc_parse::parse_stream_from_source_str;
+use rustc_resolve::rustdoc::source_span_for_markdown_range;
 use rustc_session::parse::ParseSess;
 use rustc_span::hygiene::{AstPass, ExpnData, ExpnKind, LocalExpnId};
 use rustc_span::source_map::{FilePathMapping, SourceMap};
@@ -14,13 +15,14 @@ use rustc_span::{FileName, InnerSpan, DUMMY_SP};
 use crate::clean;
 use crate::core::DocContext;
 use crate::html::markdown::{self, RustCodeBlock};
-use crate::passes::source_span_for_markdown_range;
 
 pub(crate) fn visit_item(cx: &DocContext<'_>, item: &clean::Item) {
-    if let Some(dox) = &item.attrs.collapsed_doc_value() {
+    if let Some(dox) = &item.opt_doc_value() {
         let sp = item.attr_span(cx.tcx);
         let extra = crate::html::markdown::ExtraInfo::new(cx.tcx, item.item_id.expect_def_id(), sp);
-        for code_block in markdown::rust_code_blocks(dox, &extra) {
+        for code_block in
+            markdown::rust_code_blocks(dox, &extra, cx.tcx.features().custom_code_classes_in_docs)
+        {
             check_rust_syntax(cx, item, dox, code_block);
         }
     }
@@ -40,7 +42,7 @@ fn check_rust_syntax(
     let emitter = BufferEmitter { buffer: Lrc::clone(&buffer), fallback_bundle };
 
     let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
-    let handler = Handler::with_emitter(false, None, Box::new(emitter));
+    let handler = Handler::with_emitter(Box::new(emitter)).disable_warnings();
     let source = dox[code_block.code].to_owned();
     let sess = ParseSess::with_span_handler(handler, sm);
 
@@ -67,22 +69,25 @@ fn check_rust_syntax(
         return;
     }
 
-    let Some(local_id) = item.item_id.as_def_id().and_then(|x| x.as_local())
-        else {
-            // We don't need to check the syntax for other crates so returning
-            // without doing anything should not be a problem.
-            return;
-        };
+    let Some(local_id) = item.item_id.as_def_id().and_then(|x| x.as_local()) else {
+        // We don't need to check the syntax for other crates so returning
+        // without doing anything should not be a problem.
+        return;
+    };
 
     let empty_block = code_block.lang_string == Default::default() && code_block.is_fenced;
     let is_ignore = code_block.lang_string.ignore != markdown::Ignore::None;
 
     // The span and whether it is precise or not.
-    let (sp, precise_span) =
-        match source_span_for_markdown_range(cx.tcx, dox, &code_block.range, &item.attrs) {
-            Some(sp) => (sp, true),
-            None => (item.attr_span(cx.tcx), false),
-        };
+    let (sp, precise_span) = match source_span_for_markdown_range(
+        cx.tcx,
+        dox,
+        &code_block.range,
+        &item.attrs.doc_strings,
+    ) {
+        Some(sp) => (sp, true),
+        None => (item.attr_span(cx.tcx), false),
+    };
 
     let msg = if buffer.has_errors {
         "could not parse code block as Rust code"
@@ -108,7 +113,7 @@ fn check_rust_syntax(
                 // just give a `help` instead.
                 lint.span_help(
                     sp.from_inner(InnerSpan::new(0, 3)),
-                    format!("{}: ```text", explanation),
+                    format!("{explanation}: ```text"),
                 );
             } else if empty_block {
                 lint.span_suggestion(
@@ -119,7 +124,7 @@ fn check_rust_syntax(
                 );
             }
         } else if empty_block || is_ignore {
-            lint.help(format!("{}: ```text", explanation));
+            lint.help(format!("{explanation}: ```text"));
         }
 
         // FIXME(#67563): Provide more context for these errors by displaying the spans inline.
@@ -161,7 +166,7 @@ impl Emitter for BufferEmitter {
             .translate_message(&diag.message[0].0, &fluent_args)
             .unwrap_or_else(|e| panic!("{e}"));
 
-        buffer.messages.push(format!("error from rustc: {}", translated_main_message));
+        buffer.messages.push(format!("error from rustc: {translated_main_message}"));
         if diag.is_error() {
             buffer.has_errors = true;
         }

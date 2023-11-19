@@ -4,8 +4,10 @@ use crate::{
 };
 
 use rustc_hir as hir;
-use rustc_middle::{traits::util::supertraits, ty};
+use rustc_middle::ty;
+use rustc_session::lint::FutureIncompatibilityReason;
 use rustc_span::sym;
+use rustc_trait_selection::traits::supertraits;
 
 declare_lint! {
     /// The `deref_into_dyn_supertrait` lint is output whenever there is a use of the
@@ -48,6 +50,7 @@ declare_lint! {
     Warn,
     "`Deref` implementation usage with a supertrait trait object for output might be shadowed in the future",
     @future_incompatible = FutureIncompatibleInfo {
+        reason: FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps,
         reference: "issue #89460 <https://github.com/rust-lang/rust/issues/89460>",
     };
 }
@@ -59,7 +62,7 @@ impl<'tcx> LateLintPass<'tcx> for DerefIntoDynSupertrait {
         // `Deref` is being implemented for `t`
         if let hir::ItemKind::Impl(impl_) = item.kind
             && let Some(trait_) = &impl_.of_trait
-            && let t = cx.tcx.type_of(item.owner_id).subst_identity()
+            && let t = cx.tcx.type_of(item.owner_id).instantiate_identity()
             && let opt_did @ Some(did) = trait_.trait_def_id()
             && opt_did == cx.tcx.lang_items().deref_trait()
             // `t` is `dyn t_principal`
@@ -73,14 +76,16 @@ impl<'tcx> LateLintPass<'tcx> for DerefIntoDynSupertrait {
             && supertraits(cx.tcx, t_principal.with_self_ty(cx.tcx, cx.tcx.types.trait_object_dummy_self))
                 .any(|sup| sup.map_bound(|x| ty::ExistentialTraitRef::erase_self_ty(cx.tcx, x)) == target_principal)
         {
-            let label = impl_.items.iter().find_map(|i| (i.ident.name == sym::Target).then_some(i.span)).map(|label| SupertraitAsDerefTargetLabel {
-                label,
-            });
-            cx.emit_spanned_lint(DEREF_INTO_DYN_SUPERTRAIT, cx.tcx.def_span(item.owner_id.def_id), SupertraitAsDerefTarget {
-                t,
-                target_principal,
-                label,
-            });
+            let label = impl_
+                .items
+                .iter()
+                .find_map(|i| (i.ident.name == sym::Target).then_some(i.span))
+                .map(|label| SupertraitAsDerefTargetLabel { label });
+            cx.emit_spanned_lint(
+                DEREF_INTO_DYN_SUPERTRAIT,
+                cx.tcx.def_span(item.owner_id.def_id),
+                SupertraitAsDerefTarget { t, target_principal, label },
+            );
         }
     }
 }

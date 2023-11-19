@@ -47,7 +47,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             ExprKind::Block { block: ast_block } => {
                 this.ast_block(destination, block, ast_block, source_info)
             }
-            ExprKind::Match { scrutinee, ref arms } => {
+            ExprKind::Match { scrutinee, ref arms, .. } => {
                 this.match_expr(destination, expr_span, block, &this.thir[scrutinee], arms)
             }
             ExprKind::If { cond, then, else_opt, if_then_scope } => {
@@ -114,10 +114,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     true_block,
                     source_info,
                     destination,
-                    Constant {
+                    ConstOperand {
                         span: expr_span,
                         user_ty: None,
-                        literal: ConstantKind::from_bool(this.tcx, true),
+                        const_: Const::from_bool(this.tcx, true),
                     },
                 );
 
@@ -125,10 +125,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     false_block,
                     source_info,
                     destination,
-                    Constant {
+                    ConstOperand {
                         span: expr_span,
                         user_ty: None,
-                        literal: ConstantKind::from_bool(this.tcx, false),
+                        const_: Const::from_bool(this.tcx, false),
                     },
                 );
 
@@ -159,52 +159,44 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
             }
             ExprKind::LogicalOp { op, lhs, rhs } => {
-                // And:
-                //
-                // [block: If(lhs)] -true-> [else_block: dest = (rhs)]
-                //        | (false)
-                //  [shortcircuit_block: dest = false]
-                //
-                // Or:
-                //
-                // [block: If(lhs)] -false-> [else_block: dest = (rhs)]
-                //        | (true)
-                //  [shortcircuit_block: dest = true]
-
-                let (shortcircuit_block, mut else_block, join_block) = (
-                    this.cfg.start_new_block(),
-                    this.cfg.start_new_block(),
-                    this.cfg.start_new_block(),
-                );
-
-                let lhs = unpack!(block = this.as_local_operand(block, &this.thir[lhs]));
-                let blocks = match op {
-                    LogicalOp::And => (else_block, shortcircuit_block),
-                    LogicalOp::Or => (shortcircuit_block, else_block),
+                let condition_scope = this.local_scope();
+                let source_info = this.source_info(expr.span);
+                // We first evaluate the left-hand side of the predicate ...
+                let (then_block, else_block) =
+                    this.in_if_then_scope(condition_scope, expr.span, |this| {
+                        this.then_else_break(
+                            block,
+                            &this.thir[lhs],
+                            Some(condition_scope),
+                            condition_scope,
+                            source_info,
+                        )
+                    });
+                let (short_circuit, continuation, constant) = match op {
+                    LogicalOp::And => (else_block, then_block, false),
+                    LogicalOp::Or => (then_block, else_block, true),
                 };
-                let term = TerminatorKind::if_(lhs, blocks.0, blocks.1);
-                this.cfg.terminate(block, source_info, term);
-
+                // At this point, the control flow splits into a short-circuiting path
+                // and a continuation path.
+                // - If the operator is `&&`, passing `lhs` leads to continuation of evaluation on `rhs`;
+                //   failing it leads to the short-circuting path which assigns `false` to the place.
+                // - If the operator is `||`, failing `lhs` leads to continuation of evaluation on `rhs`;
+                //   passing it leads to the short-circuting path which assigns `true` to the place.
                 this.cfg.push_assign_constant(
-                    shortcircuit_block,
+                    short_circuit,
                     source_info,
                     destination,
-                    Constant {
-                        span: expr_span,
+                    ConstOperand {
+                        span: expr.span,
                         user_ty: None,
-                        literal: match op {
-                            LogicalOp::And => ConstantKind::from_bool(this.tcx, false),
-                            LogicalOp::Or => ConstantKind::from_bool(this.tcx, true),
-                        },
+                        const_: Const::from_bool(this.tcx, constant),
                     },
                 );
-                this.cfg.goto(shortcircuit_block, source_info, join_block);
-
-                let rhs = unpack!(else_block = this.as_local_operand(else_block, &this.thir[rhs]));
-                this.cfg.push_assign(else_block, source_info, destination, Rvalue::Use(rhs));
-                this.cfg.goto(else_block, source_info, join_block);
-
-                join_block.unit()
+                let rhs = unpack!(this.expr_into_dest(destination, continuation, &this.thir[rhs]));
+                let target = this.cfg.start_new_block();
+                this.cfg.goto(rhs, source_info, target);
+                this.cfg.goto(short_circuit, source_info, target);
+                target.unit()
             }
             ExprKind::Loop { body } => {
                 // [block]
@@ -277,7 +269,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             .ty
                             .is_inhabited_from(this.tcx, this.parent_module, this.param_env)
                             .then_some(success),
-                        from_hir_call,
+                        call_source: if from_hir_call {
+                            CallSource::Normal
+                        } else {
+                            CallSource::OverloadedOperator
+                        },
                         fn_span,
                     },
                 );
@@ -313,7 +309,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             ExprKind::Adt(box AdtExpr {
                 adt_def,
                 variant_index,
-                substs,
+                args,
                 ref user_ty,
                 ref fields,
                 ref base,
@@ -378,7 +374,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let adt = Box::new(AggregateKind::Adt(
                     adt_def.did(),
                     variant_index,
-                    substs,
+                    args,
                     user_ty,
                     active_field_index,
                 ));
@@ -437,12 +433,20 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         }
                         thir::InlineAsmOperand::Const { value, span } => {
                             mir::InlineAsmOperand::Const {
-                                value: Box::new(Constant { span, user_ty: None, literal: value }),
+                                value: Box::new(ConstOperand {
+                                    span,
+                                    user_ty: None,
+                                    const_: value,
+                                }),
                             }
                         }
                         thir::InlineAsmOperand::SymFn { value, span } => {
                             mir::InlineAsmOperand::SymFn {
-                                value: Box::new(Constant { span, user_ty: None, literal: value }),
+                                value: Box::new(ConstOperand {
+                                    span,
+                                    user_ty: None,
+                                    const_: value,
+                                }),
                             }
                         }
                         thir::InlineAsmOperand::SymStatic { def_id } => {
@@ -489,7 +493,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 block.unit()
             }
 
-            ExprKind::Continue { .. } | ExprKind::Break { .. } | ExprKind::Return { .. } => {
+            ExprKind::Continue { .. }
+            | ExprKind::Break { .. }
+            | ExprKind::Return { .. }
+            | ExprKind::Become { .. } => {
                 unpack!(block = this.stmt_expr(block, expr, None));
                 // No assign, as these have type `!`.
                 block.unit()
@@ -540,7 +547,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     source_info,
                     TerminatorKind::Yield { value, resume, resume_arg: destination, drop: None },
                 );
-                this.generator_drop_cleanup(block);
+                this.coroutine_drop_cleanup(block);
                 resume.unit()
             }
 
@@ -549,7 +556,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Binary { .. }
             | ExprKind::Box { .. }
             | ExprKind::Cast { .. }
-            | ExprKind::Pointer { .. }
+            | ExprKind::PointerCoercion { .. }
             | ExprKind::Repeat { .. }
             | ExprKind::Array { .. }
             | ExprKind::Tuple { .. }

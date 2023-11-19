@@ -12,8 +12,7 @@
 //! # Examples
 //!
 //! ```rust
-//! use std::collections::hash_map::DefaultHasher;
-//! use std::hash::{Hash, Hasher};
+//! use std::hash::{DefaultHasher, Hash, Hasher};
 //!
 //! #[derive(Hash)]
 //! struct Person {
@@ -46,8 +45,7 @@
 //! the [`Hash`] trait:
 //!
 //! ```rust
-//! use std::collections::hash_map::DefaultHasher;
-//! use std::hash::{Hash, Hasher};
+//! use std::hash::{DefaultHasher, Hash, Hasher};
 //!
 //! struct Person {
 //!     id: u32,
@@ -153,6 +151,11 @@ mod sip;
 /// Thankfully, you won't need to worry about upholding this property when
 /// deriving both [`Eq`] and `Hash` with `#[derive(PartialEq, Eq, Hash)]`.
 ///
+/// Violating this property is a logic error. The behavior resulting from a logic error is not
+/// specified, but users of the trait must ensure that such logic errors do *not* result in
+/// undefined behavior. This means that `unsafe` code **must not** rely on the correctness of these
+/// methods.
+///
 /// ## Prefix collisions
 ///
 /// Implementations of `hash` should ensure that the data they
@@ -189,8 +192,7 @@ pub trait Hash {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::hash_map::DefaultHasher;
-    /// use std::hash::{Hash, Hasher};
+    /// use std::hash::{DefaultHasher, Hash, Hasher};
     ///
     /// let mut hasher = DefaultHasher::new();
     /// 7920.hash(&mut hasher);
@@ -219,8 +221,7 @@ pub trait Hash {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::hash_map::DefaultHasher;
-    /// use std::hash::{Hash, Hasher};
+    /// use std::hash::{DefaultHasher, Hash, Hasher};
     ///
     /// let mut hasher = DefaultHasher::new();
     /// let numbers = [6, 28, 496, 8128];
@@ -295,8 +296,7 @@ pub use macros::Hash;
 /// # Examples
 ///
 /// ```
-/// use std::collections::hash_map::DefaultHasher;
-/// use std::hash::Hasher;
+/// use std::hash::{DefaultHasher, Hasher};
 ///
 /// let mut hasher = DefaultHasher::new();
 ///
@@ -324,8 +324,7 @@ pub trait Hasher {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::hash_map::DefaultHasher;
-    /// use std::hash::Hasher;
+    /// use std::hash::{DefaultHasher, Hasher};
     ///
     /// let mut hasher = DefaultHasher::new();
     /// hasher.write(b"Cool!");
@@ -342,8 +341,7 @@ pub trait Hasher {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::hash_map::DefaultHasher;
-    /// use std::hash::Hasher;
+    /// use std::hash::{DefaultHasher, Hasher};
     ///
     /// let mut hasher = DefaultHasher::new();
     /// let data = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
@@ -622,8 +620,7 @@ impl<H: Hasher + ?Sized> Hasher for &mut H {
 /// # Examples
 ///
 /// ```
-/// use std::collections::hash_map::RandomState;
-/// use std::hash::{BuildHasher, Hasher};
+/// use std::hash::{BuildHasher, Hasher, RandomState};
 ///
 /// let s = RandomState::new();
 /// let mut hasher_1 = s.build_hasher();
@@ -651,8 +648,7 @@ pub trait BuildHasher {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::hash_map::RandomState;
-    /// use std::hash::BuildHasher;
+    /// use std::hash::{BuildHasher, RandomState};
     ///
     /// let s = RandomState::new();
     /// let new_s = s.build_hasher();
@@ -674,8 +670,6 @@ pub trait BuildHasher {
     /// # Example
     ///
     /// ```
-    /// #![feature(build_hasher_simple_hash_one)]
-    ///
     /// use std::cmp::{max, min};
     /// use std::hash::{BuildHasher, Hash, Hasher};
     /// struct OrderAmbivalentPair<T: Ord>(T, T);
@@ -687,7 +681,7 @@ pub trait BuildHasher {
     /// }
     ///
     /// // Then later, in a `#[test]` for the type...
-    /// let bh = std::collections::hash_map::RandomState::new();
+    /// let bh = std::hash::RandomState::new();
     /// assert_eq!(
     ///     bh.hash_one(OrderAmbivalentPair(1, 2)),
     ///     bh.hash_one(OrderAmbivalentPair(2, 1))
@@ -697,7 +691,7 @@ pub trait BuildHasher {
     ///     bh.hash_one(&OrderAmbivalentPair(2, 10))
     /// );
     /// ```
-    #[unstable(feature = "build_hasher_simple_hash_one", issue = "86161")]
+    #[stable(feature = "build_hasher_simple_hash_one", since = "1.71.0")]
     fn hash_one<T: Hash>(&self, x: T) -> u64
     where
         Self: Sized,

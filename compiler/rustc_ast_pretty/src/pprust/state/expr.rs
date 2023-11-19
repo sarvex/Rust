@@ -352,7 +352,7 @@ impl<'a> State<'a> {
                 self.end();
                 self.word(")");
             }
-            ast::ExprKind::Let(pat, scrutinee, _) => {
+            ast::ExprKind::Let(pat, scrutinee, _, _) => {
                 self.print_let(pat, scrutinee);
             }
             ast::ExprKind::If(test, blk, elseopt) => self.print_if(test, blk, elseopt.as_deref()),
@@ -445,8 +445,8 @@ impl<'a> State<'a> {
                 self.ibox(0);
                 self.print_block_with_attrs(blk, attrs);
             }
-            ast::ExprKind::Async(capture_clause, blk) => {
-                self.word_nbsp("async");
+            ast::ExprKind::Gen(capture_clause, blk, kind) => {
+                self.word_nbsp(kind.modifier());
                 self.print_capture_clause(*capture_clause);
                 // cbox/ibox in analogy to the `ExprKind::Block` arm above
                 self.cbox(0);
@@ -477,7 +477,7 @@ impl<'a> State<'a> {
                 self.word(".");
                 self.print_ident(*ident);
             }
-            ast::ExprKind::Index(expr, index) => {
+            ast::ExprKind::Index(expr, index, _) => {
                 self.print_expr_maybe_paren(expr, parser::PREC_POSTFIX);
                 self.word("[");
                 self.print_expr(index);
@@ -537,6 +537,11 @@ impl<'a> State<'a> {
                     self.print_expr_maybe_paren(expr, parser::PREC_JUMP);
                 }
             }
+            ast::ExprKind::Become(result) => {
+                self.word("become");
+                self.word(" ");
+                self.print_expr_maybe_paren(result, parser::PREC_JUMP);
+            }
             ast::ExprKind::InlineAsm(a) => {
                 // FIXME: This should have its own syntax, distinct from a macro invocation.
                 self.word("asm!");
@@ -556,8 +561,7 @@ impl<'a> State<'a> {
                 self.pclose();
             }
             ast::ExprKind::OffsetOf(container, fields) => {
-                // FIXME: This should have its own syntax, distinct from a macro invocation.
-                self.word("offset_of!");
+                self.word("builtin # offset_of");
                 self.popen();
                 self.rbox(0, Inconsistent);
                 self.print_type(container);
@@ -669,7 +673,7 @@ impl<'a> State<'a> {
 
     fn print_capture_clause(&mut self, capture_clause: ast::CaptureBy) {
         match capture_clause {
-            ast::CaptureBy::Value => self.word_space("move"),
+            ast::CaptureBy::Value { .. } => self.word_space("move"),
             ast::CaptureBy::Ref => {}
         }
     }
@@ -680,8 +684,8 @@ pub fn reconstruct_format_args_template_string(pieces: &[FormatArgsPiece]) -> St
     for piece in pieces {
         match piece {
             FormatArgsPiece::Literal(s) => {
-                for c in s.as_str().escape_debug() {
-                    template.push(c);
+                for c in s.as_str().chars() {
+                    template.extend(c.escape_debug());
                     if let '{' | '}' = c {
                         template.push(c);
                     }
@@ -693,15 +697,15 @@ pub fn reconstruct_format_args_template_string(pieces: &[FormatArgsPiece]) -> St
                 write!(template, "{n}").unwrap();
                 if p.format_options != Default::default() || p.format_trait != FormatTrait::Display
                 {
-                    template.push_str(":");
+                    template.push(':');
                 }
                 if let Some(fill) = p.format_options.fill {
                     template.push(fill);
                 }
                 match p.format_options.alignment {
-                    Some(FormatAlignment::Left) => template.push_str("<"),
-                    Some(FormatAlignment::Right) => template.push_str(">"),
-                    Some(FormatAlignment::Center) => template.push_str("^"),
+                    Some(FormatAlignment::Left) => template.push('<'),
+                    Some(FormatAlignment::Right) => template.push('>'),
+                    Some(FormatAlignment::Center) => template.push('^'),
                     None => {}
                 }
                 match p.format_options.sign {

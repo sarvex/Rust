@@ -4,6 +4,9 @@
 //! The goal is to move the definition of `MetaItem` and things that don't need to be in `syntax`
 //! to this crate.
 
+#![allow(internal_features)]
+#![feature(rustdoc_internals)]
+#![doc(rust_logo)]
 #![feature(let_chains)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
@@ -24,6 +27,6 @@ pub use StabilityLevel::*;
 
 pub use rustc_ast::attr::*;
 
-pub(crate) use rustc_ast::HashStableContext;
+pub(crate) use rustc_session::HashStableContext;
 
 fluent_messages! { "../messages.ftl" }

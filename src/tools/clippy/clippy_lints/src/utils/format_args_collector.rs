@@ -1,23 +1,24 @@
-use clippy_utils::macros::collect_ast_format_args;
+use clippy_utils::macros::AST_FORMAT_ARGS;
 use clippy_utils::source::snippet_opt;
 use itertools::Itertools;
-use rustc_ast::{Expr, ExprKind, FormatArgs};
+use rustc_ast::{Crate, Expr, ExprKind, FormatArgs};
+use rustc_data_structures::fx::FxHashMap;
 use rustc_lexer::{tokenize, TokenKind};
 use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
-use rustc_span::hygiene;
+use rustc_session::impl_lint_pass;
+use rustc_span::{hygiene, Span};
 use std::iter::once;
+use std::mem;
+use std::rc::Rc;
 
-declare_clippy_lint! {
-    /// ### What it does
-    /// Collects [`rustc_ast::FormatArgs`] so that future late passes can call
-    /// [`clippy_utils::macros::find_format_args`]
-    pub FORMAT_ARGS_COLLECTOR,
-    internal_warn,
-    "collects `format_args` AST nodes for use in later lints"
+/// Collects [`rustc_ast::FormatArgs`] so that future late passes can call
+/// [`clippy_utils::macros::find_format_args`]
+#[derive(Default)]
+pub struct FormatArgsCollector {
+    format_args: FxHashMap<Span, Rc<FormatArgs>>,
 }
 
-declare_lint_pass!(FormatArgsCollector => [FORMAT_ARGS_COLLECTOR]);
+impl_lint_pass!(FormatArgsCollector => []);
 
 impl EarlyLintPass for FormatArgsCollector {
     fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &Expr) {
@@ -26,8 +27,16 @@ impl EarlyLintPass for FormatArgsCollector {
                 return;
             }
 
-            collect_ast_format_args(expr.span, args);
+            self.format_args
+                .insert(expr.span.with_parent(None), Rc::new((**args).clone()));
         }
+    }
+
+    fn check_crate_post(&mut self, _: &EarlyContext<'_>, _: &Crate) {
+        AST_FORMAT_ARGS.with(|ast_format_args| {
+            let result = ast_format_args.set(mem::take(&mut self.format_args));
+            debug_assert!(result.is_ok());
+        });
     }
 }
 
@@ -71,7 +80,9 @@ fn has_span_from_proc_macro(cx: &EarlyContext<'_>, args: &FormatArgs) -> bool {
     for between_span in between_spans {
         let mut seen_comma = false;
 
-        let Some(snippet) = snippet_opt(cx, between_span) else { return true };
+        let Some(snippet) = snippet_opt(cx, between_span) else {
+            return true;
+        };
         for token in tokenize(&snippet) {
             match token.kind {
                 TokenKind::LineComment { .. } | TokenKind::BlockComment { .. } | TokenKind::Whitespace => {},

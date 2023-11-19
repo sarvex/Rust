@@ -11,6 +11,13 @@ struct S<T> {
 
 impl<T: ConstParamTy> ConstParamTy for S<T> {}
 
+#[derive(PartialEq, Eq, ConstParamTy)]
+struct D<T> {
+    field: u8,
+    gen: T,
+}
+
+
 fn check<T: ConstParamTy + ?Sized>() {}
 
 fn main() {
@@ -39,5 +46,10 @@ fn main() {
     check::<S<u8>>();
     check::<S<[&[bool]; 8]>>();
 
-    // FIXME: test tuples
+    check::<D<u8>>();
+    check::<D<[&[bool]; 8]>>();
+
+    check::<()>();
+    check::<(i32,)>();
+    check::<(D<u8>, D<i32>)>();
 }

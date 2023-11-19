@@ -1,6 +1,6 @@
 // edition: 2021
 
-#![feature(return_type_notation, async_fn_in_trait)]
+#![feature(return_type_notation)]
 //~^ WARN the feature `return_type_notation` is incomplete
 
 trait Trait {
@@ -8,6 +8,6 @@ trait Trait {
 }
 
 fn bar<T: Trait<methid(): Send>>() {}
-//~^ ERROR cannot find associated function `methid` in trait `Trait`
+//~^ ERROR cannot find associated function `methid` for `Trait`
 
 fn main() {}

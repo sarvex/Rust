@@ -2,11 +2,9 @@
 #![feature(let_chains)]
 #![feature(try_blocks)]
 #![feature(never_type)]
+#![feature(box_patterns)]
 #![feature(min_specialization)]
 #![feature(control_flow_enum)]
-#![feature(drain_filter)]
-#![feature(option_as_slice)]
-#![allow(rustc::potential_query_instability)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -33,7 +31,6 @@ pub mod expr_use_visitor;
 mod fallback;
 mod fn_ctxt;
 mod gather_locals;
-mod generator_interior;
 mod inherited;
 mod intrinsicck;
 mod mem_categorization;
@@ -67,13 +64,12 @@ use rustc_hir::{HirIdMap, Node};
 use rustc_hir_analysis::astconv::AstConv;
 use rustc_hir_analysis::check::check_abi;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
+use rustc_middle::query::Providers;
 use rustc_middle::traits;
-use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_session::config;
-use rustc_session::Session;
 use rustc_span::def_id::{DefId, LocalDefId};
-use rustc_span::{sym, Span};
+use rustc_span::Span;
 
 fluent_messages! { "../messages.ftl" }
 
@@ -90,13 +86,6 @@ macro_rules! type_error_struct {
     })
 }
 
-/// The type of a local binding, including the revealed type for anon types.
-#[derive(Copy, Clone, Debug)]
-pub struct LocalTy<'tcx> {
-    decl_ty: Ty<'tcx>,
-    revealed_ty: Ty<'tcx>,
-}
-
 /// If this `DefId` is a "primary tables entry", returns
 /// `Some((body_id, body_ty, fn_sig))`. Otherwise, returns `None`.
 ///
@@ -110,7 +99,7 @@ fn primary_body_of(
 ) -> Option<(hir::BodyId, Option<&hir::Ty<'_>>, Option<&hir::FnSig<'_>>)> {
     match node {
         Node::Item(item) => match item.kind {
-            hir::ItemKind::Const(ty, body) | hir::ItemKind::Static(ty, _, body) => {
+            hir::ItemKind::Const(ty, _, body) | hir::ItemKind::Static(ty, _, body) => {
                 Some((body, Some(ty), None))
             }
             hir::ItemKind::Fn(ref sig, .., body) => Some((body, None, Some(sig))),
@@ -149,11 +138,11 @@ fn has_typeck_results(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 }
 
 fn used_trait_imports(tcx: TyCtxt<'_>, def_id: LocalDefId) -> &UnordSet<LocalDefId> {
-    &*tcx.typeck(def_id).used_trait_imports
+    &tcx.typeck(def_id).used_trait_imports
 }
 
 fn typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::TypeckResults<'tcx> {
-    let fallback = move || tcx.type_of(def_id.to_def_id()).subst_identity();
+    let fallback = move || tcx.type_of(def_id.to_def_id()).instantiate_identity();
     typeck_with_fallback(tcx, def_id, fallback)
 }
 
@@ -162,7 +151,7 @@ fn typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::TypeckResults<'tc
 fn diagnostic_only_typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::TypeckResults<'tcx> {
     let fallback = move || {
         let span = tcx.hir().span(tcx.hir().local_def_id_to_hir_id(def_id));
-        tcx.ty_error_with_message(span, "diagnostic only typeck table used")
+        Ty::new_error_with_message(tcx, span, "diagnostic only typeck table used")
     };
     typeck_with_fallback(tcx, def_id, fallback)
 }
@@ -191,11 +180,7 @@ fn typeck_with_fallback<'tcx>(
     let body = tcx.hir().body(body_id);
 
     let param_env = tcx.param_env(def_id);
-    let param_env = if tcx.has_attr(def_id, sym::rustc_do_not_const_check) {
-        param_env.without_const()
-    } else {
-        param_env
-    };
+
     let inh = Inherited::new(tcx, def_id);
     let mut fcx = FnCtxt::new(&inh, param_env, def_id);
 
@@ -203,7 +188,7 @@ fn typeck_with_fallback<'tcx>(
         let fn_sig = if rustc_hir_analysis::collect::get_infer_ret_ty(&decl.output).is_some() {
             fcx.astconv().ty_of_fn(id, header.unsafety, header.abi, decl, None, None)
         } else {
-            tcx.fn_sig(def_id).subst_identity()
+            tcx.fn_sig(def_id).instantiate_identity()
         };
 
         check_abi(tcx, id, span, fn_sig.abi());
@@ -212,7 +197,7 @@ fn typeck_with_fallback<'tcx>(
         let fn_sig = tcx.liberate_late_bound_regions(def_id.to_def_id(), fn_sig);
         let fn_sig = fcx.normalize(body.value.span, fn_sig);
 
-        check_fn(&mut fcx, fn_sig, decl, def_id, body, None);
+        check_fn(&mut fcx, fn_sig, decl, def_id, body, None, tcx.features().unsized_fn_params);
     } else {
         let expected_type = if let Some(&hir::Ty { kind: hir::TyKind::Infer, span, .. }) = body_ty {
             Some(fcx.next_ty_var(TypeVariableOrigin {
@@ -270,15 +255,11 @@ fn typeck_with_fallback<'tcx>(
     fcx.check_casts();
     fcx.select_obligations_where_possible(|_| {});
 
-    // Closure and generator analysis may run after fallback
+    // Closure and coroutine analysis may run after fallback
     // because they don't constrain other type variables.
-    // Closure analysis only runs on closures. Therefore they only need to fulfill non-const predicates (as of now)
-    let prev_constness = fcx.param_env.constness();
-    fcx.param_env = fcx.param_env.without_const();
     fcx.closure_analyze(body);
-    fcx.param_env = fcx.param_env.with_constness(prev_constness);
     assert!(fcx.deferred_call_resolutions.borrow().is_empty());
-    // Before the generator analysis, temporary scopes shall be marked to provide more
+    // Before the coroutine analysis, temporary scopes shall be marked to provide more
     // precise information on types to be captured.
     fcx.resolve_rvalue_scopes(def_id.to_def_id());
 
@@ -292,7 +273,7 @@ fn typeck_with_fallback<'tcx>(
     debug!(pending_obligations = ?fcx.fulfillment_cx.borrow().pending_obligations());
 
     // This must be the last thing before `report_ambiguity_errors`.
-    fcx.resolve_generator_interiors(def_id.to_def_id());
+    fcx.resolve_coroutine_interiors(def_id.to_def_id());
 
     debug!(pending_obligations = ?fcx.fulfillment_cx.borrow().pending_obligations());
 
@@ -317,20 +298,20 @@ fn typeck_with_fallback<'tcx>(
     typeck_results
 }
 
-/// When `check_fn` is invoked on a generator (i.e., a body that
+/// When `check_fn` is invoked on a coroutine (i.e., a body that
 /// includes yield), it returns back some information about the yield
 /// points.
-struct GeneratorTypes<'tcx> {
-    /// Type of generator argument / values returned by `yield`.
+struct CoroutineTypes<'tcx> {
+    /// Type of coroutine argument / values returned by `yield`.
     resume_ty: Ty<'tcx>,
 
     /// Type of value that is yielded.
     yield_ty: Ty<'tcx>,
 
-    /// Types that are captured (see `GeneratorInterior` for more).
+    /// Types that are captured (see `CoroutineInterior` for more).
     interior: Ty<'tcx>,
 
-    /// Indicates if the generator is movable or static (immovable).
+    /// Indicates if the coroutine is movable or static (immovable).
     movability: hir::Movability,
 }
 
@@ -437,8 +418,8 @@ enum TupleArgumentsFlag {
     TupleArguments,
 }
 
-fn fatally_break_rust(sess: &Session) {
-    let handler = sess.diagnostic();
+fn fatally_break_rust(tcx: TyCtxt<'_>) {
+    let handler = tcx.sess.diagnostic();
     handler.span_bug_no_panic(
         MultiSpan::new(),
         "It looks like you're trying to break rust; would you like some ICE?",
@@ -450,9 +431,15 @@ fn fatally_break_rust(sess: &Session) {
     );
     handler.note_without_error(format!(
         "rustc {} running on {}",
-        option_env!("CFG_VERSION").unwrap_or("unknown_version"),
+        tcx.sess.cfg_version,
         config::host_triple(),
     ));
+    if let Some((flags, excluded_cargo_defaults)) = rustc_session::utils::extra_compiler_flags() {
+        handler.note_without_error(format!("compiler flags: {}", flags.join(" ")));
+        if excluded_cargo_defaults {
+            handler.note_without_error("some of the compiler flags provided by cargo are hidden");
+        }
+    }
 }
 
 fn has_expected_num_generic_args(tcx: TyCtxt<'_>, trait_did: DefId, expected: usize) -> bool {

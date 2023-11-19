@@ -1,6 +1,6 @@
 #![feature(no_core, lang_items, never_type, linkage, extern_types, thread_local, repr_simd)]
 #![no_core]
-#![allow(dead_code, non_camel_case_types)]
+#![allow(dead_code, non_camel_case_types, internal_features)]
 
 extern crate mini_core;
 
@@ -322,7 +322,12 @@ fn main() {
     #[cfg(all(not(jit), not(all(windows, target_env = "gnu"))))]
     test_tls();
 
-    #[cfg(all(not(jit), target_arch = "x86_64", any(target_os = "linux", target_os = "darwin")))]
+    #[cfg(all(
+        not(jit),
+        not(no_unstable_features),
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     unsafe {
         global_asm_test();
     }
@@ -348,14 +353,30 @@ fn main() {
 
     let f = V([0.0, 1.0]);
     let _a = f.0[0];
+
+    stack_val_align();
 }
 
-#[cfg(all(not(jit), target_arch = "x86_64", any(target_os = "linux", target_os = "darwin")))]
+#[inline(never)]
+fn stack_val_align() {
+    #[repr(align(8192))]
+    struct Foo(u8);
+
+    let a = Foo(0);
+    assert_eq!(&a as *const Foo as usize % 8192, 0);
+}
+
+#[cfg(all(
+    not(jit),
+    not(no_unstable_features),
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "macos")
+))]
 extern "C" {
     fn global_asm_test();
 }
 
-#[cfg(all(not(jit), target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(not(jit), not(no_unstable_features), target_arch = "x86_64", target_os = "linux"))]
 global_asm! {
     "
     .global global_asm_test
@@ -365,7 +386,7 @@ global_asm! {
     "
 }
 
-#[cfg(all(not(jit), target_arch = "x86_64", target_os = "darwin"))]
+#[cfg(all(not(jit), not(no_unstable_features), target_arch = "x86_64", target_os = "macos"))]
 global_asm! {
     "
     .global _global_asm_test

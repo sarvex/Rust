@@ -149,7 +149,7 @@ fn resolve_block<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, blk: &'tcx h
                     // From now on, we continue normally.
                     visitor.cx = prev_cx;
                 }
-                hir::StmtKind::Local(..) | hir::StmtKind::Item(..) => {
+                hir::StmtKind::Local(..) => {
                     // Each declaration introduces a subscope for bindings
                     // introduced by the declaration; this subscope covers a
                     // suffix of the block. Each subscope in a block has the
@@ -162,6 +162,10 @@ fn resolve_block<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, blk: &'tcx h
                     });
                     visitor.cx.var_parent = visitor.cx.parent;
                     visitor.visit_stmt(statement)
+                }
+                hir::StmtKind::Item(..) => {
+                    // Don't create scopes for items, since they won't be
+                    // lowered to THIR and MIR.
                 }
                 hir::StmtKind::Expr(..) | hir::StmtKind::Semi(..) => visitor.visit_stmt(statement),
             }
@@ -392,7 +396,7 @@ fn resolve_expr<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, expr: &'tcx h
         // Manually recurse over closures and inline consts, because they are the only
         // case of nested bodies that share the parent environment.
         hir::ExprKind::Closure(&hir::Closure { body, .. })
-        | hir::ExprKind::ConstBlock(hir::AnonConst { body, .. }) => {
+        | hir::ExprKind::ConstBlock(hir::ConstBlock { body, .. }) => {
             let body = visitor.tcx.hir().body(body);
             visitor.visit_body(body);
         }
@@ -594,7 +598,7 @@ fn resolve_local<'tcx>(
     }
 
     // Make sure we visit the initializer first, so expr_and_pat_count remains correct.
-    // The correct order, as shared between generator_interior, drop_ranges and intravisitor,
+    // The correct order, as shared between coroutine_interior, drop_ranges and intravisitor,
     // is to walk initializer, followed by pattern bindings, finally followed by the `else` block.
     if let Some(expr) = init {
         visitor.visit_expr(expr);
@@ -821,7 +825,7 @@ impl<'tcx> Visitor<'tcx> for RegionResolutionVisitor<'tcx> {
             resolve_local(self, None, Some(&body.value));
         }
 
-        if body.generator_kind.is_some() {
+        if body.coroutine_kind.is_some() {
             self.scope_tree.body_expr_count.insert(body_id, self.expr_and_pat_count);
         }
 

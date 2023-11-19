@@ -1,4 +1,5 @@
 [workspace]
+resolver = "1"
 members = [
   "compiler/rustc",
   "library/std",
@@ -39,6 +40,10 @@ members = [
   "src/tools/collect-license-metadata",
   "src/tools/generate-copyright",
   "src/tools/suggest-tests",
+  "src/tools/generate-windows-sys",
+  "src/tools/rustdoc-gui-test",
+  "src/tools/opt-dist",
+  "src/tools/coverage-dump",
 ]
 
 exclude = [

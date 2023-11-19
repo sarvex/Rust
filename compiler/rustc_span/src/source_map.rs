@@ -9,19 +9,15 @@
 //! within the `SourceMap`, which upon request can be converted to line and column
 //! information, source code snippets, etc.
 
-pub use crate::hygiene::{ExpnData, ExpnKind};
-pub use crate::*;
-
+use crate::*;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::{Hash128, Hash64, StableHasher};
-use rustc_data_structures::sync::{AtomicU32, Lrc, MappedReadGuard, ReadGuard, RwLock};
+use rustc_data_structures::sync::{IntoDynSyncSend, Lrc, MappedReadGuard, ReadGuard, RwLock};
 use std::cmp;
-use std::hash::Hash;
-use std::path::{self, Path, PathBuf};
-use std::sync::atomic::Ordering;
-
 use std::fs;
-use std::io;
+use std::hash::Hash;
+use std::io::{self, BorrowedBuf, Read};
+use std::path::{self, Path, PathBuf};
 
 #[cfg(test)]
 mod tests;
@@ -40,7 +36,7 @@ pub fn original_sp(sp: Span, enclosing_sp: Span) -> Span {
     }
 }
 
-pub mod monotonic {
+mod monotonic {
     use std::ops::{Deref, DerefMut};
 
     /// A `MonotonicVec` is a `Vec` which can only be grown.
@@ -50,18 +46,14 @@ pub mod monotonic {
     // field is inaccessible
     pub struct MonotonicVec<T>(Vec<T>);
     impl<T> MonotonicVec<T> {
-        pub fn new(val: Vec<T>) -> MonotonicVec<T> {
-            MonotonicVec(val)
-        }
-
-        pub fn push(&mut self, val: T) {
+        pub(super) fn push(&mut self, val: T) {
             self.0.push(val);
         }
     }
 
     impl<T> Default for MonotonicVec<T> {
         fn default() -> Self {
-            MonotonicVec::new(vec![])
+            MonotonicVec(vec![])
         }
     }
 
@@ -99,10 +91,13 @@ pub trait FileLoader {
     fn file_exists(&self, path: &Path) -> bool;
 
     /// Read the contents of a UTF-8 file into memory.
+    /// This function must return a String because we normalize
+    /// source files, which may require resizing.
     fn read_file(&self, path: &Path) -> io::Result<String>;
 
     /// Read the contents of a potentially non-UTF-8 file into memory.
-    fn read_binary_file(&self, path: &Path) -> io::Result<Vec<u8>>;
+    /// We don't normalize binary files, so we can start in an Lrc.
+    fn read_binary_file(&self, path: &Path) -> io::Result<Lrc<[u8]>>;
 }
 
 /// A FileLoader that uses std::fs to load real files.
@@ -117,8 +112,45 @@ impl FileLoader for RealFileLoader {
         fs::read_to_string(path)
     }
 
-    fn read_binary_file(&self, path: &Path) -> io::Result<Vec<u8>> {
-        fs::read(path)
+    fn read_binary_file(&self, path: &Path) -> io::Result<Lrc<[u8]>> {
+        let mut file = fs::File::open(path)?;
+        let len = file.metadata()?.len();
+
+        let mut bytes = Lrc::new_uninit_slice(len as usize);
+        let mut buf = BorrowedBuf::from(Lrc::get_mut(&mut bytes).unwrap());
+        match file.read_buf_exact(buf.unfilled()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                drop(bytes);
+                return fs::read(path).map(Vec::into);
+            }
+            Err(e) => return Err(e),
+        }
+        // SAFETY: If the read_buf_exact call returns Ok(()), then we have
+        // read len bytes and initialized the buffer.
+        let bytes = unsafe { bytes.assume_init() };
+
+        // At this point, we've read all the bytes that filesystem metadata reported exist.
+        // But we are not guaranteed to be at the end of the file, because we did not attempt to do
+        // a read with a non-zero-sized buffer and get Ok(0).
+        // So we do small read to a fixed-size buffer. If the read returns no bytes then we're
+        // already done, and we just return the Lrc we built above.
+        // If the read returns bytes however, we just fall back to reading into a Vec then turning
+        // that into an Lrc, losing our nice peak memory behavior. This fallback code path should
+        // be rarely exercised.
+
+        let mut probe = [0u8; 32];
+        let n = loop {
+            match file.read(&mut probe) {
+                Ok(0) => return Ok(bytes),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+                Ok(n) => break n,
+            }
+        };
+        let mut bytes: Vec<u8> = bytes.iter().copied().chain(probe[..n].iter().copied()).collect();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes.into())
     }
 }
 
@@ -166,17 +198,14 @@ impl StableSourceFileId {
 //
 
 #[derive(Default)]
-pub(super) struct SourceMapFiles {
+struct SourceMapFiles {
     source_files: monotonic::MonotonicVec<Lrc<SourceFile>>,
     stable_id_to_source_file: FxHashMap<StableSourceFileId, Lrc<SourceFile>>,
 }
 
 pub struct SourceMap {
-    /// The address space below this value is currently used by the files in the source map.
-    used_address_space: AtomicU32,
-
     files: RwLock<SourceMapFiles>,
-    file_loader: Box<dyn FileLoader + Sync + Send>,
+    file_loader: IntoDynSyncSend<Box<dyn FileLoader + Sync + Send>>,
     // This is used to apply the file path remapping as specified via
     // `--remap-path-prefix` to all `SourceFile`s allocated within this `SourceMap`.
     path_mapping: FilePathMapping,
@@ -200,9 +229,8 @@ impl SourceMap {
         hash_kind: SourceFileHashAlgorithm,
     ) -> SourceMap {
         SourceMap {
-            used_address_space: AtomicU32::new(0),
             files: Default::default(),
-            file_loader,
+            file_loader: IntoDynSyncSend(file_loader),
             path_mapping,
             hash_kind,
         }
@@ -226,7 +254,7 @@ impl SourceMap {
     ///
     /// Unlike `load_file`, guarantees that no normalization like BOM-removal
     /// takes place.
-    pub fn load_binary_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+    pub fn load_binary_file(&self, path: &Path) -> io::Result<Lrc<[u8]>> {
         let bytes = self.file_loader.read_binary_file(path)?;
 
         // We need to add file to the `SourceMap`, so that it is present
@@ -252,26 +280,26 @@ impl SourceMap {
         self.files.borrow().stable_id_to_source_file.get(&stable_id).cloned()
     }
 
-    fn allocate_address_space(&self, size: usize) -> Result<usize, OffsetOverflowError> {
-        let size = u32::try_from(size).map_err(|_| OffsetOverflowError)?;
+    fn register_source_file(
+        &self,
+        file_id: StableSourceFileId,
+        mut file: SourceFile,
+    ) -> Result<Lrc<SourceFile>, OffsetOverflowError> {
+        let mut files = self.files.borrow_mut();
 
-        loop {
-            let current = self.used_address_space.load(Ordering::Relaxed);
-            let next = current
-                .checked_add(size)
-                // Add one so there is some space between files. This lets us distinguish
-                // positions in the `SourceMap`, even in the presence of zero-length files.
-                .and_then(|next| next.checked_add(1))
-                .ok_or(OffsetOverflowError)?;
+        file.start_pos = BytePos(if let Some(last_file) = files.source_files.last() {
+            // Add one so there is some space between files. This lets us distinguish
+            // positions in the `SourceMap`, even in the presence of zero-length files.
+            last_file.end_position().0.checked_add(1).ok_or(OffsetOverflowError)?
+        } else {
+            0
+        });
 
-            if self
-                .used_address_space
-                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok(usize::try_from(current).unwrap());
-            }
-        }
+        let file = Lrc::new(file);
+        files.source_files.push(file.clone());
+        files.stable_id_to_source_file.insert(file_id, file.clone());
+
+        Ok(file)
     }
 
     /// Creates a new `SourceFile`.
@@ -295,32 +323,18 @@ impl SourceMap {
         let (filename, _) = self.path_mapping.map_filename_prefix(&filename);
 
         let file_id = StableSourceFileId::new_from_name(&filename, LOCAL_CRATE);
-
-        let lrc_sf = match self.source_file_by_stable_id(file_id) {
-            Some(lrc_sf) => lrc_sf,
+        match self.source_file_by_stable_id(file_id) {
+            Some(lrc_sf) => Ok(lrc_sf),
             None => {
-                let start_pos = self.allocate_address_space(src.len())?;
-
-                let source_file = Lrc::new(SourceFile::new(
-                    filename,
-                    src,
-                    Pos::from_usize(start_pos),
-                    self.hash_kind,
-                ));
+                let source_file = SourceFile::new(filename, src, self.hash_kind)?;
 
                 // Let's make sure the file_id we generated above actually matches
                 // the ID we generate for the SourceFile we just created.
                 debug_assert_eq!(StableSourceFileId::new(&source_file), file_id);
 
-                let mut files = self.files.borrow_mut();
-
-                files.source_files.push(source_file.clone());
-                files.stable_id_to_source_file.insert(file_id, source_file.clone());
-
-                source_file
+                self.register_source_file(file_id, source_file)
             }
-        };
-        Ok(lrc_sf)
+        }
     }
 
     /// Allocates a new `SourceFile` representing a source file from an external
@@ -332,78 +346,37 @@ impl SourceMap {
         filename: FileName,
         src_hash: SourceFileHash,
         name_hash: Hash128,
-        source_len: usize,
+        source_len: u32,
         cnum: CrateNum,
-        file_local_lines: Lock<SourceFileLines>,
-        mut file_local_multibyte_chars: Vec<MultiByteChar>,
-        mut file_local_non_narrow_chars: Vec<NonNarrowChar>,
-        mut file_local_normalized_pos: Vec<NormalizedPos>,
-        original_start_pos: BytePos,
+        file_local_lines: FreezeLock<SourceFileLines>,
+        multibyte_chars: Vec<MultiByteChar>,
+        non_narrow_chars: Vec<NonNarrowChar>,
+        normalized_pos: Vec<NormalizedPos>,
         metadata_index: u32,
     ) -> Lrc<SourceFile> {
-        let start_pos = self
-            .allocate_address_space(source_len)
-            .expect("not enough address space for imported source file");
+        let source_len = RelativeBytePos::from_u32(source_len);
 
-        let end_pos = Pos::from_usize(start_pos + source_len);
-        let start_pos = Pos::from_usize(start_pos);
-
-        // Translate these positions into the new global frame of reference,
-        // now that the offset of the SourceFile is known.
-        //
-        // These are all unsigned values. `original_start_pos` may be larger or
-        // smaller than `start_pos`, but `pos` is always larger than both.
-        // Therefore, `(pos - original_start_pos) + start_pos` won't overflow
-        // but `start_pos - original_start_pos` might. So we use the former
-        // form rather than pre-computing the offset into a local variable. The
-        // compiler backend can optimize away the repeated computations in a
-        // way that won't trigger overflow checks.
-        match &mut *file_local_lines.borrow_mut() {
-            SourceFileLines::Lines(lines) => {
-                for pos in lines {
-                    *pos = (*pos - original_start_pos) + start_pos;
-                }
-            }
-            SourceFileLines::Diffs(SourceFileDiffs { line_start, .. }) => {
-                *line_start = (*line_start - original_start_pos) + start_pos;
-            }
-        }
-        for mbc in &mut file_local_multibyte_chars {
-            mbc.pos = (mbc.pos - original_start_pos) + start_pos;
-        }
-        for swc in &mut file_local_non_narrow_chars {
-            *swc = (*swc - original_start_pos) + start_pos;
-        }
-        for nc in &mut file_local_normalized_pos {
-            nc.pos = (nc.pos - original_start_pos) + start_pos;
-        }
-
-        let source_file = Lrc::new(SourceFile {
+        let source_file = SourceFile {
             name: filename,
             src: None,
             src_hash,
-            external_src: Lock::new(ExternalSource::Foreign {
+            external_src: FreezeLock::new(ExternalSource::Foreign {
                 kind: ExternalSourceKind::AbsentOk,
                 metadata_index,
             }),
-            start_pos,
-            end_pos,
+            start_pos: BytePos(0),
+            source_len,
             lines: file_local_lines,
-            multibyte_chars: file_local_multibyte_chars,
-            non_narrow_chars: file_local_non_narrow_chars,
-            normalized_pos: file_local_normalized_pos,
+            multibyte_chars,
+            non_narrow_chars,
+            normalized_pos,
             name_hash,
             cnum,
-        });
+        };
 
-        let mut files = self.files.borrow_mut();
-
-        files.source_files.push(source_file.clone());
-        files
-            .stable_id_to_source_file
-            .insert(StableSourceFileId::new(&source_file), source_file.clone());
-
-        source_file
+        let file_id = StableSourceFileId::new(&source_file);
+        self.register_source_file(file_id, source_file)
+            .expect("not enough address space for imported source file")
     }
 
     /// If there is a doctest offset, applies it to the line.
@@ -437,6 +410,7 @@ impl SourceMap {
     pub fn lookup_line(&self, pos: BytePos) -> Result<SourceFileAndLine, Lrc<SourceFile>> {
         let f = self.lookup_source_file(pos);
 
+        let pos = f.relative_position(pos);
         match f.lookup_line(pos) {
             Some(line) => Ok(SourceFileAndLine { sf: f, line }),
             None => Err(f),
@@ -483,33 +457,6 @@ impl SourceMap {
         self.span_to_string(sp, FileNameDisplayPreference::Remapped)
     }
 
-    /// Format the span location suitable for pretty printing annotations with relative line numbers
-    pub fn span_to_relative_line_string(&self, sp: Span, relative_to: Span) -> String {
-        if self.files.borrow().source_files.is_empty() || sp.is_dummy() || relative_to.is_dummy() {
-            return "no-location".to_string();
-        }
-
-        let lo = self.lookup_char_pos(sp.lo());
-        let hi = self.lookup_char_pos(sp.hi());
-        let offset = self.lookup_char_pos(relative_to.lo());
-
-        if lo.file.name != offset.file.name || !relative_to.contains(sp) {
-            return self.span_to_embeddable_string(sp);
-        }
-
-        let lo_line = lo.line.saturating_sub(offset.line);
-        let hi_line = hi.line.saturating_sub(offset.line);
-
-        format!(
-            "{}:+{}:{}: +{}:{}",
-            lo.file.name.display(FileNameDisplayPreference::Remapped),
-            lo_line,
-            lo.col.to_usize() + 1,
-            hi_line,
-            hi.col.to_usize() + 1,
-        )
-    }
-
     /// Format the span location to be printed in diagnostics. Must not be emitted
     /// to build artifacts as this may leak local file paths. Use span_to_embeddable_string
     /// for string suitable for embedding.
@@ -532,7 +479,9 @@ impl SourceMap {
             return true;
         }
         let f = (*self.files.borrow().source_files)[lo].clone();
-        f.lookup_line(sp.lo()) != f.lookup_line(sp.hi())
+        let lo = f.relative_position(sp.lo());
+        let hi = f.relative_position(sp.hi());
+        f.lookup_line(lo) != f.lookup_line(hi)
     }
 
     #[instrument(skip(self), level = "trace")]
@@ -608,11 +557,11 @@ impl SourceMap {
                 end: (local_end.sf.name.clone(), local_end.sf.start_pos),
             })))
         } else {
-            self.ensure_source_file_source_present(local_begin.sf.clone());
+            self.ensure_source_file_source_present(&local_begin.sf);
 
             let start_index = local_begin.pos.to_usize();
             let end_index = local_end.pos.to_usize();
-            let source_len = (local_begin.sf.end_pos - local_begin.sf.start_pos).to_usize();
+            let source_len = local_begin.sf.source_len.to_usize();
 
             if start_index > end_index || end_index > source_len {
                 return Err(SpanSnippetError::MalformedForSourcemap(MalformedSourceMapPositions {
@@ -625,7 +574,7 @@ impl SourceMap {
 
             if let Some(ref src) = local_begin.sf.src {
                 extract_source(src, start_index, end_index)
-            } else if let Some(src) = local_begin.sf.external_src.borrow().get_source() {
+            } else if let Some(src) = local_begin.sf.external_src.read().get_source() {
                 extract_source(src, start_index, end_index)
             } else {
                 Err(SpanSnippetError::SourceNotAvailable { filename: local_begin.sf.name.clone() })
@@ -637,7 +586,7 @@ impl SourceMap {
         self.span_to_source(sp, |src, start_index, end_index| {
             Ok(src.get(start_index..end_index).is_some())
         })
-        .map_or(false, |is_accessible| is_accessible)
+        .is_ok_and(|is_accessible| is_accessible)
     }
 
     /// Returns the source snippet as `String` corresponding to the given `Span`.
@@ -742,6 +691,21 @@ impl SourceMap {
         })
     }
 
+    /// Extends the given `Span` to previous character while the previous character matches the predicate
+    pub fn span_extend_prev_while(
+        &self,
+        span: Span,
+        f: impl Fn(char) -> bool,
+    ) -> Result<Span, SpanSnippetError> {
+        self.span_to_source(span, |s, start, _end| {
+            let n = s[..start]
+                .char_indices()
+                .rfind(|&(_, c)| !f(c))
+                .map_or(start, |(i, _)| start - i - 1);
+            Ok(span.with_lo(span.lo() - BytePos(n as u32)))
+        })
+    }
+
     /// Extends the given `Span` to just before the next occurrence of `c`.
     pub fn span_extend_to_next_char(&self, sp: Span, c: char, accept_newlines: bool) -> Span {
         if let Ok(next_source) = self.span_to_next_source(sp) {
@@ -833,7 +797,7 @@ impl SourceMap {
             }
             return Ok(true);
         })
-        .map_or(false, |is_accessible| is_accessible)
+        .is_ok_and(|is_accessible| is_accessible)
     }
 
     /// Given a `Span`, tries to get a shorter span ending just after the first occurrence of `char`
@@ -902,7 +866,7 @@ impl SourceMap {
             let sp = sp.data();
             let local_begin = self.lookup_byte_offset(sp.lo);
             let start_index = local_begin.pos.to_usize();
-            let src = local_begin.sf.external_src.borrow();
+            let src = local_begin.sf.external_src.read();
 
             let snippet = if let Some(ref src) = local_begin.sf.src {
                 Some(&src[start_index..])
@@ -956,24 +920,21 @@ impl SourceMap {
         Span::new(BytePos(start_of_next_point), end_of_next_point, sp.ctxt(), None)
     }
 
-    /// Returns a new span to check next none-whitespace character or some specified expected character
-    /// If `expect` is none, the first span of non-whitespace character is returned.
-    /// If `expect` presented, the first span of the character `expect` is returned
-    /// Otherwise, the span reached to limit is returned.
-    pub fn span_look_ahead(&self, span: Span, expect: Option<&str>, limit: Option<usize>) -> Span {
+    /// Check whether span is followed by some specified expected string in limit scope
+    pub fn span_look_ahead(&self, span: Span, expect: &str, limit: Option<usize>) -> Option<Span> {
         let mut sp = span;
         for _ in 0..limit.unwrap_or(100_usize) {
             sp = self.next_point(sp);
             if let Ok(ref snippet) = self.span_to_snippet(sp) {
-                if expect.map_or(false, |es| snippet == es) {
-                    break;
+                if snippet == expect {
+                    return Some(sp);
                 }
-                if expect.is_none() && snippet.chars().any(|c| !c.is_whitespace()) {
+                if snippet.chars().any(|c| !c.is_whitespace()) {
                     break;
                 }
             }
         }
-        sp
+        None
     }
 
     /// Finds the width of the character, either before or after the end of provided span,
@@ -1007,7 +968,7 @@ impl SourceMap {
             return 1;
         }
 
-        let source_len = (local_begin.sf.end_pos - local_begin.sf.start_pos).to_usize();
+        let source_len = local_begin.sf.source_len.to_usize();
         debug!("source_len=`{:?}`", source_len);
         // Ensure indexes are also not malformed.
         if start_index > end_index || end_index > source_len - 1 {
@@ -1015,38 +976,21 @@ impl SourceMap {
             return 1;
         }
 
-        let src = local_begin.sf.external_src.borrow();
+        let src = local_begin.sf.external_src.read();
 
-        // We need to extend the snippet to the end of the src rather than to end_index so when
-        // searching forwards for boundaries we've got somewhere to search.
-        let snippet = if let Some(ref src) = local_begin.sf.src {
-            &src[start_index..]
+        let snippet = if let Some(src) = &local_begin.sf.src {
+            src
         } else if let Some(src) = src.get_source() {
-            &src[start_index..]
+            src
         } else {
             return 1;
         };
-        debug!("snippet=`{:?}`", snippet);
 
-        let mut target = if forwards { end_index + 1 } else { end_index - 1 };
-        debug!("initial target=`{:?}`", target);
-
-        while !snippet.is_char_boundary(target - start_index) && target < source_len {
-            target = if forwards {
-                target + 1
-            } else {
-                match target.checked_sub(1) {
-                    Some(target) => target,
-                    None => {
-                        break;
-                    }
-                }
-            };
-            debug!("target=`{:?}`", target);
+        if forwards {
+            (snippet.ceil_char_boundary(end_index + 1) - end_index) as u32
+        } else {
+            (end_index - snippet.floor_char_boundary(end_index - 1)) as u32
         }
-        debug!("final target=`{:?}`", target);
-
-        if forwards { (target - end_index) as u32 } else { (end_index - target) as u32 }
     }
 
     pub fn get_source_file(&self, filename: &FileName) -> Option<Lrc<SourceFile>> {
@@ -1072,18 +1016,14 @@ impl SourceMap {
     /// This index is guaranteed to be valid for the lifetime of this `SourceMap`,
     /// since `source_files` is a `MonotonicVec`
     pub fn lookup_source_file_idx(&self, pos: BytePos) -> usize {
-        self.files
-            .borrow()
-            .source_files
-            .binary_search_by_key(&pos, |key| key.start_pos)
-            .unwrap_or_else(|p| p - 1)
+        self.files.borrow().source_files.partition_point(|x| x.start_pos <= pos) - 1
     }
 
     pub fn count_lines(&self) -> usize {
         self.files().iter().fold(0, |a, f| a + f.count_lines())
     }
 
-    pub fn ensure_source_file_source_present(&self, source_file: Lrc<SourceFile>) -> bool {
+    pub fn ensure_source_file_source_present(&self, source_file: &SourceFile) -> bool {
         source_file.add_external_src(|| {
             let FileName::Real(ref name) = source_file.name else {
                 return None;
@@ -1148,16 +1088,13 @@ pub struct FilePathMapping {
 
 impl FilePathMapping {
     pub fn empty() -> FilePathMapping {
-        FilePathMapping::new(Vec::new())
+        FilePathMapping::new(Vec::new(), FileNameDisplayPreference::Local)
     }
 
-    pub fn new(mapping: Vec<(PathBuf, PathBuf)>) -> FilePathMapping {
-        let filename_display_for_diagnostics = if mapping.is_empty() {
-            FileNameDisplayPreference::Local
-        } else {
-            FileNameDisplayPreference::Remapped
-        };
-
+    pub fn new(
+        mapping: Vec<(PathBuf, PathBuf)>,
+        filename_display_for_diagnostics: FileNameDisplayPreference,
+    ) -> FilePathMapping {
         FilePathMapping { mapping, filename_display_for_diagnostics }
     }
 
@@ -1309,6 +1246,27 @@ impl FilePathMapping {
                 }
             }
         }
+    }
+
+    /// Expand a relative path to an absolute path **without** remapping taken into account.
+    ///
+    /// The resulting `RealFileName` will have its `virtual_path` portion erased if
+    /// possible (i.e. if there's also a remapped path).
+    pub fn to_local_embeddable_absolute_path(
+        &self,
+        file_path: RealFileName,
+        working_directory: &RealFileName,
+    ) -> RealFileName {
+        let file_path = file_path.local_path_if_available();
+        if file_path.is_absolute() {
+            // No remapping has applied to this path and it is absolute,
+            // so the working directory cannot influence it either, so
+            // we are done.
+            return RealFileName::LocalPath(file_path.to_path_buf());
+        }
+        debug_assert!(file_path.is_relative());
+        let working_directory = working_directory.local_path_if_available();
+        RealFileName::LocalPath(Path::new(working_directory).join(file_path))
     }
 
     /// Attempts to (heuristically) reverse a prefix mapping.

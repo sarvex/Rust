@@ -7,8 +7,8 @@ use rustc_infer::infer::region_constraints::GenericKind;
 use rustc_infer::infer::InferCtxt;
 use rustc_middle::mir::ConstraintCategory;
 use rustc_middle::traits::query::OutlivesBound;
-use rustc_middle::ty::{self, RegionVid, Ty};
-use rustc_span::Span;
+use rustc_middle::ty::{self, RegionVid, Ty, TypeVisitableExt};
+use rustc_span::{ErrorGuaranteed, Span, DUMMY_SP};
 use rustc_trait_selection::traits::query::type_op::{self, TypeOp};
 use std::rc::Rc;
 use type_op::TypeOpOutput;
@@ -243,18 +243,11 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
             let TypeOpOutput { output: norm_ty, constraints: constraints_normalize, .. } = self
                 .param_env
                 .and(type_op::normalize::Normalize::new(ty))
-                .fully_perform(self.infcx)
-                .unwrap_or_else(|_| {
-                    let guar = self
-                        .infcx
-                        .tcx
-                        .sess
-                        .delay_span_bug(span, format!("failed to normalize {:?}", ty));
-                    TypeOpOutput {
-                        output: self.infcx.tcx.ty_error(guar),
-                        constraints: None,
-                        error_info: None,
-                    }
+                .fully_perform(self.infcx, span)
+                .unwrap_or_else(|guar| TypeOpOutput {
+                    output: Ty::new_error(self.infcx.tcx, guar),
+                    constraints: None,
+                    error_info: None,
                 });
             if let Some(c) = constraints_normalize {
                 constraints.push(c)
@@ -324,9 +317,13 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
         let TypeOpOutput { output: bounds, constraints, .. } = self
             .param_env
             .and(type_op::implied_outlives_bounds::ImpliedOutlivesBounds { ty })
-            .fully_perform(self.infcx)
-            .unwrap_or_else(|_| bug!("failed to compute implied bounds {:?}", ty));
+            .fully_perform(self.infcx, DUMMY_SP)
+            .map_err(|_: ErrorGuaranteed| debug!("failed to compute implied bounds {:?}", ty))
+            .ok()?;
         debug!(?bounds, ?constraints);
+        // Because of #109628, we may have unexpected placeholders. Ignore them!
+        // FIXME(#109628): panic in this case once the issue is fixed.
+        let bounds = bounds.into_iter().filter(|bound| !bound.has_placeholders());
         self.add_outlives_bounds(bounds);
         constraints
     }

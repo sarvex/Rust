@@ -33,21 +33,21 @@ define-function: (
 
 call-function: ("check-colors", {
     "theme": "ayu",
-    "color": "rgb(197, 197, 197)",
-    "background": "rgb(49, 69, 89)",
-    "box_shadow": "rgb(92, 103, 115)",
+    "color": "#c5c5c5",
+    "background": "#314559",
+    "box_shadow": "#5c6773",
 })
 call-function: ("check-colors", {
     "theme": "dark",
-    "color": "rgb(0, 0, 0)",
-    "background": "rgb(250, 251, 252)",
-    "box_shadow": "rgb(198, 203, 209)",
+    "color": "#000",
+    "background": "#fafbfc",
+    "box_shadow": "#c6cbd1",
 })
 call-function: ("check-colors", {
     "theme": "light",
-    "color": "rgb(0, 0, 0)",
-    "background": "rgb(250, 251, 252)",
-    "box_shadow": "rgb(198, 203, 209)",
+    "color": "#000",
+    "background": "#fafbfc",
+    "box_shadow": "#c6cbd1",
 })
 
 // This test ensures that opening the help popover without switching pages works.
@@ -67,5 +67,5 @@ go-to: "file://" + |DOC_PATH| + "/test_docs/index.html"
 set-window-size: (1000, 1000) // Popover only appears when the screen width is >700px.
 assert-false: "#help"
 click: "#help-button > a"
-click: ".popover a[href='https://doc.rust-lang.org/rustdoc/']"
-wait-for-document-property: {"URL": "https://doc.rust-lang.org/rustdoc/"}
+click: "//*[@id='help']//a[text()='the rustdoc book']"
+wait-for-document-property: ({"URL": "https://doc.rust-lang.org/"}, STARTS_WITH)

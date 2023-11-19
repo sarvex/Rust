@@ -33,20 +33,24 @@ pub(super) fn each_borrow_involving_path<'tcx, F, I, S>(
     _location: Location,
     access_place: (AccessDepth, Place<'tcx>),
     borrow_set: &BorrowSet<'tcx>,
-    candidates: I,
+    is_candidate: I,
     mut op: F,
 ) where
     F: FnMut(&mut S, BorrowIndex, &BorrowData<'tcx>) -> Control,
-    I: Iterator<Item = BorrowIndex>,
+    I: Fn(BorrowIndex) -> bool,
 {
     let (access, place) = access_place;
 
-    // FIXME: analogous code in check_loans first maps `place` to
-    // its base_path.
+    // The number of candidates can be large, but borrows for different locals cannot conflict with
+    // each other, so we restrict the working set a priori.
+    let Some(borrows_for_place_base) = borrow_set.local_map.get(&place.local) else { return };
 
     // check for loan restricting path P being used. Accounts for
     // borrows of P, P.a.b, etc.
-    for i in candidates {
+    for &i in borrows_for_place_base {
+        if !is_candidate(i) {
+            continue;
+        }
         let borrowed = &borrow_set[i];
 
         if places_conflict::borrow_conflicts_with_place(
@@ -133,7 +137,7 @@ pub(super) fn is_active<'tcx>(
 }
 
 /// Determines if a given borrow is borrowing local data
-/// This is called for all Yield expressions on movable generators
+/// This is called for all Yield expressions on movable coroutines
 pub(super) fn borrow_of_local_data(place: Place<'_>) -> bool {
     // Reborrow of already borrowed data is ignored
     // Any errors will be caught on the initial borrow
@@ -161,7 +165,7 @@ pub(crate) fn is_upvar_field_projection<'tcx>(
     match place_ref.last_projection() {
         Some((place_base, ProjectionElem::Field(field, _ty))) => {
             let base_ty = place_base.ty(body, tcx).ty;
-            if (base_ty.is_closure() || base_ty.is_generator())
+            if (base_ty.is_closure() || base_ty.is_coroutine())
                 && (!by_ref || upvars[field.index()].by_ref)
             {
                 Some(field)

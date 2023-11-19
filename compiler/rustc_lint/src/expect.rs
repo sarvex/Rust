@@ -1,5 +1,5 @@
 use crate::lints::{Expectation, ExpectationNote};
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::lint::builtin::UNFULFILLED_LINT_EXPECTATIONS;
 use rustc_session::lint::LintExpectationId;
@@ -11,7 +11,7 @@ pub(crate) fn provide(providers: &mut Providers) {
 }
 
 fn check_expectations(tcx: TyCtxt<'_>, tool_filter: Option<Symbol>) {
-    if !tcx.features().enabled(sym::lint_reasons) {
+    if !tcx.features().active(sym::lint_reasons) {
         return;
     }
 

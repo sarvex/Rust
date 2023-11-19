@@ -1,23 +1,20 @@
 //! List of the accepted feature gates.
 
-use super::{to_nonzero, Feature, State};
+use super::{to_nonzero, Feature};
 use rustc_span::symbol::sym;
 
 macro_rules! declare_features {
     ($(
         $(#[doc = $doc:tt])* (accepted, $feature:ident, $ver:expr, $issue:expr, None),
     )+) => {
-        /// Those language feature has since been Accepted (it was once Active)
+        /// Formerly unstable features that have now been accepted (stabilized).
         pub const ACCEPTED_FEATURES: &[Feature] = &[
-            $(
-                Feature {
-                    state: State::Accepted,
-                    name: sym::$feature,
-                    since: $ver,
-                    issue: to_nonzero($issue),
-                    edition: None,
-                }
-            ),+
+            $(Feature {
+                name: sym::$feature,
+                since: $ver,
+                issue: to_nonzero($issue),
+                edition: None,
+            }),+
         ];
     }
 }
@@ -53,6 +50,8 @@ declare_features! (
     /// Allows the sysV64 ABI to be specified on all platforms
     /// instead of just the platforms on which it is the C ABI.
     (accepted, abi_sysv64, "1.24.0", Some(36167), None),
+    /// Allows using the `thiscall` ABI.
+    (accepted, abi_thiscall, "1.73.0", None, None),
     /// Allows using ADX intrinsics from `core::arch::{x86, x86_64}`.
     (accepted, adx_target_feature, "1.61.0", Some(44839), None),
     /// Allows explicit discriminants on non-unit enum variants.
@@ -65,6 +64,8 @@ declare_features! (
     (accepted, associated_types, "1.0.0", None, None),
     /// Allows free and inherent `async fn`s, `async` blocks, and `<expr>.await` expressions.
     (accepted, async_await, "1.39.0", Some(50547), None),
+    /// Allows async functions to be declared, implemented, and used in traits.
+    (accepted, async_fn_in_trait, "1.75.0", Some(91611), None),
     /// Allows all literals in attribute lists and values of key-value pairs.
     (accepted, attr_literals, "1.30.0", Some(34981), None),
     /// Allows overloading augmented assignment operations like `a += b`.
@@ -131,7 +132,7 @@ declare_features! (
     /// Allows `crate` in paths.
     (accepted, crate_in_paths, "1.30.0", Some(45477), None),
     /// Allows using `#[debugger_visualizer]` attribute.
-    (accepted, debugger_visualizer, "CURRENT_RUSTC_VERSION", Some(95939), None),
+    (accepted, debugger_visualizer, "1.71.0", Some(95939), None),
     /// Allows rustc to inject a default alloc_error_handler
     (accepted, default_alloc_error_handler, "1.68.0", Some(66741), None),
     /// Allows using assigning a default type to type parameters in algebraic data type definitions.
@@ -195,6 +196,8 @@ declare_features! (
     /// + `impl<I:Iterator> Iterator for &mut Iterator`
     /// + `impl Debug for Foo<'_>`
     (accepted, impl_header_lifetime_elision, "1.31.0", Some(15872), None),
+    /// Allows referencing `Self` and projections in impl-trait.
+    (accepted, impl_trait_projections, "1.74.0", Some(103532), None),
     /// Allows using `a..=b` and `..=b` as inclusive range syntaxes.
     (accepted, inclusive_range_syntax, "1.26.0", Some(28237), None),
     /// Allows inferring outlives requirements (RFC 2093).
@@ -265,6 +268,8 @@ declare_features! (
     (accepted, non_modrs_mods, "1.30.0", Some(44660), None),
     /// Allows the use of or-patterns (e.g., `0 | 1`).
     (accepted, or_patterns, "1.53.0", Some(54883), None),
+    /// Allows using `+bundle,+whole-archive` link modifiers with native libs.
+    (accepted, packed_bundled_libs, "1.74.0", Some(108081), None),
     /// Allows annotating functions conforming to `fn(&PanicInfo) -> !` with `#[panic_handler]`.
     /// This defines the behavior of panics.
     (accepted, panic_handler, "1.30.0", Some(44489), None),
@@ -281,7 +286,7 @@ declare_features! (
     /// Allows use of the postfix `?` operator in expressions.
     (accepted, question_mark, "1.13.0", Some(31436), None),
     /// Allows the use of raw-dylibs (RFC 2627).
-    (accepted, raw_dylib, "CURRENT_RUSTC_VERSION", Some(58713), None),
+    (accepted, raw_dylib, "1.71.0", Some(58713), None),
     /// Allows keywords to be escaped for use as identifiers.
     (accepted, raw_identifiers, "1.30.0", Some(48589), None),
     /// Allows relaxing the coherence rules such that
@@ -300,6 +305,8 @@ declare_features! (
     (accepted, repr_packed, "1.33.0", Some(33158), None),
     /// Allows `#[repr(transparent)]` attribute on newtype structs.
     (accepted, repr_transparent, "1.28.0", Some(43036), None),
+    /// Allows return-position `impl Trait` in traits.
+    (accepted, return_position_impl_trait_in_trait, "1.75.0", Some(91611), None),
     /// Allows code like `let x: &'static u32 = &42` to work (RFC 1414).
     (accepted, rvalue_static_promotion, "1.21.0", Some(38865), None),
     /// Allows `Self` in type definitions (RFC 2300).

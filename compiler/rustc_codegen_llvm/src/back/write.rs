@@ -1,18 +1,22 @@
 use crate::back::lto::ThinBuffer;
+use crate::back::owned_target_machine::OwnedTargetMachine;
 use crate::back::profiling::{
     selfprofile_after_pass_callback, selfprofile_before_pass_callback, LlvmSelfProfiler,
 };
 use crate::base;
 use crate::common;
-use crate::consts;
 use crate::errors::{
-    CopyBitcode, FromLlvmDiag, FromLlvmOptimizationDiag, LlvmError, WithLlvmError, WriteBytecode,
+    CopyBitcode, FromLlvmDiag, FromLlvmOptimizationDiag, LlvmError, UnknownCompression,
+    WithLlvmError, WriteBytecode,
 };
 use crate::llvm::{self, DiagnosticInfo, PassManager};
 use crate::llvm_util;
 use crate::type_::Type;
 use crate::LlvmCodegenBackend;
 use crate::ModuleLlvm;
+use llvm::{
+    LLVMRustLLVMHasZlibCompressionForDebugSymbols, LLVMRustLLVMHasZstdCompressionForDebugSymbols,
+};
 use rustc_codegen_ssa::back::link::ensure_removed;
 use rustc_codegen_ssa::back::write::{
     BitcodeSection, CodegenContext, EmitObj, ModuleConfig, TargetMachineFactoryConfig,
@@ -95,8 +99,8 @@ pub fn write_output_file<'ll>(
     }
 }
 
-pub fn create_informational_target_machine(sess: &Session) -> &'static mut llvm::TargetMachine {
-    let config = TargetMachineFactoryConfig { split_dwarf_file: None };
+pub fn create_informational_target_machine(sess: &Session) -> OwnedTargetMachine {
+    let config = TargetMachineFactoryConfig { split_dwarf_file: None, output_obj_file: None };
     // Can't use query system here quite yet because this function is invoked before the query
     // system/tcx is set up.
     let features = llvm_util::global_llvm_features(sess, false);
@@ -104,7 +108,7 @@ pub fn create_informational_target_machine(sess: &Session) -> &'static mut llvm:
         .unwrap_or_else(|err| llvm_err(sess.diagnostic(), err).raise())
 }
 
-pub fn create_target_machine(tcx: TyCtxt<'_>, mod_name: &str) -> &'static mut llvm::TargetMachine {
+pub fn create_target_machine(tcx: TyCtxt<'_>, mod_name: &str) -> OwnedTargetMachine {
     let split_dwarf_file = if tcx.sess.target_can_use_split_dwarf() {
         tcx.output_filenames(()).split_dwarf_path(
             tcx.sess.split_debuginfo(),
@@ -114,7 +118,11 @@ pub fn create_target_machine(tcx: TyCtxt<'_>, mod_name: &str) -> &'static mut ll
     } else {
         None
     };
-    let config = TargetMachineFactoryConfig { split_dwarf_file };
+
+    let output_obj_file =
+        Some(tcx.output_filenames(()).temp_path(OutputType::Object, Some(mod_name)));
+    let config = TargetMachineFactoryConfig { split_dwarf_file, output_obj_file };
+
     target_machine_factory(
         &tcx.sess,
         tcx.backend_optimization_level(()),
@@ -217,36 +225,81 @@ pub fn target_machine_factory(
 
     let force_emulated_tls = sess.target.force_emulated_tls;
 
-    Arc::new(move |config: TargetMachineFactoryConfig| {
-        let split_dwarf_file =
-            path_mapping.map_prefix(config.split_dwarf_file.unwrap_or_default()).0;
-        let split_dwarf_file = CString::new(split_dwarf_file.to_str().unwrap()).unwrap();
+    // copy the exe path, followed by path all into one buffer
+    // null terminating them so we can use them as null terminated strings
+    let args_cstr_buff = {
+        let mut args_cstr_buff: Vec<u8> = Vec::new();
+        let exe_path = std::env::current_exe().unwrap_or_default();
+        let exe_path_str = exe_path.into_os_string().into_string().unwrap_or_default();
 
-        let tm = unsafe {
-            llvm::LLVMRustCreateTargetMachine(
-                triple.as_ptr(),
-                cpu.as_ptr(),
-                features.as_ptr(),
-                abi.as_ptr(),
-                code_model,
-                reloc_model,
-                opt_level,
-                use_softfp,
-                ffunction_sections,
-                fdata_sections,
-                funique_section_names,
-                trap_unreachable,
-                singlethread,
-                asm_comments,
-                emit_stack_size_section,
-                relax_elf_relocations,
-                use_init_array,
-                split_dwarf_file.as_ptr(),
-                force_emulated_tls,
-            )
+        args_cstr_buff.extend_from_slice(exe_path_str.as_bytes());
+        args_cstr_buff.push(0);
+
+        for arg in sess.expanded_args.iter() {
+            args_cstr_buff.extend_from_slice(arg.as_bytes());
+            args_cstr_buff.push(0);
+        }
+
+        args_cstr_buff
+    };
+
+    let debuginfo_compression = sess.opts.debuginfo_compression.to_string();
+    match sess.opts.debuginfo_compression {
+        rustc_session::config::DebugInfoCompression::Zlib => {
+            if !unsafe { LLVMRustLLVMHasZlibCompressionForDebugSymbols() } {
+                sess.emit_warning(UnknownCompression { algorithm: "zlib" });
+            }
+        }
+        rustc_session::config::DebugInfoCompression::Zstd => {
+            if !unsafe { LLVMRustLLVMHasZstdCompressionForDebugSymbols() } {
+                sess.emit_warning(UnknownCompression { algorithm: "zstd" });
+            }
+        }
+        rustc_session::config::DebugInfoCompression::None => {}
+    };
+    let debuginfo_compression = SmallCStr::new(&debuginfo_compression);
+
+    let should_prefer_remapped_for_split_debuginfo_paths =
+        sess.should_prefer_remapped_for_split_debuginfo_paths();
+
+    Arc::new(move |config: TargetMachineFactoryConfig| {
+        let path_to_cstring_helper = |path: Option<PathBuf>| -> CString {
+            let path = path.unwrap_or_default();
+            let path = if should_prefer_remapped_for_split_debuginfo_paths {
+                path_mapping.map_prefix(path).0
+            } else {
+                path.into()
+            };
+            CString::new(path.to_str().unwrap()).unwrap()
         };
 
-        tm.ok_or_else(|| LlvmError::CreateTargetMachine { triple: triple.clone() })
+        let split_dwarf_file = path_to_cstring_helper(config.split_dwarf_file);
+        let output_obj_file = path_to_cstring_helper(config.output_obj_file);
+
+        OwnedTargetMachine::new(
+            &triple,
+            &cpu,
+            &features,
+            &abi,
+            code_model,
+            reloc_model,
+            opt_level,
+            use_softfp,
+            ffunction_sections,
+            fdata_sections,
+            funique_section_names,
+            trap_unreachable,
+            singlethread,
+            asm_comments,
+            emit_stack_size_section,
+            relax_elf_relocations,
+            use_init_array,
+            &split_dwarf_file,
+            &output_obj_file,
+            &debuginfo_compression,
+            force_emulated_tls,
+            &args_cstr_buff,
+        )
     })
 }
 
@@ -259,13 +312,23 @@ pub(crate) fn save_temp_bitcode(
         return;
     }
     unsafe {
-        let ext = format!("{}.bc", name);
+        let ext = format!("{name}.bc");
         let cgu = Some(&module.name[..]);
         let path = cgcx.output_filenames.temp_path_ext(&ext, cgu);
         let cstr = path_to_c_string(&path);
         let llmod = module.module_llvm.llmod();
         llvm::LLVMWriteBitcodeToFile(llmod, cstr.as_ptr());
     }
+}
+
+/// In what context is a dignostic handler being attached to a codegen unit?
+pub enum CodegenDiagnosticsStage {
+    /// Prelink optimization stage.
+    Opt,
+    /// LTO/ThinLTO postlink optimization stage.
+    LTO,
+    /// Code generation.
+    Codegen,
 }
 
 pub struct DiagnosticHandlers<'a> {
@@ -279,6 +342,8 @@ impl<'a> DiagnosticHandlers<'a> {
         cgcx: &'a CodegenContext<LlvmCodegenBackend>,
         handler: &'a Handler,
         llcx: &'a llvm::Context,
+        module: &ModuleCodegen<ModuleLlvm>,
+        stage: CodegenDiagnosticsStage,
     ) -> Self {
         let remark_passes_all: bool;
         let remark_passes: Vec<CString>;
@@ -295,6 +360,21 @@ impl<'a> DiagnosticHandlers<'a> {
         };
         let remark_passes: Vec<*const c_char> =
             remark_passes.iter().map(|name: &CString| name.as_ptr()).collect();
+        let remark_file = cgcx
+            .remark_dir
+            .as_ref()
+            // Use the .opt.yaml file suffix, which is supported by LLVM's opt-viewer.
+            .map(|dir| {
+                let stage_suffix = match stage {
+                    CodegenDiagnosticsStage::Codegen => "codegen",
+                    CodegenDiagnosticsStage::Opt => "opt",
+                    CodegenDiagnosticsStage::LTO => "lto",
+                };
+                dir.join(format!("{}.{stage_suffix}.opt.yaml", module.name))
+            })
+            .and_then(|dir| dir.to_str().and_then(|p| CString::new(p).ok()));
+
+        let pgo_available = cgcx.opts.cg.profile_use.is_some();
         let data = Box::into_raw(Box::new((cgcx, handler)));
         unsafe {
             let old_handler = llvm::LLVMRustContextGetDiagnosticHandler(llcx);
@@ -305,6 +385,10 @@ impl<'a> DiagnosticHandlers<'a> {
                 remark_passes_all,
                 remark_passes.as_ptr(),
                 remark_passes.len(),
+                // The `as_ref()` is important here, otherwise the `CString` will be dropped
+                // too soon!
+                remark_file.as_ref().map(|dir| dir.as_ptr()).unwrap_or(std::ptr::null()),
+                pgo_available,
             );
             DiagnosticHandlers { data, llcx, old_handler }
         }
@@ -353,29 +437,22 @@ unsafe extern "C" fn diagnostic_handler(info: &DiagnosticInfo, user: *mut c_void
         }
 
         llvm::diagnostic::Optimization(opt) => {
-            let enabled = match cgcx.remark {
-                Passes::All => true,
-                Passes::Some(ref v) => v.iter().any(|s| *s == opt.pass_name),
-            };
-
-            if enabled {
-                diag_handler.emit_note(FromLlvmOptimizationDiag {
-                    filename: &opt.filename,
-                    line: opt.line,
-                    column: opt.column,
-                    pass_name: &opt.pass_name,
-                    kind: match opt.kind {
-                        OptimizationDiagnosticKind::OptimizationRemark => "success",
-                        OptimizationDiagnosticKind::OptimizationMissed
-                        | OptimizationDiagnosticKind::OptimizationFailure => "missed",
-                        OptimizationDiagnosticKind::OptimizationAnalysis
-                        | OptimizationDiagnosticKind::OptimizationAnalysisFPCommute
-                        | OptimizationDiagnosticKind::OptimizationAnalysisAliasing => "analysis",
-                        OptimizationDiagnosticKind::OptimizationRemarkOther => "other",
-                    },
-                    message: &opt.message,
-                });
-            }
+            diag_handler.emit_note(FromLlvmOptimizationDiag {
+                filename: &opt.filename,
+                line: opt.line,
+                column: opt.column,
+                pass_name: &opt.pass_name,
+                kind: match opt.kind {
+                    OptimizationDiagnosticKind::OptimizationRemark => "success",
+                    OptimizationDiagnosticKind::OptimizationMissed
+                    | OptimizationDiagnosticKind::OptimizationFailure => "missed",
+                    OptimizationDiagnosticKind::OptimizationAnalysis
+                    | OptimizationDiagnosticKind::OptimizationAnalysisFPCommute
+                    | OptimizationDiagnosticKind::OptimizationAnalysisAliasing => "analysis",
+                    OptimizationDiagnosticKind::OptimizationRemarkOther => "other",
+                },
+                message: &opt.message,
+            });
         }
         llvm::diagnostic::PGO(diagnostic_ref) | llvm::diagnostic::Linker(diagnostic_ref) => {
             let message = llvm::build_string(|s| {
@@ -449,6 +526,8 @@ pub(crate) unsafe fn llvm_optimize(
         Some(llvm::SanitizerOptions {
             sanitize_address: config.sanitizer.contains(SanitizerSet::ADDRESS),
             sanitize_address_recover: config.sanitizer_recover.contains(SanitizerSet::ADDRESS),
+            sanitize_cfi: config.sanitizer.contains(SanitizerSet::CFI),
+            sanitize_kcfi: config.sanitizer.contains(SanitizerSet::KCFI),
             sanitize_memory: config.sanitizer.contains(SanitizerSet::MEMORY),
             sanitize_memory_recover: config.sanitizer_recover.contains(SanitizerSet::MEMORY),
             sanitize_memory_track_origins: config.sanitizer_memory_track_origins as c_int,
@@ -484,6 +563,7 @@ pub(crate) unsafe fn llvm_optimize(
         &*module.module_llvm.tm,
         to_pass_builder_opt_level(opt_level),
         opt_stage,
+        cgcx.opts.cg.linker_plugin_lto.enabled(),
         config.no_prepopulate_passes,
         config.verify_llvm_ir,
         using_thin_buffers,
@@ -523,7 +603,8 @@ pub(crate) unsafe fn optimize(
 
     let llmod = module.module_llvm.llmod();
     let llcx = &*module.module_llvm.llcx;
-    let _handlers = DiagnosticHandlers::new(cgcx, diag_handler, llcx);
+    let _handlers =
+        DiagnosticHandlers::new(cgcx, diag_handler, llcx, module, CodegenDiagnosticsStage::Opt);
 
     let module_name = module.name.clone();
     let module_name = Some(&module_name[..]);
@@ -582,7 +663,13 @@ pub(crate) unsafe fn codegen(
         let tm = &*module.module_llvm.tm;
         let module_name = module.name.clone();
         let module_name = Some(&module_name[..]);
-        let handlers = DiagnosticHandlers::new(cgcx, diag_handler, llcx);
+        let _handlers = DiagnosticHandlers::new(
+            cgcx,
+            diag_handler,
+            llcx,
+            &module,
+            CodegenDiagnosticsStage::Codegen,
+        );
 
         if cgcx.msvc_imps_needed {
             create_msvc_imps(cgcx, llcx, llmod);
@@ -677,7 +764,7 @@ pub(crate) unsafe fn codegen(
 
                 let Ok(demangled) = rustc_demangle::try_demangle(input) else { return 0 };
 
-                if write!(cursor, "{:#}", demangled).is_err() {
+                if write!(cursor, "{demangled:#}").is_err() {
                     // Possible only if provided buffer is not big enough
                     return 0;
                 }
@@ -775,7 +862,6 @@ pub(crate) unsafe fn codegen(
         }
 
         record_llvm_cgu_instructions_stats(&cgcx.prof, llmod);
-        drop(handlers);
     }
 
     // `.dwo` files are only emitted if:
@@ -799,7 +885,7 @@ pub(crate) unsafe fn codegen(
 }
 
 fn create_section_with_flags_asm(section_name: &str, section_flags: &str, data: &[u8]) -> Vec<u8> {
-    let mut asm = format!(".section {},\"{}\"\n", section_name, section_flags).into_bytes();
+    let mut asm = format!(".section {section_name},\"{section_flags}\"\n").into_bytes();
     asm.extend_from_slice(b".ascii \"");
     asm.reserve(data.len());
     for &byte in data {
@@ -819,6 +905,27 @@ fn create_section_with_flags_asm(section_name: &str, section_flags: &str, data: 
     }
     asm.extend_from_slice(b"\"\n");
     asm
+}
+
+fn target_is_apple(cgcx: &CodegenContext<LlvmCodegenBackend>) -> bool {
+    cgcx.opts.target_triple.triple().contains("-ios")
+        || cgcx.opts.target_triple.triple().contains("-darwin")
+        || cgcx.opts.target_triple.triple().contains("-tvos")
+        || cgcx.opts.target_triple.triple().contains("-watchos")
+}
+
+fn target_is_aix(cgcx: &CodegenContext<LlvmCodegenBackend>) -> bool {
+    cgcx.opts.target_triple.triple().contains("-aix")
+}
+
+pub(crate) fn bitcode_section_name(cgcx: &CodegenContext<LlvmCodegenBackend>) -> &'static str {
+    if target_is_apple(cgcx) {
+        "__LLVM,__bitcode\0"
+    } else if target_is_aix(cgcx) {
+        ".ipa\0"
+    } else {
+        ".llvmbc\0"
+    }
 }
 
 /// Embed the bitcode of an LLVM module in the LLVM module itself.
@@ -875,17 +982,15 @@ unsafe fn embed_bitcode(
     //   passed though then these sections will show up in the final output.
     //   Additionally the flag that we need to set here is `SHF_EXCLUDE`.
     //
+    // * XCOFF - AIX linker ignores content in .ipa and .info if no auxiliary
+    //   symbol associated with these sections.
+    //
     // Unfortunately, LLVM provides no way to set custom section flags. For ELF
     // and COFF we emit the sections using module level inline assembly for that
     // reason (see issue #90326 for historical background).
-    let is_apple = cgcx.opts.target_triple.triple().contains("-ios")
-        || cgcx.opts.target_triple.triple().contains("-darwin")
-        || cgcx.opts.target_triple.triple().contains("-tvos")
-        || cgcx.opts.target_triple.triple().contains("-watchos");
-    if is_apple
-        || cgcx.opts.target_triple.triple().starts_with("wasm")
-        || cgcx.opts.target_triple.triple().starts_with("asmjs")
-    {
+    let is_aix = target_is_aix(cgcx);
+    let is_apple = target_is_apple(cgcx);
+    if is_apple || is_aix || cgcx.opts.target_triple.triple().starts_with("wasm") {
         // We don't need custom section flags, create LLVM globals.
         let llconst = common::bytes_in_context(llcx, bitcode);
         let llglobal = llvm::LLVMAddGlobal(
@@ -895,7 +1000,7 @@ unsafe fn embed_bitcode(
         );
         llvm::LLVMSetInitializer(llglobal, llconst);
 
-        let section = if is_apple { "__LLVM,__bitcode\0" } else { ".llvmbc\0" };
+        let section = bitcode_section_name(cgcx);
         llvm::LLVMSetSection(llglobal, section.as_ptr().cast());
         llvm::LLVMRustSetLinkage(llglobal, llvm::Linkage::PrivateLinkage);
         llvm::LLVMSetGlobalConstant(llglobal, llvm::True);
@@ -907,7 +1012,13 @@ unsafe fn embed_bitcode(
             "rustc.embedded.cmdline\0".as_ptr().cast(),
         );
         llvm::LLVMSetInitializer(llglobal, llconst);
-        let section = if is_apple { "__LLVM,__cmdline\0" } else { ".llvmcmd\0" };
+        let section = if is_apple {
+            "__LLVM,__cmdline\0"
+        } else if is_aix {
+            ".info\0"
+        } else {
+            ".llvmcmd\0"
+        };
         llvm::LLVMSetSection(llglobal, section.as_ptr().cast());
         llvm::LLVMRustSetLinkage(llglobal, llvm::Linkage::PrivateLinkage);
     } else {
@@ -940,7 +1051,7 @@ fn create_msvc_imps(
     let prefix = if cgcx.target_arch == "x86" { "\x01__imp__" } else { "\x01__imp_" };
 
     unsafe {
-        let i8p_ty = Type::i8p_llcx(llcx);
+        let ptr_ty = Type::ptr_llcx(llcx);
         let globals = base::iter_globals(llmod)
             .filter(|&val| {
                 llvm::LLVMRustGetLinkage(val) == llvm::Linkage::ExternalLinkage
@@ -960,8 +1071,8 @@ fn create_msvc_imps(
             .collect::<Vec<_>>();
 
         for (imp_name, val) in globals {
-            let imp = llvm::LLVMAddGlobal(llmod, i8p_ty, imp_name.as_ptr().cast());
-            llvm::LLVMSetInitializer(imp, consts::ptrcast(val, i8p_ty));
+            let imp = llvm::LLVMAddGlobal(llmod, ptr_ty, imp_name.as_ptr().cast());
+            llvm::LLVMSetInitializer(imp, val);
             llvm::LLVMRustSetLinkage(imp, llvm::Linkage::ExternalLinkage);
         }
     }

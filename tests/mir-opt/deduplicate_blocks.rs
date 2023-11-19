@@ -1,4 +1,5 @@
-// ignore-wasm32 compiled with panic=abort by default
+// skip-filecheck
+// EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 // unit-test: DeduplicateBlocks
 
 // EMIT_MIR deduplicate_blocks.is_line_doc_comment_2.DeduplicateBlocks.diff

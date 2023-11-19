@@ -1,4 +1,3 @@
-//@run-rustfix
 //@aux-build:proc_macros.rs
 
 #![warn(clippy::inconsistent_struct_constructor)]

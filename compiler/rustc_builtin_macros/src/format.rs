@@ -1,13 +1,16 @@
+use parse::Position::ArgumentNamed;
 use rustc_ast::ptr::P;
-use rustc_ast::token;
 use rustc_ast::tokenstream::TokenStream;
+use rustc_ast::{token, StmtKind};
 use rustc_ast::{
     Expr, ExprKind, FormatAlignment, FormatArgPosition, FormatArgPositionKind, FormatArgs,
     FormatArgsPiece, FormatArgument, FormatArgumentKind, FormatArguments, FormatCount,
     FormatDebugHex, FormatOptions, FormatPlaceholder, FormatSign, FormatTrait,
 };
 use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{Applicability, MultiSpan, PResult, SingleLabelManySpans};
+use rustc_errors::{
+    Applicability, DiagnosticBuilder, ErrorGuaranteed, MultiSpan, PResult, SingleLabelManySpans,
+};
 use rustc_expand::base::{self, *};
 use rustc_parse_format as parse;
 use rustc_span::symbol::{Ident, Symbol};
@@ -73,7 +76,9 @@ fn parse_args<'a>(ecx: &mut ExtCtxt<'a>, sp: Span, tts: TokenStream) -> PResult<
 
     let first_token = &p.token;
 
-    let fmtstr = if let token::Literal(lit) = first_token.kind && matches!(lit.kind, token::Str | token::StrRaw(_)) {
+    let fmtstr = if let token::Literal(lit) = first_token.kind
+        && matches!(lit.kind, token::Str | token::StrRaw(_))
+    {
         // This allows us to properly handle cases when the first comma
         // after the format string is mistakenly replaced with any operator,
         // which cause the expression parser to eat too much tokens.
@@ -163,7 +168,7 @@ fn make_format_args(
 
     let MacroInput { fmtstr: efmt, mut args, is_direct_literal } = input;
 
-    let (fmt_str, fmt_style, fmt_span) = match expr_to_spanned_string(ecx, efmt, msg) {
+    let (fmt_str, fmt_style, fmt_span) = match expr_to_spanned_string(ecx, efmt.clone(), msg) {
         Ok(mut fmt) if append_newline => {
             fmt.0 = Symbol::intern(&format!("{}\n", fmt.0));
             fmt
@@ -171,17 +176,33 @@ fn make_format_args(
         Ok(fmt) => fmt,
         Err(err) => {
             if let Some((mut err, suggested)) = err {
-                let sugg_fmt = match args.explicit_args().len() {
-                    0 => "{}".to_string(),
-                    _ => format!("{}{{}}", "{} ".repeat(args.explicit_args().len())),
-                };
                 if !suggested {
-                    err.span_suggestion(
-                        unexpanded_fmt_span.shrink_to_lo(),
-                        "you might be missing a string literal to format with",
-                        format!("\"{}\", ", sugg_fmt),
-                        Applicability::MaybeIncorrect,
-                    );
+                    if let ExprKind::Block(block, None) = &efmt.kind
+                        && block.stmts.len() == 1
+                        && let StmtKind::Expr(expr) = &block.stmts[0].kind
+                        && let ExprKind::Path(None, path) = &expr.kind
+                        && path.is_potential_trivial_const_arg()
+                    {
+                        err.multipart_suggestion(
+                            "quote your inlined format argument to use as string literal",
+                            vec![
+                                (unexpanded_fmt_span.shrink_to_hi(), "\"".to_string()),
+                                (unexpanded_fmt_span.shrink_to_lo(), "\"".to_string()),
+                            ],
+                            Applicability::MaybeIncorrect,
+                        );
+                    } else {
+                        let sugg_fmt = match args.explicit_args().len() {
+                            0 => "{}".to_string(),
+                            _ => format!("{}{{}}", "{} ".repeat(args.explicit_args().len())),
+                        };
+                        err.span_suggestion(
+                            unexpanded_fmt_span.shrink_to_lo(),
+                            "you might be missing a string literal to format with",
+                            format!("\"{sugg_fmt}\", "),
+                            Applicability::MaybeIncorrect,
+                        );
+                    }
                 }
                 err.emit();
             }
@@ -241,23 +262,37 @@ fn make_format_args(
         if let Some(note) = err.note {
             e.note_ = Some(errors::InvalidFormatStringNote { note });
         }
-        if let Some((label, span)) = err.secondary_label && is_source_literal {
-            e.label_ = Some(errors::InvalidFormatStringLabel { span: fmt_span.from_inner(InnerSpan::new(span.start, span.end)), label } );
+        if let Some((label, span)) = err.secondary_label
+            && is_source_literal
+        {
+            e.label_ = Some(errors::InvalidFormatStringLabel {
+                span: fmt_span.from_inner(InnerSpan::new(span.start, span.end)),
+                label,
+            });
         }
-        if err.should_be_replaced_with_positional_argument {
-            let captured_arg_span =
-                fmt_span.from_inner(InnerSpan::new(err.span.start, err.span.end));
-            if let Ok(arg) = ecx.source_map().span_to_snippet(captured_arg_span) {
-                let span = match args.unnamed_args().last() {
-                    Some(arg) => arg.expr.span,
-                    None => fmt_span,
-                };
-                e.sugg_ = Some(errors::InvalidFormatStringSuggestion {
-                    captured: captured_arg_span,
-                    len: args.unnamed_args().len().to_string(),
-                    span: span.shrink_to_hi(),
-                    arg,
-                });
+        match err.suggestion {
+            parse::Suggestion::None => {}
+            parse::Suggestion::UsePositional => {
+                let captured_arg_span =
+                    fmt_span.from_inner(InnerSpan::new(err.span.start, err.span.end));
+                if let Ok(arg) = ecx.source_map().span_to_snippet(captured_arg_span) {
+                    let span = match args.unnamed_args().last() {
+                        Some(arg) => arg.expr.span,
+                        None => fmt_span,
+                    };
+                    e.sugg_ = Some(errors::InvalidFormatStringSuggestion::UsePositional {
+                        captured: captured_arg_span,
+                        len: args.unnamed_args().len().to_string(),
+                        span: span.shrink_to_hi(),
+                        arg,
+                    });
+                }
+            }
+            parse::Suggestion::RemoveRawIdent(span) => {
+                if is_source_literal {
+                    let span = fmt_span.from_inner(InnerSpan::new(span.start, span.end));
+                    e.sugg_ = Some(errors::InvalidFormatStringSuggestion::RemoveRawIdent { span })
+                }
             }
         }
         ecx.emit_err(e);
@@ -332,8 +367,8 @@ fn make_format_args(
     let mut unfinished_literal = String::new();
     let mut placeholder_index = 0;
 
-    for piece in pieces {
-        match piece {
+    for piece in &pieces {
+        match *piece {
             parse::Piece::String(s) => {
                 unfinished_literal.push_str(s);
             }
@@ -481,7 +516,17 @@ fn make_format_args(
         // If there's a lot of unused arguments,
         // let's check if this format arguments looks like another syntax (printf / shell).
         let detect_foreign_fmt = unused.len() > args.explicit_args().len() / 2;
-        report_missing_placeholders(ecx, unused, detect_foreign_fmt, str_style, fmt_str, fmt_span);
+        report_missing_placeholders(
+            ecx,
+            unused,
+            &used,
+            &args,
+            &pieces,
+            detect_foreign_fmt,
+            str_style,
+            fmt_str,
+            fmt_span,
+        );
     }
 
     // Only check for unused named argument names if there are no other errors to avoid causing
@@ -548,15 +593,15 @@ fn invalid_placeholder_type_error(
 fn report_missing_placeholders(
     ecx: &mut ExtCtxt<'_>,
     unused: Vec<(Span, bool)>,
+    used: &[bool],
+    args: &FormatArguments,
+    pieces: &[parse::Piece<'_>],
     detect_foreign_fmt: bool,
     str_style: Option<usize>,
     fmt_str: &str,
     fmt_span: Span,
 ) {
     let mut diag = if let &[(span, named)] = &unused[..] {
-        //let mut diag = ecx.struct_span_err(span, msg);
-        //diag.span_label(span, msg);
-        //diag
         ecx.create_err(errors::FormatUnusedArg { span, named })
     } else {
         let unused_labels =
@@ -568,6 +613,33 @@ fn report_missing_placeholders(
             unused_labels,
         })
     };
+
+    let placeholders = pieces
+        .iter()
+        .filter_map(|piece| {
+            if let parse::Piece::NextArgument(argument) = piece
+                && let ArgumentNamed(binding) = argument.position
+            {
+                let span = fmt_span.from_inner(InnerSpan::new(
+                    argument.position_span.start,
+                    argument.position_span.end,
+                ));
+                Some((span, binding))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if !placeholders.is_empty() {
+        if let Some(mut new_diag) =
+            report_redundant_format_arguments(ecx, &args, used, placeholders)
+        {
+            diag.cancel();
+            new_diag.emit();
+            return;
+        }
+    }
 
     // Used to ensure we only report translations for *one* kind of foreign format.
     let mut found_foreign = false;
@@ -656,6 +728,76 @@ fn report_missing_placeholders(
     diag.emit();
 }
 
+/// This function detects and reports unused format!() arguments that are
+/// redundant due to implicit captures (e.g. `format!("{x}", x)`).
+fn report_redundant_format_arguments<'a>(
+    ecx: &mut ExtCtxt<'a>,
+    args: &FormatArguments,
+    used: &[bool],
+    placeholders: Vec<(Span, &str)>,
+) -> Option<DiagnosticBuilder<'a, ErrorGuaranteed>> {
+    let mut fmt_arg_indices = vec![];
+    let mut args_spans = vec![];
+    let mut fmt_spans = vec![];
+
+    for (i, unnamed_arg) in args.unnamed_args().iter().enumerate().rev() {
+        let Some(ty) = unnamed_arg.expr.to_ty() else { continue };
+        let Some(argument_binding) = ty.kind.is_simple_path() else { continue };
+        let argument_binding = argument_binding.as_str();
+
+        if used[i] {
+            continue;
+        }
+
+        let matching_placeholders = placeholders
+            .iter()
+            .filter(|(_, inline_binding)| argument_binding == *inline_binding)
+            .map(|(span, _)| span)
+            .collect::<Vec<_>>();
+
+        if !matching_placeholders.is_empty() {
+            fmt_arg_indices.push(i);
+            args_spans.push(unnamed_arg.expr.span);
+            for span in &matching_placeholders {
+                if fmt_spans.contains(*span) {
+                    continue;
+                }
+                fmt_spans.push(**span);
+            }
+        }
+    }
+
+    if !args_spans.is_empty() {
+        let multispan = MultiSpan::from(fmt_spans);
+        let mut suggestion_spans = vec![];
+
+        for (arg_span, fmt_arg_idx) in args_spans.iter().zip(fmt_arg_indices.iter()) {
+            let span = if fmt_arg_idx + 1 == args.explicit_args().len() {
+                *arg_span
+            } else {
+                arg_span.until(args.explicit_args()[*fmt_arg_idx + 1].expr.span)
+            };
+
+            suggestion_spans.push(span);
+        }
+
+        let sugg = if args.named_args().len() == 0 {
+            Some(errors::FormatRedundantArgsSugg { spans: suggestion_spans })
+        } else {
+            None
+        };
+
+        return Some(ecx.create_err(errors::FormatRedundantArgs {
+            n: args_spans.len(),
+            span: MultiSpan::from(args_spans),
+            note: multispan,
+            sugg,
+        }));
+    }
+
+    None
+}
+
 /// Handle invalid references to positional arguments. Output different
 /// errors for the case where all arguments are positional and for when
 /// there are named arguments or numbered positional arguments in the
@@ -671,7 +813,7 @@ fn report_invalid_references(
     let num_args_desc = match args.explicit_args().len() {
         0 => "no arguments were given".to_string(),
         1 => "there is 1 argument".to_string(),
-        n => format!("there are {} arguments", n),
+        n => format!("there are {n} arguments"),
     };
 
     let mut e;
@@ -783,7 +925,7 @@ fn report_invalid_references(
                         if num_placeholders == 1 {
                             "is 1 argument".to_string()
                         } else {
-                            format!("are {} arguments", num_placeholders)
+                            format!("are {num_placeholders} arguments")
                         },
                     ),
                 );
@@ -814,7 +956,7 @@ fn report_invalid_references(
         };
         e = ecx.struct_span_err(
             span,
-            &format!("invalid reference to positional {} ({})", arg_list, num_args_desc),
+            format!("invalid reference to positional {arg_list} ({num_args_desc})"),
         );
         e.note("positional arguments are zero-based");
     }

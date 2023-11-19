@@ -1,12 +1,13 @@
 #![allow(clippy::wildcard_imports, clippy::enum_glob_use)]
 
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::ast_utils::{eq_field_pat, eq_id, eq_maybe_qself, eq_pat, eq_path};
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::over;
 use rustc_ast::mut_visit::*;
 use rustc_ast::ptr::P;
-use rustc_ast::{self as ast, Mutability, Pat, PatKind, PatKind::*, DUMMY_NODE_ID};
+use rustc_ast::PatKind::*;
+use rustc_ast::{self as ast, Mutability, Pat, PatKind, DUMMY_NODE_ID};
 use rustc_ast_pretty::pprust;
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
@@ -28,13 +29,13 @@ declare_clippy_lint! {
     /// In the example above, `Some` is repeated, which unnecessarily complicates the pattern.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn main() {
     ///     if let Some(0) | Some(2) = Some(0) {}
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn main() {
     ///     if let Some(0 | 2) = Some(0) {}
     /// }
@@ -67,7 +68,7 @@ impl EarlyLintPass for UnnestedOrPatterns {
 
     fn check_expr(&mut self, cx: &EarlyContext<'_>, e: &ast::Expr) {
         if self.msrv.meets(msrvs::OR_PATTERNS) {
-            if let ast::ExprKind::Let(pat, _, _) = &e.kind {
+            if let ast::ExprKind::Let(pat, _, _, _) = &e.kind {
                 lint_unnested_or_patterns(cx, pat);
             }
         }
@@ -162,9 +163,7 @@ fn unnest_or_patterns(pat: &mut P<Pat>) -> bool {
             noop_visit_pat(p, self);
 
             // Don't have an or-pattern? Just quit early on.
-            let Or(alternatives) = &mut p.kind else {
-                return
-            };
+            let Or(alternatives) = &mut p.kind else { return };
 
             // Collapse or-patterns directly nested in or-patterns.
             let mut idx = 0;

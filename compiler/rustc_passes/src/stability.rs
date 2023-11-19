@@ -3,28 +3,27 @@
 
 use crate::errors;
 use rustc_attr::{
-    self as attr, rust_version_symbol, ConstStability, Stability, StabilityLevel, Unstable,
-    UnstableReason, VERSION_PLACEHOLDER,
+    self as attr, ConstStability, DeprecatedSince, Stability, StabilityLevel, StableSince,
+    Unstable, UnstableReason, VERSION_PLACEHOLDER,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{LocalDefId, CRATE_DEF_ID};
+use rustc_hir::def_id::{LocalDefId, LocalModDefId, CRATE_DEF_ID};
 use rustc_hir::hir_id::CRATE_HIR_ID;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{FieldDef, Item, ItemKind, TraitRef, Ty, TyKind, Variant};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::privacy::EffectiveVisibilities;
 use rustc_middle::middle::stability::{AllowUnstable, DeprecationEntry, Index};
-use rustc_middle::ty::{query::Providers, TyCtxt};
+use rustc_middle::query::Providers;
+use rustc_middle::ty::TyCtxt;
 use rustc_session::lint;
 use rustc_session::lint::builtin::{INEFFECTIVE_UNSTABLE_TRAIT_IMPL, USELESS_DEPRECATED};
 use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
 
-use std::cmp::Ordering;
-use std::iter;
 use std::mem::replace;
 use std::num::NonZeroU32;
 
@@ -114,7 +113,7 @@ impl<'a, 'tcx> Annotator<'a, 'tcx> {
         let attrs = self.tcx.hir().attrs(self.tcx.hir().local_def_id_to_hir_id(def_id));
         debug!("annotate(id = {:?}, attrs = {:?})", def_id, attrs);
 
-        let depr = attr::find_deprecation(&self.tcx.sess, attrs);
+        let depr = attr::find_deprecation(self.tcx.sess, self.tcx.features(), attrs);
         let mut is_deprecated = false;
         if let Some((depr, span)) = &depr {
             is_deprecated = true;
@@ -197,10 +196,11 @@ impl<'a, 'tcx> Annotator<'a, 'tcx> {
             }
         }
 
-        if let Some((rustc_attr::Deprecation { is_since_rustc_version: true, .. }, span)) = &depr {
-            if stab.is_none() {
-                self.tcx.sess.emit_err(errors::DeprecatedAttribute { span: *span });
-            }
+        if let Some((depr, span)) = &depr
+            && depr.is_since_rustc_version()
+            && stab.is_none()
+        {
+            self.tcx.sess.emit_err(errors::DeprecatedAttribute { span: *span });
         }
 
         if let Some((body_stab, _span)) = body_stab {
@@ -222,40 +222,25 @@ impl<'a, 'tcx> Annotator<'a, 'tcx> {
 
             // Check if deprecated_since < stable_since. If it is,
             // this is *almost surely* an accident.
-            if let (&Some(dep_since), &attr::Stable { since: stab_since, .. }) =
-                (&depr.as_ref().and_then(|(d, _)| d.since), &stab.level)
+            if let (
+                &Some(DeprecatedSince::RustcVersion(dep_since)),
+                &attr::Stable { since: stab_since, .. },
+            ) = (&depr.as_ref().map(|(d, _)| d.since), &stab.level)
             {
-                // Explicit version of iter::order::lt to handle parse errors properly
-                for (dep_v, stab_v) in
-                    iter::zip(dep_since.as_str().split('.'), stab_since.as_str().split('.'))
-                {
-                    match stab_v.parse::<u64>() {
-                        Err(_) => {
-                            self.tcx.sess.emit_err(errors::InvalidStability { span, item_sp });
-                            break;
+                match stab_since {
+                    StableSince::Current => {
+                        self.tcx.sess.emit_err(errors::CannotStabilizeDeprecated { span, item_sp });
+                    }
+                    StableSince::Version(stab_since) => {
+                        if dep_since < stab_since {
+                            self.tcx
+                                .sess
+                                .emit_err(errors::CannotStabilizeDeprecated { span, item_sp });
                         }
-                        Ok(stab_vp) => match dep_v.parse::<u64>() {
-                            Ok(dep_vp) => match dep_vp.cmp(&stab_vp) {
-                                Ordering::Less => {
-                                    self.tcx.sess.emit_err(errors::CannotStabilizeDeprecated {
-                                        span,
-                                        item_sp,
-                                    });
-                                    break;
-                                }
-                                Ordering::Equal => continue,
-                                Ordering::Greater => break,
-                            },
-                            Err(_) => {
-                                if dep_v != "TBD" {
-                                    self.tcx.sess.emit_err(errors::InvalidDeprecationVersion {
-                                        span,
-                                        item_sp,
-                                    });
-                                }
-                                break;
-                            }
-                        },
+                    }
+                    StableSince::Err => {
+                        // An error already reported. Assume the unparseable stabilization
+                        // version is older than the deprecation version.
                     }
                 }
             }
@@ -553,10 +538,8 @@ impl<'tcx> MissingStabilityAnnotations<'tcx> {
 
         let is_const = self.tcx.is_const_fn(def_id.to_def_id())
             || self.tcx.is_const_trait_impl_raw(def_id.to_def_id());
-        let is_stable = self
-            .tcx
-            .lookup_stability(def_id)
-            .map_or(false, |stability| stability.level.is_stable());
+        let is_stable =
+            self.tcx.lookup_stability(def_id).is_some_and(|stability| stability.level.is_stable());
         let missing_const_stability_attribute = self.tcx.lookup_const_stability(def_id).is_none();
         let is_reachable = self.effective_visibilities.is_reachable(def_id);
 
@@ -683,7 +666,7 @@ fn stability_index(tcx: TyCtxt<'_>, (): ()) -> Index {
 
 /// Cross-references the feature names of unstable APIs with enabled
 /// features and possibly prints errors.
-fn check_mod_unstable_api_usage(tcx: TyCtxt<'_>, module_def_id: LocalDefId) {
+fn check_mod_unstable_api_usage(tcx: TyCtxt<'_>, module_def_id: LocalModDefId) {
     tcx.hir().visit_item_likes_in_module(module_def_id, &mut Checker { tcx });
 }
 
@@ -733,13 +716,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'tcx> {
             // For implementations of traits, check the stability of each item
             // individually as it's possible to have a stable trait with unstable
             // items.
-            hir::ItemKind::Impl(hir::Impl {
-                of_trait: Some(ref t),
-                self_ty,
-                items,
-                constness,
-                ..
-            }) => {
+            hir::ItemKind::Impl(hir::Impl { of_trait: Some(ref t), self_ty, items, .. }) => {
                 let features = self.tcx.features();
                 if features.staged_api {
                     let attrs = self.tcx.hir().attrs(item.hir_id());
@@ -770,8 +747,8 @@ impl<'tcx> Visitor<'tcx> for Checker<'tcx> {
                     // `#![feature(const_trait_impl)]` is unstable, so any impl declared stable
                     // needs to have an error emitted.
                     if features.const_trait_impl
-                        && *constness == hir::Constness::Const
-                        && const_stab.map_or(false, |(stab, _)| stab.is_const_stable())
+                        && self.tcx.is_const_trait_impl_raw(item.owner_id.to_def_id())
+                        && const_stab.is_some_and(|(stab, _)| stab.is_const_stable())
                     {
                         self.tcx.sess.emit_err(errors::TraitImplConstStable { span: item.span });
                     }
@@ -808,15 +785,12 @@ impl<'tcx> Visitor<'tcx> for Checker<'tcx> {
             );
 
             let is_allowed_through_unstable_modules = |def_id| {
-                self.tcx
-                    .lookup_stability(def_id)
-                    .map(|stab| match stab.level {
-                        StabilityLevel::Stable { allowed_through_unstable_modules, .. } => {
-                            allowed_through_unstable_modules
-                        }
-                        _ => false,
-                    })
-                    .unwrap_or(false)
+                self.tcx.lookup_stability(def_id).is_some_and(|stab| match stab.level {
+                    StabilityLevel::Stable { allowed_through_unstable_modules, .. } => {
+                        allowed_through_unstable_modules
+                    }
+                    _ => false,
+                })
             };
 
             if item_is_allowed && !is_allowed_through_unstable_modules(def_id) {
@@ -860,7 +834,9 @@ impl<'tcx> Visitor<'tcx> for Checker<'tcx> {
 /// See issue #94972 for details on why this is a special case
 fn is_unstable_reexport(tcx: TyCtxt<'_>, id: hir::HirId) -> bool {
     // Get the LocalDefId so we can lookup the item to check the kind.
-    let Some(owner) = id.as_owner() else { return false; };
+    let Some(owner) = id.as_owner() else {
+        return false;
+    };
     let def_id = owner.def_id;
 
     let Some(stab) = tcx.stability().local_stability(def_id) else {
@@ -1006,14 +982,17 @@ pub fn check_unused_or_stable_features(tcx: TyCtxt<'_>) {
         all_implications: &FxHashMap<Symbol, Symbol>,
     ) {
         for (feature, since) in defined_features {
-            if let Some(since) = since && let Some(span) = remaining_lib_features.get(&feature) {
+            if let Some(since) = since
+                && let Some(span) = remaining_lib_features.get(&feature)
+            {
                 // Warn if the user has enabled an already-stable lib feature.
                 if let Some(implies) = all_implications.get(&feature) {
-                    unnecessary_partially_stable_feature_lint(tcx, *span, *feature, *implies, *since);
+                    unnecessary_partially_stable_feature_lint(
+                        tcx, *span, *feature, *implies, *since,
+                    );
                 } else {
                     unnecessary_stable_feature_lint(tcx, *span, *feature, *since);
                 }
-
             }
             remaining_lib_features.remove(feature);
 
@@ -1114,7 +1093,7 @@ fn unnecessary_stable_feature_lint(
     mut since: Symbol,
 ) {
     if since.as_str() == VERSION_PLACEHOLDER {
-        since = rust_version_symbol();
+        since = sym::env_CFG_RELEASE;
     }
     tcx.emit_spanned_lint(
         lint::builtin::STABLE_FEATURES,

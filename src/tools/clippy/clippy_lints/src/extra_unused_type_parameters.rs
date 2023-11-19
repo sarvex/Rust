@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_then};
-use clippy_utils::trait_ref_of_method;
+use clippy_utils::{is_from_proc_macro, trait_ref_of_method};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::{walk_impl_item, walk_item, walk_param_bound, walk_ty, Visitor};
@@ -11,10 +11,8 @@ use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::lint::in_external_macro;
 use rustc_session::{declare_tool_lint, impl_lint_pass};
-use rustc_span::{
-    def_id::{DefId, LocalDefId},
-    Span,
-};
+use rustc_span::def_id::{DefId, LocalDefId};
+use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -25,13 +23,13 @@ declare_clippy_lint! {
     /// requires using a turbofish, which serves no purpose but to satisfy the compiler.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn unused_ty<T>(x: u8) {
     ///     // ..
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn no_unused_ty(x: u8) {
     ///     // ..
     /// }
@@ -179,20 +177,22 @@ impl<'cx, 'tcx> TypeWalker<'cx, 'tcx> {
                     .iter()
                     .rev()
                     .map(|(idx, param)| {
-                        if let Some(next) = explicit_params.get(idx + 1) && end != Some(next.def_id) {
-                        // Extend the current span forward, up until the next param in the list.
-                        param.span.until(next.span)
-                    } else {
-                        // Extend the current span back to include the comma following the previous
-                        // param. If the span of the next param in the list has already been
-                        // extended, we continue the chain. This is why we're iterating in reverse.
-                        end = Some(param.def_id);
+                        if let Some(next) = explicit_params.get(idx + 1)
+                            && end != Some(next.def_id)
+                        {
+                            // Extend the current span forward, up until the next param in the list.
+                            param.span.until(next.span)
+                        } else {
+                            // Extend the current span back to include the comma following the previous
+                            // param. If the span of the next param in the list has already been
+                            // extended, we continue the chain. This is why we're iterating in reverse.
+                            end = Some(param.def_id);
 
-                        // idx will never be 0, else we'd be removing the entire list of generics
-                        let prev = explicit_params[idx - 1];
-                        let prev_span = self.get_bound_span(prev);
-                        self.get_bound_span(param).with_lo(prev_span.hi())
-                    }
+                            // idx will never be 0, else we'd be removing the entire list of generics
+                            let prev = explicit_params[idx - 1];
+                            let prev_span = self.get_bound_span(prev);
+                            self.get_bound_span(param).with_lo(prev_span.hi())
+                        }
                     })
                     .collect()
             };
@@ -248,8 +248,13 @@ impl<'cx, 'tcx> Visitor<'tcx> for TypeWalker<'cx, 'tcx> {
                 {
                     self.ty_params.remove(&def_id);
                 }
+            } else {
+                // If the bounded type isn't a generic param, but is instead a concrete generic
+                // type, any params we find nested inside of it are being used as concrete types,
+                // and can therefore can be considered used. So, we're fine to walk the left-hand
+                // side of the where bound.
+                walk_ty(self, predicate.bounded_ty);
             }
-            // Only walk the right-hand side of where bounds
             for bound in predicate.bounds {
                 walk_param_bound(self, bound);
             }
@@ -265,6 +270,7 @@ impl<'tcx> LateLintPass<'tcx> for ExtraUnusedTypeParameters {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
         if let ItemKind::Fn(_, generics, body_id) = item.kind
             && !self.is_empty_exported_or_macro(cx, item.span, item.owner_id.def_id, body_id)
+            && !is_from_proc_macro(cx, item)
         {
             let mut walker = TypeWalker::new(cx, generics);
             walk_item(&mut walker, item);

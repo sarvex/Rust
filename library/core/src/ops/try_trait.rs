@@ -226,8 +226,8 @@ pub trait Try: FromResidual {
     on(
         all(
             from_desugaring = "QuestionMark",
-            _Self = "std::result::Result<T, E>",
-            R = "std::option::Option<std::convert::Infallible>"
+            _Self = "core::result::Result<T, E>",
+            R = "core::option::Option<core::convert::Infallible>",
         ),
         message = "the `?` operator can only be used on `Result`s, not `Option`s, \
             in {ItemContext} that returns `Result`",
@@ -237,7 +237,7 @@ pub trait Try: FromResidual {
     on(
         all(
             from_desugaring = "QuestionMark",
-            _Self = "std::result::Result<T, E>",
+            _Self = "core::result::Result<T, E>",
         ),
         // There's a special error message in the trait selection code for
         // `From` in `?`, so this is not shown for result-in-result errors,
@@ -250,8 +250,8 @@ pub trait Try: FromResidual {
     on(
         all(
             from_desugaring = "QuestionMark",
-            _Self = "std::option::Option<T>",
-            R = "std::result::Result<T, E>",
+            _Self = "core::option::Option<T>",
+            R = "core::result::Result<T, E>",
         ),
         message = "the `?` operator can only be used on `Option`s, not `Result`s, \
             in {ItemContext} that returns `Option`",
@@ -261,7 +261,7 @@ pub trait Try: FromResidual {
     on(
         all(
             from_desugaring = "QuestionMark",
-            _Self = "std::option::Option<T>",
+            _Self = "core::option::Option<T>",
         ),
         // `Option`-in-`Option` always works, as there's only one possible
         // residual, so this can also be phrased strongly.
@@ -273,8 +273,8 @@ pub trait Try: FromResidual {
     on(
         all(
             from_desugaring = "QuestionMark",
-            _Self = "std::ops::ControlFlow<B, C>",
-            R = "std::ops::ControlFlow<B, C>",
+            _Self = "core::ops::control_flow::ControlFlow<B, C>",
+            R = "core::ops::control_flow::ControlFlow<B, C>",
         ),
         message = "the `?` operator in {ItemContext} that returns `ControlFlow<B, _>` \
             can only be used on other `ControlFlow<B, _>`s (with the same Break type)",
@@ -285,7 +285,7 @@ pub trait Try: FromResidual {
     on(
         all(
             from_desugaring = "QuestionMark",
-            _Self = "std::ops::ControlFlow<B, C>",
+            _Self = "core::ops::control_flow::ControlFlow<B, C>",
             // `R` is not a `ControlFlow`, as that case was matched previously
         ),
         message = "the `?` operator can only be used on `ControlFlow`s \

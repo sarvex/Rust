@@ -42,8 +42,8 @@ macro_rules! span_bug {
 // the impls for you.
 
 #[macro_export]
-macro_rules! CloneLiftImpls {
-    ($($ty:ty,)+) => {
+macro_rules! TrivialLiftImpls {
+    ($($ty:ty),+ $(,)?) => {
         $(
             impl<'tcx> $crate::ty::Lift<'tcx> for $ty {
                 type Lifted = Self;
@@ -59,7 +59,7 @@ macro_rules! CloneLiftImpls {
 /// allocated data** (i.e., don't need to be folded).
 #[macro_export]
 macro_rules! TrivialTypeTraversalImpls {
-    ($($ty:ty,)+) => {
+    ($($ty:ty),+ $(,)?) => {
         $(
             impl<'tcx> $crate::ty::fold::TypeFoldable<$crate::ty::TyCtxt<'tcx>> for $ty {
                 fn try_fold_with<F: $crate::ty::fold::FallibleTypeFolder<$crate::ty::TyCtxt<'tcx>>>(
@@ -96,6 +96,6 @@ macro_rules! TrivialTypeTraversalImpls {
 macro_rules! TrivialTypeTraversalAndLiftImpls {
     ($($t:tt)*) => {
         TrivialTypeTraversalImpls! { $($t)* }
-        CloneLiftImpls! { $($t)* }
+        TrivialLiftImpls! { $($t)* }
     }
 }

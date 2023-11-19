@@ -37,6 +37,10 @@
 //!   if they do not consistently refer to the same place in memory. This is satisfied if they do
 //!   not contain any indirection through a pointer or any indexing projections.
 //!
+//! * `p` and `q` must have the **same type**. If we replace a local with a subtype or supertype,
+//!   we may end up with a differnet vtable for that local. See the `subtyping-impacts-selection`
+//!   tests for an example where that causes issues.
+//!
 //! * We need to make sure that the goal of "merging the memory" is actually structurally possible
 //!   in MIR. For example, even if all the other conditions are satisfied, there is no way to
 //!   "merge" `_5.foo` and `_6.bar`. For now, we ensure this by requiring that both `p` and `q` are
@@ -110,7 +114,7 @@
 //! approach that only works for some classes of CFGs:
 //! - rustc now has a powerful dataflow analysis framework that can handle forwards and backwards
 //!   analyses efficiently.
-//! - Layout optimizations for generators have been added to improve code generation for
+//! - Layout optimizations for coroutines have been added to improve code generation for
 //!   async/await, which are very similar in spirit to what this optimization does.
 //!
 //! Also, rustc now has a simple NRVO pass (see `nrvo.rs`), which handles a subset of the cases that
@@ -134,6 +138,7 @@ use crate::MirPass;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
+use rustc_middle::mir::HasLocalDecls;
 use rustc_middle::mir::{dump_mir, PassWhere};
 use rustc_middle::mir::{
     traversal, Body, InlineAsmOperand, Local, LocalKind, Location, Operand, Place, Rvalue,
@@ -213,9 +218,9 @@ impl<'tcx> MirPass<'tcx> for DestinationPropagation {
                 if merged_locals.contains(*src) {
                     continue;
                 }
-                let Some(dest) =
-                    candidates.iter().find(|dest| !merged_locals.contains(**dest)) else {
-                        continue;
+                let Some(dest) = candidates.iter().find(|dest| !merged_locals.contains(**dest))
+                else {
+                    continue;
                 };
                 if !tcx.consider_optimizing(|| {
                     format!("{} round {}", tcx.def_path_str(def_id), round_count)
@@ -239,7 +244,7 @@ impl<'tcx> MirPass<'tcx> for DestinationPropagation {
         if round_count != 0 {
             // Merging can introduce overlap between moved arguments and/or call destination in an
             // unreachable code, which validator considers to be ill-formed.
-            remove_dead_blocks(tcx, body);
+            remove_dead_blocks(body);
         }
 
         trace!(round_count);
@@ -596,9 +601,7 @@ impl WriteInfo {
         rhs: &Operand<'tcx>,
         body: &Body<'tcx>,
     ) {
-        let Some(rhs) = rhs.place() else {
-            return
-        };
+        let Some(rhs) = rhs.place() else { return };
         if let Some(pair) = places_to_candidate_pair(lhs, rhs, body) {
             self.skip_pair = Some(pair);
         }
@@ -644,15 +647,15 @@ impl WriteInfo {
                 }
             }
             TerminatorKind::Goto { .. }
-            | TerminatorKind::Resume
-            | TerminatorKind::Terminate
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::Return
             | TerminatorKind::Unreachable { .. } => (),
             TerminatorKind::Drop { .. } => {
                 // `Drop`s create a `&mut` and so are not considered
             }
             TerminatorKind::Yield { .. }
-            | TerminatorKind::GeneratorDrop
+            | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. } => {
                 bug!("{:?} not found in this MIR phase", terminator)
@@ -763,9 +766,19 @@ impl<'tcx> Visitor<'tcx> for FindAssignments<'_, '_, 'tcx> {
                 return;
             };
 
-            // As described at the top of the file, we do not go near things that have their address
-            // taken.
+            // As described at the top of the file, we do not go near things that have
+            // their address taken.
             if self.borrowed.contains(src) || self.borrowed.contains(dest) {
+                return;
+            }
+
+            // As described at the top of this file, we do not touch locals which have
+            // different types.
+            let src_ty = self.body.local_decls()[src].ty;
+            let dest_ty = self.body.local_decls()[dest].ty;
+            if src_ty != dest_ty {
+                // FIXME(#112651): This can be removed afterwards. Also update the module description.
+                trace!("skipped `{src:?} = {dest:?}` due to subtyping: {src_ty} != {dest_ty}");
                 return;
             }
 

@@ -1,10 +1,12 @@
-use pulldown_cmark::{BrokenLink, Event, LinkType, Options, Parser, Tag};
+use pulldown_cmark::{BrokenLink, CowStr, Event, LinkType, Options, Parser, Tag};
 use rustc_ast as ast;
 use rustc_ast::util::comments::beautify_doc_string;
 use rustc_data_structures::fx::FxHashMap;
+use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::DefId;
 use rustc_span::symbol::{kw, sym, Symbol};
-use rustc_span::Span;
+use rustc_span::{InnerSpan, Span, DUMMY_SP};
+use std::ops::Range;
 use std::{cmp, mem};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -344,7 +346,9 @@ pub fn has_primitive_or_keyword_docs(attrs: &[ast::Attribute]) -> bool {
     for attr in attrs {
         if attr.has_name(sym::rustc_doc_primitive) {
             return true;
-        } else if attr.has_name(sym::doc) && let Some(items) = attr.meta_item_list() {
+        } else if attr.has_name(sym::doc)
+            && let Some(items) = attr.meta_item_list()
+        {
             for item in items {
                 if item.has_name(sym::keyword) {
                     return true;
@@ -392,16 +396,158 @@ pub(crate) fn attrs_to_preprocessed_links(attrs: &[ast::Attribute]) -> Vec<Box<s
     let (doc_fragments, _) = attrs_to_doc_fragments(attrs.iter().map(|attr| (attr, None)), true);
     let doc = prepare_to_doc_link_resolution(&doc_fragments).into_values().next().unwrap();
 
-    Parser::new_with_broken_link_callback(
+    parse_links(&doc)
+}
+
+/// Similiar version of `markdown_links` from rustdoc.
+/// This will collect destination links and display text if exists.
+fn parse_links<'md>(doc: &'md str) -> Vec<Box<str>> {
+    let mut broken_link_callback = |link: BrokenLink<'md>| Some((link.reference, "".into()));
+    let mut event_iter = Parser::new_with_broken_link_callback(
         &doc,
         main_body_opts(),
-        Some(&mut |link: BrokenLink<'_>| Some((link.reference, "".into()))),
+        Some(&mut broken_link_callback),
     )
-    .filter_map(|event| match event {
-        Event::Start(Tag::Link(link_type, dest, _)) if may_be_doc_link(link_type) => {
-            Some(preprocess_link(&dest))
+    .into_iter();
+    let mut links = Vec::new();
+
+    while let Some(event) = event_iter.next() {
+        match event {
+            Event::Start(Tag::Link(link_type, dest, _)) if may_be_doc_link(link_type) => {
+                if matches!(
+                    link_type,
+                    LinkType::Inline
+                        | LinkType::ReferenceUnknown
+                        | LinkType::Reference
+                        | LinkType::Shortcut
+                        | LinkType::ShortcutUnknown
+                ) {
+                    if let Some(display_text) = collect_link_data(&mut event_iter) {
+                        links.push(display_text);
+                    }
+                }
+
+                links.push(preprocess_link(&dest));
+            }
+            _ => {}
         }
-        _ => None,
-    })
-    .collect()
+    }
+
+    links
+}
+
+/// Collects additional data of link.
+fn collect_link_data<'input, 'callback>(
+    event_iter: &mut Parser<'input, 'callback>,
+) -> Option<Box<str>> {
+    let mut display_text: Option<String> = None;
+    let mut append_text = |text: CowStr<'_>| {
+        if let Some(display_text) = &mut display_text {
+            display_text.push_str(&text);
+        } else {
+            display_text = Some(text.to_string());
+        }
+    };
+
+    while let Some(event) = event_iter.next() {
+        match event {
+            Event::Text(text) => {
+                append_text(text);
+            }
+            Event::Code(code) => {
+                append_text(code);
+            }
+            Event::End(_) => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    display_text.map(String::into_boxed_str)
+}
+
+/// Returns a span encompassing all the document fragments.
+pub fn span_of_fragments(fragments: &[DocFragment]) -> Option<Span> {
+    if fragments.is_empty() {
+        return None;
+    }
+    let start = fragments[0].span;
+    if start == DUMMY_SP {
+        return None;
+    }
+    let end = fragments.last().expect("no doc strings provided").span;
+    Some(start.to(end))
+}
+
+/// Attempts to match a range of bytes from parsed markdown to a `Span` in the source code.
+///
+/// This method will return `None` if we cannot construct a span from the source map or if the
+/// fragments are not all sugared doc comments. It's difficult to calculate the correct span in
+/// that case due to escaping and other source features.
+pub fn source_span_for_markdown_range(
+    tcx: TyCtxt<'_>,
+    markdown: &str,
+    md_range: &Range<usize>,
+    fragments: &[DocFragment],
+) -> Option<Span> {
+    let is_all_sugared_doc = fragments.iter().all(|frag| frag.kind == DocFragmentKind::SugaredDoc);
+
+    if !is_all_sugared_doc {
+        return None;
+    }
+
+    let snippet = tcx.sess.source_map().span_to_snippet(span_of_fragments(fragments)?).ok()?;
+
+    let starting_line = markdown[..md_range.start].matches('\n').count();
+    let ending_line = starting_line + markdown[md_range.start..md_range.end].matches('\n').count();
+
+    // We use `split_terminator('\n')` instead of `lines()` when counting bytes so that we treat
+    // CRLF and LF line endings the same way.
+    let mut src_lines = snippet.split_terminator('\n');
+    let md_lines = markdown.split_terminator('\n');
+
+    // The number of bytes from the source span to the markdown span that are not part
+    // of the markdown, like comment markers.
+    let mut start_bytes = 0;
+    let mut end_bytes = 0;
+
+    'outer: for (line_no, md_line) in md_lines.enumerate() {
+        loop {
+            let source_line = src_lines.next()?;
+            match source_line.find(md_line) {
+                Some(offset) => {
+                    if line_no == starting_line {
+                        start_bytes += offset;
+
+                        if starting_line == ending_line {
+                            break 'outer;
+                        }
+                    } else if line_no == ending_line {
+                        end_bytes += offset;
+                        break 'outer;
+                    } else if line_no < starting_line {
+                        start_bytes += source_line.len() - md_line.len();
+                    } else {
+                        end_bytes += source_line.len() - md_line.len();
+                    }
+                    break;
+                }
+                None => {
+                    // Since this is a source line that doesn't include a markdown line,
+                    // we have to count the newline that we split from earlier.
+                    if line_no <= starting_line {
+                        start_bytes += source_line.len() + 1;
+                    } else {
+                        end_bytes += source_line.len() + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(span_of_fragments(fragments)?.from_inner(InnerSpan::new(
+        md_range.start + start_bytes,
+        md_range.end + start_bytes + end_bytes,
+    )))
 }

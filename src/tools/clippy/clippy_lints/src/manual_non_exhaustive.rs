@@ -1,8 +1,9 @@
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::{span_lint_and_then, span_lint_hir_and_then};
 use clippy_utils::is_doc_hidden;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_opt;
 use rustc_ast::ast::{self, VisibilityKind};
+use rustc_ast::attr;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
@@ -21,7 +22,7 @@ declare_clippy_lint! {
     /// and allows possible optimizations when applied to enums.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// struct S {
     ///     pub a: i32,
     ///     pub b: i32,
@@ -38,7 +39,7 @@ declare_clippy_lint! {
     /// struct T(pub i32, pub i32, ());
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// #[non_exhaustive]
     /// struct S {
     ///     pub a: i32,
@@ -137,7 +138,7 @@ impl EarlyLintPass for ManualNonExhaustiveStruct {
                             );
                         }
                         diag.span_help(field.span, "remove this field");
-                    }
+                    },
                 );
             }
         }
@@ -158,7 +159,8 @@ impl<'tcx> LateLintPass<'tcx> for ManualNonExhaustiveEnum {
             let mut iter = def.variants.iter().filter_map(|v| {
                 (matches!(v.data, hir::VariantData::Unit(_, _))
                     && v.ident.as_str().starts_with('_')
-                    && is_doc_hidden(cx.tcx.hir().attrs(v.hir_id)))
+                    && is_doc_hidden(cx.tcx.hir().attrs(v.hir_id))
+                    && !attr::contains_name(cx.tcx.hir().attrs(item.hir_id()), sym::non_exhaustive))
                 .then_some((v.def_id, v.span))
             });
             if let Some((id, span)) = iter.next()
@@ -198,16 +200,14 @@ impl<'tcx> LateLintPass<'tcx> for ManualNonExhaustiveEnum {
                 enum_span,
                 "this seems like a manual implementation of the non-exhaustive pattern",
                 |diag| {
-                    if !cx.tcx.adt_def(enum_id).is_variant_list_non_exhaustive()
-                        && let header_span = cx.sess().source_map().span_until_char(enum_span, '{')
-                        && let Some(snippet) = snippet_opt(cx, header_span)
-                    {
-                            diag.span_suggestion(
-                                header_span,
-                                "add the attribute",
-                                format!("#[non_exhaustive] {snippet}"),
-                                Applicability::Unspecified,
-                            );
+                    let header_span = cx.sess().source_map().span_until_char(enum_span, '{');
+                    if let Some(snippet) = snippet_opt(cx, header_span) {
+                        diag.span_suggestion(
+                            header_span,
+                            "add the attribute",
+                            format!("#[non_exhaustive] {snippet}"),
+                            Applicability::Unspecified,
+                        );
                     }
                     diag.span_help(variant_span, "remove this variant");
                 },

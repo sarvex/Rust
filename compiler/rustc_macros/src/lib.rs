@@ -4,15 +4,18 @@
 #![feature(never_type)]
 #![feature(proc_macro_diagnostic)]
 #![feature(proc_macro_span)]
+#![feature(proc_macro_tracked_env)]
 #![allow(rustc::default_hash_types)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
+#![allow(internal_features)]
 #![recursion_limit = "128"]
 
 use synstructure::decl_derive;
 
 use proc_macro::TokenStream;
 
+mod current_version;
 mod diagnostics;
 mod hash_stable;
 mod lift;
@@ -22,6 +25,14 @@ mod serialize;
 mod symbols;
 mod type_foldable;
 mod type_visitable;
+
+// Reads the rust version (e.g. "1.75.0") from the CFG_RELEASE env var and
+// produces a `RustcVersion` literal containing that version (e.g.
+// `RustcVersion { major: 1, minor: 75, patch: 0 }`).
+#[proc_macro]
+pub fn current_rustc_version(input: TokenStream) -> TokenStream {
+    current_version::current_version(input)
+}
 
 #[proc_macro]
 pub fn rustc_queries(input: TokenStream) -> TokenStream {

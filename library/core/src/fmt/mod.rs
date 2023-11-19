@@ -39,6 +39,9 @@ pub enum Alignment {
 #[stable(feature = "debug_builders", since = "1.2.0")]
 pub use self::builders::{DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple};
 
+#[unstable(feature = "debug_closure_helpers", issue = "117729")]
+pub use self::builders::FormatterFn;
+
 /// The type returned by formatter methods.
 ///
 /// # Examples
@@ -112,9 +115,9 @@ pub trait Write {
     ///
     /// # Errors
     ///
-    /// This function will return an instance of [`Error`] on error.
+    /// This function will return an instance of [`std::fmt::Error`][Error] on error.
     ///
-    /// The purpose of std::fmt::Error is to abort the formatting operation when the underlying
+    /// The purpose of that error is to abort the formatting operation when the underlying
     /// destination encounters some error preventing it from accepting more text; it should
     /// generally be propagated rather than handled, at least when implementing formatting traits.
     ///
@@ -188,8 +191,28 @@ pub trait Write {
     /// assert_eq!(&buf, "world");
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    fn write_fmt(mut self: &mut Self, args: Arguments<'_>) -> Result {
-        write(&mut self, args)
+    fn write_fmt(&mut self, args: Arguments<'_>) -> Result {
+        // We use a specialization for `Sized` types to avoid an indirection
+        // through `&mut self`
+        trait SpecWriteFmt {
+            fn spec_write_fmt(self, args: Arguments<'_>) -> Result;
+        }
+
+        impl<W: Write + ?Sized> SpecWriteFmt for &mut W {
+            #[inline]
+            default fn spec_write_fmt(mut self, args: Arguments<'_>) -> Result {
+                write(&mut self, args)
+            }
+        }
+
+        impl<W: Write> SpecWriteFmt for &mut W {
+            #[inline]
+            fn spec_write_fmt(self, args: Arguments<'_>) -> Result {
+                write(self, args)
+            }
+        }
+
+        self.spec_write_fmt(args)
     }
 }
 
@@ -219,6 +242,7 @@ impl<W: Write + ?Sized> Write for &mut W {
 /// documentation of the methods defined on `Formatter` below.
 #[allow(missing_debug_implementations)]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "Formatter"]
 pub struct Formatter<'a> {
     flags: u32,
     fill: char,
@@ -381,7 +405,7 @@ impl<'a> Arguments<'a> {
     ///
     /// fn write_str(_: &str) { /* ... */ }
     ///
-    /// fn write_fmt(args: &Arguments) {
+    /// fn write_fmt(args: &Arguments<'_>) {
     ///     if let Some(s) = args.as_str() {
     ///         write_str(s)
     ///     } else {
@@ -771,8 +795,10 @@ pub trait Octal {
 /// assert_eq!(format!("l as binary is: {l:b}"), "l as binary is: 1101011");
 ///
 /// assert_eq!(
-///     format!("l as binary is: {l:#032b}"),
-///     "l as binary is: 0b000000000000000000000001101011"
+///     // Note that the `0b` prefix added by `#` is included in the total width, so we
+///     // need to add two to correctly display all 32 bits.
+///     format!("l as binary is: {l:#034b}"),
+///     "l as binary is: 0b00000000000000000000000001101011"
 /// );
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -1228,7 +1254,7 @@ impl<'a> Formatter<'a> {
     /// }
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         // We need to remove "-" from the number output.
     ///         let tmp = self.nb.abs().to_string();
     ///
@@ -1328,7 +1354,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo;
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         formatter.pad("Foo")
     ///     }
     /// }
@@ -1415,7 +1441,11 @@ impl<'a> Formatter<'a> {
     /// Takes the formatted parts and applies the padding.
     /// Assumes that the caller already has rendered the parts with required precision,
     /// so that `self.precision` can be ignored.
-    fn pad_formatted_parts(&mut self, formatted: &numfmt::Formatted<'_>) -> Result {
+    ///
+    /// # Safety
+    ///
+    /// Any `numfmt::Part::Copy` parts in `formatted` must contain valid UTF-8.
+    unsafe fn pad_formatted_parts(&mut self, formatted: &numfmt::Formatted<'_>) -> Result {
         if let Some(mut width) = self.width {
             // for the sign-aware zero padding, we render the sign first and
             // behave as if we had no sign from the beginning.
@@ -1438,10 +1468,14 @@ impl<'a> Formatter<'a> {
             let len = formatted.len();
             let ret = if width <= len {
                 // no padding
-                self.write_formatted_parts(&formatted)
+                // SAFETY: Per the precondition.
+                unsafe { self.write_formatted_parts(&formatted) }
             } else {
                 let post_padding = self.padding(width - len, Alignment::Right)?;
-                self.write_formatted_parts(&formatted)?;
+                // SAFETY: Per the precondition.
+                unsafe {
+                    self.write_formatted_parts(&formatted)?;
+                }
                 post_padding.write(self)
             };
             self.fill = old_fill;
@@ -1449,20 +1483,20 @@ impl<'a> Formatter<'a> {
             ret
         } else {
             // this is the common case and we take a shortcut
-            self.write_formatted_parts(formatted)
+            // SAFETY: Per the precondition.
+            unsafe { self.write_formatted_parts(formatted) }
         }
     }
 
-    fn write_formatted_parts(&mut self, formatted: &numfmt::Formatted<'_>) -> Result {
-        fn write_bytes(buf: &mut dyn Write, s: &[u8]) -> Result {
+    /// # Safety
+    ///
+    /// Any `numfmt::Part::Copy` parts in `formatted` must contain valid UTF-8.
+    unsafe fn write_formatted_parts(&mut self, formatted: &numfmt::Formatted<'_>) -> Result {
+        unsafe fn write_bytes(buf: &mut dyn Write, s: &[u8]) -> Result {
             // SAFETY: This is used for `numfmt::Part::Num` and `numfmt::Part::Copy`.
             // It's safe to use for `numfmt::Part::Num` since every char `c` is between
-            // `b'0'` and `b'9'`, which means `s` is valid UTF-8.
-            // It's also probably safe in practice to use for `numfmt::Part::Copy(buf)`
-            // since `buf` should be plain ASCII, but it's possible for someone to pass
-            // in a bad value for `buf` into `numfmt::to_shortest_str` since it is a
-            // public function.
-            // FIXME: Determine whether this could result in UB.
+            // `b'0'` and `b'9'`, which means `s` is valid UTF-8. It's safe to use for
+            // `numfmt::Part::Copy` due to this function's precondition.
             buf.write_str(unsafe { str::from_utf8_unchecked(s) })
         }
 
@@ -1489,11 +1523,15 @@ impl<'a> Formatter<'a> {
                         *c = b'0' + (v % 10) as u8;
                         v /= 10;
                     }
-                    write_bytes(self.buf, &s[..len])?;
+                    // SAFETY: Per the precondition.
+                    unsafe {
+                        write_bytes(self.buf, &s[..len])?;
+                    }
                 }
-                numfmt::Part::Copy(buf) => {
+                // SAFETY: Per the precondition.
+                numfmt::Part::Copy(buf) => unsafe {
                     write_bytes(self.buf, buf)?;
-                }
+                },
             }
         }
         Ok(())
@@ -1510,7 +1548,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo;
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         formatter.write_str("Foo")
     ///         // This is equivalent to:
     ///         // write!(formatter, "Foo")
@@ -1535,7 +1573,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(i32);
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         formatter.write_fmt(format_args!("Foo {}", self.0))
     ///     }
     /// }
@@ -1570,7 +1608,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo;
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         let c = formatter.fill();
     ///         if let Some(width) = formatter.width() {
     ///             for _ in 0..width {
@@ -1598,14 +1636,12 @@ impl<'a> Formatter<'a> {
     /// # Examples
     ///
     /// ```
-    /// extern crate core;
-    ///
     /// use std::fmt::{self, Alignment};
     ///
     /// struct Foo;
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         let s = if let Some(s) = formatter.align() {
     ///             match s {
     ///                 Alignment::Left    => "left",
@@ -1645,7 +1681,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(i32);
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         if let Some(width) = formatter.width() {
     ///             // If we received a width, we use it
     ///             write!(formatter, "{:width$}", format!("Foo({})", self.0), width = width)
@@ -1676,7 +1712,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(f32);
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         if let Some(precision) = formatter.precision() {
     ///             // If we received a precision, we use it.
     ///             write!(formatter, "Foo({1:.*})", precision, self.0)
@@ -1706,7 +1742,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(i32);
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         if formatter.sign_plus() {
     ///             write!(formatter,
     ///                    "Foo({}{})",
@@ -1738,7 +1774,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(i32);
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         if formatter.sign_minus() {
     ///             // You want a minus sign? Have one!
     ///             write!(formatter, "-Foo({})", self.0)
@@ -1767,7 +1803,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(i32);
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         if formatter.alternate() {
     ///             write!(formatter, "Foo({})", self.0)
     ///         } else {
@@ -1795,7 +1831,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(i32);
     ///
     /// impl fmt::Display for Foo {
-    ///     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         assert!(formatter.sign_aware_zero_pad());
     ///         assert_eq!(formatter.width(), Some(4));
     ///         // We ignore the formatter's options.
@@ -1839,7 +1875,7 @@ impl<'a> Formatter<'a> {
     /// }
     ///
     /// impl fmt::Debug for Foo {
-    ///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         fmt.debug_struct("Foo")
     ///             .field("bar", &self.bar)
     ///             .field("baz", &self.baz)
@@ -1997,7 +2033,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo<T>(i32, String, PhantomData<T>);
     ///
     /// impl<T> fmt::Debug for Foo<T> {
-    ///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         fmt.debug_tuple("Foo")
     ///             .field(&self.0)
     ///             .field(&self.1)
@@ -2129,7 +2165,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(Vec<i32>);
     ///
     /// impl fmt::Debug for Foo {
-    ///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         fmt.debug_list().entries(self.0.iter()).finish()
     ///     }
     /// }
@@ -2152,7 +2188,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(Vec<i32>);
     ///
     /// impl fmt::Debug for Foo {
-    ///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         fmt.debug_set().entries(self.0.iter()).finish()
     ///     }
     /// }
@@ -2168,14 +2204,14 @@ impl<'a> Formatter<'a> {
     /// ```rust
     /// use std::fmt;
     ///
-    /// struct Arm<'a, L: 'a, R: 'a>(&'a (L, R));
-    /// struct Table<'a, K: 'a, V: 'a>(&'a [(K, V)], V);
+    /// struct Arm<'a, L, R>(&'a (L, R));
+    /// struct Table<'a, K, V>(&'a [(K, V)], V);
     ///
     /// impl<'a, L, R> fmt::Debug for Arm<'a, L, R>
     /// where
     ///     L: 'a + fmt::Debug, R: 'a + fmt::Debug
     /// {
-    ///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         L::fmt(&(self.0).0, fmt)?;
     ///         fmt.write_str(" => ")?;
     ///         R::fmt(&(self.0).1, fmt)
@@ -2186,7 +2222,7 @@ impl<'a> Formatter<'a> {
     /// where
     ///     K: 'a + fmt::Debug, V: 'a + fmt::Debug
     /// {
-    ///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         fmt.debug_set()
     ///         .entries(self.0.iter().map(Arm))
     ///         .entry(&Arm(&(format_args!("_"), &self.1)))
@@ -2210,7 +2246,7 @@ impl<'a> Formatter<'a> {
     /// struct Foo(Vec<(String, i32)>);
     ///
     /// impl fmt::Debug for Foo {
-    ///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         fmt.debug_map().entries(self.0.iter().map(|&(ref k, ref v)| (k, v))).finish()
     ///     }
     /// }
@@ -2269,6 +2305,7 @@ fmt_refs! { Debug, Display, Octal, Binary, LowerHex, UpperHex, LowerExp, UpperEx
 
 #[unstable(feature = "never_type", issue = "35121")]
 impl Debug for ! {
+    #[inline]
     fn fmt(&self, _: &mut Formatter<'_>) -> Result {
         *self
     }
@@ -2276,6 +2313,7 @@ impl Debug for ! {
 
 #[unstable(feature = "never_type", issue = "35121")]
 impl Display for ! {
+    #[inline]
     fn fmt(&self, _: &mut Formatter<'_>) -> Result {
         *self
     }
@@ -2509,22 +2547,12 @@ impl<T: Copy + Debug> Debug for Cell<T> {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized + Debug> Debug for RefCell<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut d = f.debug_struct("RefCell");
         match self.try_borrow() {
-            Ok(borrow) => f.debug_struct("RefCell").field("value", &borrow).finish(),
-            Err(_) => {
-                // The RefCell is mutably borrowed so we can't look at its value
-                // here. Show a placeholder instead.
-                struct BorrowedPlaceholder;
-
-                impl Debug for BorrowedPlaceholder {
-                    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-                        f.write_str("<borrowed>")
-                    }
-                }
-
-                f.debug_struct("RefCell").field("value", &BorrowedPlaceholder).finish()
-            }
-        }
+            Ok(borrow) => d.field("value", &borrow),
+            Err(_) => d.field("value", &format_args!("<borrowed>")),
+        };
+        d.finish()
     }
 }
 

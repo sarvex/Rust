@@ -74,18 +74,20 @@ pub(crate) fn incoming_calls(
     Some(calls.into_items())
 }
 
-pub(crate) fn outgoing_calls(db: &RootDatabase, position: FilePosition) -> Option<Vec<CallItem>> {
+pub(crate) fn outgoing_calls(
+    db: &RootDatabase,
+    FilePosition { file_id, offset }: FilePosition,
+) -> Option<Vec<CallItem>> {
     let sema = Semantics::new(db);
-    let file_id = position.file_id;
     let file = sema.parse(file_id);
     let file = file.syntax();
-    let token = pick_best_token(file.token_at_offset(position.offset), |kind| match kind {
+    let token = pick_best_token(file.token_at_offset(offset), |kind| match kind {
         IDENT => 1,
         _ => 0,
     })?;
     let mut calls = CallLocations::default();
 
-    sema.descend_into_macros(token)
+    sema.descend_into_macros(token, offset)
         .into_iter()
         .filter_map(|it| it.parent_ancestors().nth(1).and_then(ast::Item::cast))
         .filter_map(|item| match item {
@@ -263,7 +265,7 @@ mod tests {
             expect![["callee Function FileId(0) 0..14 3..9"]],
             expect![[r#"
                 caller1 Function FileId(0) 15..45 18..25 : [34..40]
-                test_caller Function FileId(0) 95..149 110..121 : [134..140]"#]],
+                test_caller Function FileId(0) 95..149 110..121 tests : [134..140]"#]],
             expect![[]],
         );
     }
@@ -283,7 +285,7 @@ fn caller() {
 //- /foo/mod.rs
 pub fn callee() {}
 "#,
-            expect![["callee Function FileId(1) 0..18 7..13"]],
+            expect!["callee Function FileId(1) 0..18 7..13 foo"],
             expect![["caller Function FileId(0) 27..56 30..36 : [45..51]"]],
             expect![[]],
         );
@@ -323,7 +325,7 @@ pub fn callee() {}
 "#,
             expect![["caller Function FileId(0) 27..56 30..36"]],
             expect![[]],
-            expect![["callee Function FileId(1) 0..18 7..13 : [45..51]"]],
+            expect!["callee Function FileId(1) 0..18 7..13 foo : [45..51]"],
         );
     }
 
@@ -477,7 +479,7 @@ fn caller() {
     S1::callee();
 }
 "#,
-            expect![["callee Function FileId(0) 15..27 18..24"]],
+            expect!["callee Function FileId(0) 15..27 18..24 T1"],
             expect![["caller Function FileId(0) 82..115 85..91 : [104..110]"]],
             expect![[]],
         );

@@ -393,6 +393,8 @@ use crate::ops::{CoerceUnsized, Deref, DerefMut, DispatchFromDyn, Receiver};
 /// value in place, preventing the value referenced by that pointer from being moved
 /// unless it implements [`Unpin`].
 ///
+/// `Pin<P>` is guaranteed to have the same memory layout and ABI as `P`.
+///
 /// *See the [`pin` module] documentation for an explanation of pinning.*
 ///
 /// [`pin` module]: self
@@ -570,7 +572,10 @@ impl<P: Deref> Pin<P> {
     ///     // though we have previously pinned it! We have violated the pinning API contract.
     /// }
     /// ```
-    /// A value, once pinned, must remain pinned forever (unless its type implements `Unpin`).
+    /// A value, once pinned, must remain pinned until it is dropped (unless its type implements
+    /// `Unpin`). Because `Pin<&mut T>` does not own the value, dropping the `Pin` will not drop
+    /// the value and will not end the pinning contract. So moving the value after dropping the
+    /// `Pin<&mut T>` is still a violation of the API contract.
     ///
     /// Similarly, calling `Pin::new_unchecked` on an `Rc<T>` is unsafe because there could be
     /// aliases to the same data that are not subject to the pinning restrictions:
@@ -1080,17 +1085,18 @@ impl<P, U> DispatchFromDyn<Pin<U>> for Pin<P> where P: DispatchFromDyn<U> {}
 /// # assert_eq!(42, block_on(async { 42 }));
 /// ```
 ///
-/// ### With `Generator`s
+/// ### With `Coroutine`s
 ///
 /// ```rust
-/// #![feature(generators, generator_trait)]
+/// #![feature(coroutines)]
+/// #![feature(coroutine_trait)]
 /// use core::{
-///     ops::{Generator, GeneratorState},
+///     ops::{Coroutine, CoroutineState},
 ///     pin::pin,
 /// };
 ///
-/// fn generator_fn() -> impl Generator<Yield = usize, Return = ()> /* not Unpin */ {
-///  // Allow generator to be self-referential (not `Unpin`)
+/// fn coroutine_fn() -> impl Coroutine<Yield = usize, Return = ()> /* not Unpin */ {
+///  // Allow coroutine to be self-referential (not `Unpin`)
 ///  // vvvvvv        so that locals can cross yield points.
 ///     static || {
 ///         let foo = String::from("foo");
@@ -1102,18 +1108,18 @@ impl<P, U> DispatchFromDyn<Pin<U>> for Pin<P> where P: DispatchFromDyn<U> {}
 /// }
 ///
 /// fn main() {
-///     let mut generator = pin!(generator_fn());
-///     match generator.as_mut().resume(()) {
-///         GeneratorState::Yielded(0) => {},
+///     let mut coroutine = pin!(coroutine_fn());
+///     match coroutine.as_mut().resume(()) {
+///         CoroutineState::Yielded(0) => {},
 ///         _ => unreachable!(),
 ///     }
-///     match generator.as_mut().resume(()) {
-///         GeneratorState::Yielded(3) => {},
+///     match coroutine.as_mut().resume(()) {
+///         CoroutineState::Yielded(3) => {},
 ///         _ => unreachable!(),
 ///     }
-///     match generator.resume(()) {
-///         GeneratorState::Yielded(_) => unreachable!(),
-///         GeneratorState::Complete(()) => {},
+///     match coroutine.resume(()) {
+///         CoroutineState::Yielded(_) => unreachable!(),
+///         CoroutineState::Complete(()) => {},
 ///     }
 /// }
 /// ```

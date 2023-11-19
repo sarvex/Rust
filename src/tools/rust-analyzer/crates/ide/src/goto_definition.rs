@@ -1,6 +1,9 @@
 use std::mem::discriminant;
 
-use crate::{doc_links::token_as_doc_comment, FilePosition, NavigationTarget, RangeInfo, TryToNav};
+use crate::{
+    doc_links::token_as_doc_comment, navigation_target::ToNav, FilePosition, NavigationTarget,
+    RangeInfo, TryToNav,
+};
 use hir::{AsAssocItem, AssocItem, Semantics};
 use ide_db::{
     base_db::{AnchoredPath, FileId, FileLoader},
@@ -26,45 +29,39 @@ use syntax::{ast, AstNode, AstToken, SyntaxKind::*, SyntaxToken, TextRange, T};
 // image::https://user-images.githubusercontent.com/48062697/113065563-025fbe00-91b1-11eb-83e4-a5a703610b23.gif[]
 pub(crate) fn goto_definition(
     db: &RootDatabase,
-    position: FilePosition,
+    FilePosition { file_id, offset }: FilePosition,
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
     let sema = &Semantics::new(db);
-    let file = sema.parse(position.file_id).syntax().clone();
-    let original_token =
-        pick_best_token(file.token_at_offset(position.offset), |kind| match kind {
-            IDENT
-            | INT_NUMBER
-            | LIFETIME_IDENT
-            | T![self]
-            | T![super]
-            | T![crate]
-            | T![Self]
-            | COMMENT => 4,
-            // index and prefix ops
-            T!['['] | T![']'] | T![?] | T![*] | T![-] | T![!] => 3,
-            kind if kind.is_keyword() => 2,
-            T!['('] | T![')'] => 2,
-            kind if kind.is_trivia() => 0,
-            _ => 1,
-        })?;
+    let file = sema.parse(file_id).syntax().clone();
+    let original_token = pick_best_token(file.token_at_offset(offset), |kind| match kind {
+        IDENT
+        | INT_NUMBER
+        | LIFETIME_IDENT
+        | T![self]
+        | T![super]
+        | T![crate]
+        | T![Self]
+        | COMMENT => 4,
+        // index and prefix ops
+        T!['['] | T![']'] | T![?] | T![*] | T![-] | T![!] => 3,
+        kind if kind.is_keyword() => 2,
+        T!['('] | T![')'] => 2,
+        kind if kind.is_trivia() => 0,
+        _ => 1,
+    })?;
     if let Some(doc_comment) = token_as_doc_comment(&original_token) {
-        return doc_comment.get_definition_with_descend_at(
-            sema,
-            position.offset,
-            |def, _, link_range| {
-                let nav = def.try_to_nav(db)?;
-                Some(RangeInfo::new(link_range, vec![nav]))
-            },
-        );
+        return doc_comment.get_definition_with_descend_at(sema, offset, |def, _, link_range| {
+            let nav = def.try_to_nav(db)?;
+            Some(RangeInfo::new(link_range, vec![nav]))
+        });
     }
     let navs = sema
-        .descend_into_macros(original_token.clone())
+        .descend_into_macros(original_token.clone(), offset)
         .into_iter()
         .filter_map(|token| {
             let parent = token.parent()?;
             if let Some(tt) = ast::TokenTree::cast(parent) {
-                if let Some(x) = try_lookup_include_path(sema, tt, token.clone(), position.file_id)
-                {
+                if let Some(x) = try_lookup_include_path(sema, tt, token.clone(), file_id) {
                     return Some(vec![x]);
                 }
             }
@@ -73,6 +70,13 @@ pub(crate) fn goto_definition(
                     .definitions()
                     .into_iter()
                     .flat_map(|def| {
+                        if let Definition::ExternCrateDecl(crate_def) = def {
+                            return crate_def
+                                .resolved_crate(db)
+                                .map(|it| it.root_module().to_nav(sema.db))
+                                .into_iter()
+                                .collect();
+                        }
                         try_filter_trait_item_definition(sema, &def)
                             .unwrap_or_else(|| def_to_nav(sema.db, def))
                     })
@@ -113,6 +117,7 @@ fn try_lookup_include_path(
         file_id,
         full_range: TextRange::new(0.into(), size),
         name: path.into(),
+        alias: None,
         focus_range: None,
         kind: None,
         container_name: None,
@@ -833,8 +838,7 @@ fn test() {
 #[rustc_builtin_macro]
 macro_rules! include {}
 
-  include!("foo.rs");
-//^^^^^^^^^^^^^^^^^^^
+include!("foo.rs");
 
 fn f() {
     foo$0();
@@ -846,6 +850,33 @@ mod confuse_index {
 
 //- /foo.rs
 fn foo() {}
+ //^^^
+        "#,
+        );
+    }
+
+    #[test]
+    fn goto_through_included_file_struct_with_doc_comment() {
+        check(
+            r#"
+//- /main.rs
+#[rustc_builtin_macro]
+macro_rules! include {}
+
+include!("foo.rs");
+
+fn f() {
+    let x = Foo$0;
+}
+
+mod confuse_index {
+    pub struct Foo;
+}
+
+//- /foo.rs
+/// This is a doc comment
+pub struct Foo;
+         //^^^
         "#,
         );
     }
@@ -1466,6 +1497,29 @@ impl Twait for Stwuct {
 fn f() {
     let s = Stwuct;
     s.a$0();
+}
+        "#,
+            );
+        }
+        #[test]
+        fn method_call_inside_block() {
+            check(
+                r#"
+trait Twait {
+    fn a(&self);
+}
+
+fn outer() {
+    struct Stwuct;
+
+    impl Twait for Stwuct {
+        fn a(&self){}
+         //^
+    }
+    fn f() {
+        let s = Stwuct;
+        s.a$0();
+    }
 }
         "#,
             );

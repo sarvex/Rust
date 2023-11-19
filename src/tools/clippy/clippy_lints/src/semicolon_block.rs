@@ -19,13 +19,13 @@ declare_clippy_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust
+    /// ```no_run
     /// # fn f(_: u32) {}
     /// # let x = 0;
     /// unsafe { f(x) };
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # fn f(_: u32) {}
     /// # let x = 0;
     /// unsafe { f(x); }
@@ -48,13 +48,13 @@ declare_clippy_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust
+    /// ```no_run
     /// # fn f(_: u32) {}
     /// # let x = 0;
     /// unsafe { f(x); }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # fn f(_: u32) {}
     /// # let x = 0;
     /// unsafe { f(x) };
@@ -148,12 +148,18 @@ impl LateLintPass<'_> for SemicolonBlock {
                     expr: None,
                     stmts: [.., stmt],
                     ..
-                } = block else { return };
+                } = block
+                else {
+                    return;
+                };
                 let &Stmt {
                     kind: StmtKind::Semi(expr),
                     span,
                     ..
-                } = stmt else { return };
+                } = stmt
+                else {
+                    return;
+                };
                 self.semicolon_outside_block(cx, block, expr, span);
             },
             StmtKind::Semi(Expr {

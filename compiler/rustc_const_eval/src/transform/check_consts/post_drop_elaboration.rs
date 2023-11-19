@@ -5,7 +5,7 @@ use rustc_span::{symbol::sym, Span};
 
 use super::check::Qualifs;
 use super::ops::{self, NonConstOp};
-use super::qualifs::{NeedsNonConstDrop, Qualif};
+use super::qualifs::{NeedsDrop, Qualif};
 use super::ConstCx;
 
 /// Returns `true` if we should use the more precise live drop checker that runs after drop
@@ -82,7 +82,9 @@ impl<'tcx> Visitor<'tcx> for CheckLiveDrops<'_, 'tcx> {
         match &terminator.kind {
             mir::TerminatorKind::Drop { place: dropped_place, .. } => {
                 let dropped_ty = dropped_place.ty(self.body, self.tcx).ty;
-                if !NeedsNonConstDrop::in_any_value_of_ty(self.ccx, dropped_ty) {
+
+                // FIXME(effects) use `NeedsNonConstDrop`
+                if !NeedsDrop::in_any_value_of_ty(self.ccx, dropped_ty) {
                     // Instead of throwing a bug, we just return here. This is because we have to
                     // run custom `const Drop` impls.
                     return;
@@ -104,15 +106,15 @@ impl<'tcx> Visitor<'tcx> for CheckLiveDrops<'_, 'tcx> {
                 }
             }
 
-            mir::TerminatorKind::Terminate
+            mir::TerminatorKind::UnwindTerminate(_)
             | mir::TerminatorKind::Call { .. }
             | mir::TerminatorKind::Assert { .. }
             | mir::TerminatorKind::FalseEdge { .. }
             | mir::TerminatorKind::FalseUnwind { .. }
-            | mir::TerminatorKind::GeneratorDrop
+            | mir::TerminatorKind::CoroutineDrop
             | mir::TerminatorKind::Goto { .. }
             | mir::TerminatorKind::InlineAsm { .. }
-            | mir::TerminatorKind::Resume
+            | mir::TerminatorKind::UnwindResume
             | mir::TerminatorKind::Return
             | mir::TerminatorKind::SwitchInt { .. }
             | mir::TerminatorKind::Unreachable

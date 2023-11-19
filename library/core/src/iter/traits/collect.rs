@@ -95,6 +95,16 @@
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_on_unimplemented(
     on(
+        _Self = "&[{A}]",
+        message = "a slice of type `{Self}` cannot be built since we need to store the elements somewhere",
+        label = "try explicitly collecting into a `Vec<{A}>`",
+    ),
+    on(
+        all(A = "{integer}", any(_Self = "&[{integral}]",)),
+        message = "a slice of type `{Self}` cannot be built since we need to store the elements somewhere",
+        label = "try explicitly collecting into a `Vec<{A}>`",
+    ),
+    on(
         _Self = "[{A}]",
         message = "a slice of type `{Self}` cannot be built since `{Self}` has no definite size",
         label = "try explicitly collecting into a `Vec<{A}>`",
@@ -128,8 +138,6 @@ pub trait FromIterator<A>: Sized {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let five_fives = std::iter::repeat(5).take(5);
     ///
@@ -138,6 +146,7 @@ pub trait FromIterator<A>: Sized {
     /// assert_eq!(v, vec![5, 5, 5, 5, 5]);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_diagnostic_item = "from_iter_fn"]
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
 }
 
@@ -245,8 +254,6 @@ pub trait IntoIterator {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let v = [1, 2, 3];
     /// let mut iter = v.into_iter();
@@ -352,8 +359,6 @@ pub trait Extend<A> {
     /// [trait-level]: Extend
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// // You can extend a String with some chars:

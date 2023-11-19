@@ -3,10 +3,10 @@
 use crate::clean::Item;
 use crate::core::DocContext;
 use crate::html::markdown::main_body_opts;
-use crate::passes::source_span_for_markdown_range;
 use pulldown_cmark::{BrokenLink, Event, Parser};
 use rustc_errors::DiagnosticBuilder;
 use rustc_lint_defs::Applicability;
+use rustc_resolve::rustdoc::source_span_for_markdown_range;
 use std::ops::Range;
 
 pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item) {
@@ -16,7 +16,7 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item) {
         return;
     };
 
-    let dox = item.attrs.collapsed_doc_value().unwrap_or_default();
+    let dox = item.doc_value();
     if dox.is_empty() {
         return;
     }
@@ -52,11 +52,11 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item) {
                     tcx,
                     &dox,
                     &(backtick_index..backtick_index + 1),
-                    &item.attrs,
+                    &item.attrs.doc_strings,
                 )
                 .unwrap_or_else(|| item.attr_span(tcx));
 
-                cx.tcx.struct_span_lint_hir(crate::lint::UNESCAPED_BACKTICKS, hir_id, span, "unescaped backtick", |lint| {
+                tcx.struct_span_lint_hir(crate::lint::UNESCAPED_BACKTICKS, hir_id, span, "unescaped backtick", |lint| {
                     let mut help_emitted = false;
 
                     match element.prev_code_guess {
@@ -373,14 +373,17 @@ fn suggest_insertion(
     lint: &mut DiagnosticBuilder<'_, ()>,
     insert_index: usize,
     suggestion: char,
-    message: &str,
+    message: &'static str,
 ) {
     /// Maximum bytes of context to show around the insertion.
     const CONTEXT_MAX_LEN: usize = 80;
 
-    if let Some(span) =
-        source_span_for_markdown_range(cx.tcx, &dox, &(insert_index..insert_index), &item.attrs)
-    {
+    if let Some(span) = source_span_for_markdown_range(
+        cx.tcx,
+        &dox,
+        &(insert_index..insert_index),
+        &item.attrs.doc_strings,
+    ) {
         lint.span_suggestion(span, message, suggestion, Applicability::MaybeIncorrect);
     } else {
         let line_start = dox[..insert_index].rfind('\n').map_or(0, |idx| idx + 1);

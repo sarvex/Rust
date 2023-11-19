@@ -6,9 +6,9 @@ use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::sugg::Sugg;
 use clippy_utils::{
-    get_parent_node, is_else_clause, is_expn_of, peel_blocks, peel_blocks_with_stmt, span_extract_comment,
+    get_parent_node, higher, is_else_clause, is_expn_of, peel_blocks, peel_blocks_with_stmt, span_extract_comment,
+    SpanlessEq,
 };
-use clippy_utils::{higher, SpanlessEq};
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Block, Expr, ExprKind, HirId, Node, UnOp};
@@ -32,7 +32,7 @@ declare_clippy_lint! {
     /// shorter code.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = true;
     /// if x {
     ///     false
@@ -43,7 +43,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # let x = true;
     /// !x
     /// # ;
@@ -106,7 +106,7 @@ declare_clippy_lint! {
     /// # let mut skip: bool;
     /// skip = !must_keep(x, y);
     /// ```
-    #[clippy::version = "1.69.0"]
+    #[clippy::version = "1.71.0"]
     pub NEEDLESS_BOOL_ASSIGN,
     complexity,
     "setting the same boolean variable in both branches of an if-statement"
@@ -119,7 +119,7 @@ fn condition_needs_parentheses(e: &Expr<'_>) -> bool {
     | ExprKind::Call(i, _)
     | ExprKind::Cast(i, _)
     | ExprKind::Type(i, _)
-    | ExprKind::Index(i, _) = inner.kind
+    | ExprKind::Index(i, _, _) = inner.kind
     {
         if matches!(
             i.kind,
@@ -146,7 +146,7 @@ fn is_parent_stmt(cx: &LateContext<'_>, id: HirId) -> bool {
 impl<'tcx> LateLintPass<'tcx> for NeedlessBool {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) {
         use self::Expression::{Bool, RetBool};
-        if e.span.from_expansion() {
+        if e.span.from_expansion() || !span_extract_comment(cx.tcx.sess.source_map(), e.span).is_empty() {
             return;
         }
         if let Some(higher::If {
@@ -207,10 +207,9 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBool {
                     _ => (),
                 }
             }
-            if let Some((lhs_a, a)) = fetch_assign(then) &&
-                let Some((lhs_b, b)) = fetch_assign(r#else) &&
-                SpanlessEq::new(cx).eq_expr(lhs_a, lhs_b) &&
-                span_extract_comment(cx.tcx.sess.source_map(), e.span).is_empty()
+            if let Some((lhs_a, a)) = fetch_assign(then)
+                && let Some((lhs_b, b)) = fetch_assign(r#else)
+                && SpanlessEq::new(cx).eq_expr(lhs_a, lhs_b)
             {
                 let mut applicability = Applicability::MachineApplicable;
                 let cond = Sugg::hir_with_applicability(cx, cond, "..", &mut applicability);
@@ -227,7 +226,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBool {
                     "this if-then-else expression assigns a bool literal",
                     "you can reduce it to",
                     sugg,
-                    applicability
+                    applicability,
                 );
             }
         }

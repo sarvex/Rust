@@ -1,12 +1,13 @@
 //! Codegen of a single function
 
+use cranelift_codegen::ir::UserFuncName;
+use cranelift_codegen::CodegenError;
+use cranelift_module::ModuleError;
 use rustc_ast::InlineAsmOptions;
 use rustc_index::IndexVec;
-use rustc_middle::ty::adjustment::PointerCast;
+use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::layout::FnAbiOf;
 use rustc_middle::ty::print::with_no_trimmed_paths;
-
-use cranelift_codegen::ir::UserFuncName;
 
 use crate::constant::ConstantCx;
 use crate::debuginfo::FunctionDebugContext;
@@ -28,7 +29,7 @@ pub(crate) fn codegen_fn<'tcx>(
     module: &mut dyn Module,
     instance: Instance<'tcx>,
 ) -> CodegenedFunction {
-    debug_assert!(!instance.substs.has_infer());
+    debug_assert!(!instance.args.has_infer());
 
     let symbol_name = tcx.symbol_name(instance).name.to_string();
     let _timer = tcx.prof.generic_activity_with_arg("codegen fn", &*symbol_name);
@@ -156,6 +157,7 @@ pub(crate) fn compile_fn(
             write!(clif, " {}", isa_flag).unwrap();
         }
         writeln!(clif, "\n").unwrap();
+        writeln!(clif, "; symbol {}", codegened_func.symbol_name).unwrap();
         crate::PrintOnPanic(move || {
             let mut clif = clif.clone();
             ::cranelift_codegen::write::decorate_function(
@@ -171,7 +173,21 @@ pub(crate) fn compile_fn(
     // Define function
     cx.profiler.generic_activity("define function").run(|| {
         context.want_disasm = cx.should_write_ir;
-        module.define_function(codegened_func.func_id, context).unwrap();
+        match module.define_function(codegened_func.func_id, context) {
+            Ok(()) => {}
+            Err(ModuleError::Compilation(CodegenError::ImplLimitExceeded)) => {
+                let handler = rustc_session::EarlyErrorHandler::new(
+                    rustc_session::config::ErrorOutputType::default(),
+                );
+                handler.early_error(format!(
+                    "backend implementation limit exceeded while compiling {name}",
+                    name = codegened_func.symbol_name
+                ));
+            }
+            Err(err) => {
+                panic!("Error while defining {name}: {err:?}", name = codegened_func.symbol_name);
+            }
+        }
     });
 
     if cx.should_write_ir {
@@ -233,14 +249,6 @@ pub(crate) fn verify_func(
 }
 
 fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
-    if !crate::constant::check_constants(fx) {
-        fx.bcx.append_block_params_for_function_params(fx.block_map[START_BLOCK]);
-        fx.bcx.switch_to_block(fx.block_map[START_BLOCK]);
-        // compilation should have been aborted
-        fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
-        return;
-    }
-
     let arg_uninhabited = fx
         .mir
         .args_iter()
@@ -355,7 +363,7 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
 
                         codegen_panic_inner(
                             fx,
-                            rustc_hir::LangItem::PanicBoundsCheck,
+                            rustc_hir::LangItem::PanicMisalignedPointerDereference,
                             &[required, found, location],
                             source_info.span,
                         );
@@ -420,7 +428,7 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
                 target,
                 fn_span,
                 unwind: _,
-                from_hir_call: _,
+                call_source: _,
             } => {
                 fx.tcx.prof.generic_activity("codegen call").run(|| {
                     crate::abi::codegen_terminator_call(
@@ -448,7 +456,7 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
                     );
                 }
 
-                crate::inline_asm::codegen_inline_asm(
+                crate::inline_asm::codegen_inline_asm_terminator(
                     fx,
                     source_info.span,
                     template,
@@ -457,10 +465,10 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
                     *destination,
                 );
             }
-            TerminatorKind::Terminate => {
-                codegen_panic_cannot_unwind(fx, source_info);
+            TerminatorKind::UnwindTerminate(reason) => {
+                codegen_unwind_terminate(fx, source_info, *reason);
             }
-            TerminatorKind::Resume => {
+            TerminatorKind::UnwindResume => {
                 // FIXME implement unwinding
                 fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
             }
@@ -470,10 +478,10 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
             TerminatorKind::Yield { .. }
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. }
-            | TerminatorKind::GeneratorDrop => {
+            | TerminatorKind::CoroutineDrop => {
                 bug!("shouldn't exist at codegen {:?}", bb_data.terminator());
             }
-            TerminatorKind::Drop { place, target, unwind: _ } => {
+            TerminatorKind::Drop { place, target, unwind: _, replace: _ } => {
                 let drop_place = codegen_place(fx, *place);
                 crate::abi::codegen_drop(fx, source_info, drop_place);
 
@@ -570,20 +578,20 @@ fn codegen_stmt<'tcx>(
                     lval.write_cvalue(fx, res);
                 }
                 Rvalue::Cast(
-                    CastKind::Pointer(PointerCast::ReifyFnPointer),
+                    CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer),
                     ref operand,
                     to_ty,
                 ) => {
                     let from_ty = fx.monomorphize(operand.ty(&fx.mir.local_decls, fx.tcx));
                     let to_layout = fx.layout_of(fx.monomorphize(to_ty));
                     match *from_ty.kind() {
-                        ty::FnDef(def_id, substs) => {
+                        ty::FnDef(def_id, args) => {
                             let func_ref = fx.get_function_ref(
                                 Instance::resolve_for_fn_ptr(
                                     fx.tcx,
                                     ParamEnv::reveal_all(),
                                     def_id,
-                                    substs,
+                                    args,
                                 )
                                 .unwrap()
                                 .polymorphize(fx.tcx),
@@ -595,17 +603,17 @@ fn codegen_stmt<'tcx>(
                     }
                 }
                 Rvalue::Cast(
-                    CastKind::Pointer(PointerCast::UnsafeFnPointer),
+                    CastKind::PointerCoercion(PointerCoercion::UnsafeFnPointer),
                     ref operand,
                     to_ty,
                 )
                 | Rvalue::Cast(
-                    CastKind::Pointer(PointerCast::MutToConstPointer),
+                    CastKind::PointerCoercion(PointerCoercion::MutToConstPointer),
                     ref operand,
                     to_ty,
                 )
                 | Rvalue::Cast(
-                    CastKind::Pointer(PointerCast::ArrayToPointer),
+                    CastKind::PointerCoercion(PointerCoercion::ArrayToPointer),
                     ref operand,
                     to_ty,
                 ) => {
@@ -630,11 +638,11 @@ fn codegen_stmt<'tcx>(
                     let to_ty = fx.monomorphize(to_ty);
 
                     fn is_fat_ptr<'tcx>(fx: &FunctionCx<'_, '_, 'tcx>, ty: Ty<'tcx>) -> bool {
-                        ty.builtin_deref(true)
-                            .map(|ty::TypeAndMut { ty: pointee_ty, mutbl: _ }| {
+                        ty.builtin_deref(true).is_some_and(
+                            |ty::TypeAndMut { ty: pointee_ty, mutbl: _ }| {
                                 has_ptr_meta(fx.tcx, pointee_ty)
-                            })
-                            .unwrap_or(false)
+                            },
+                        )
                     }
 
                     if is_fat_ptr(fx, from_ty) {
@@ -661,17 +669,17 @@ fn codegen_stmt<'tcx>(
                     }
                 }
                 Rvalue::Cast(
-                    CastKind::Pointer(PointerCast::ClosureFnPointer(_)),
+                    CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(_)),
                     ref operand,
                     _to_ty,
                 ) => {
                     let operand = codegen_operand(fx, operand);
                     match *operand.layout().ty.kind() {
-                        ty::Closure(def_id, substs) => {
+                        ty::Closure(def_id, args) => {
                             let instance = Instance::resolve_closure(
                                 fx.tcx,
                                 def_id,
-                                substs,
+                                args,
                                 ty::ClosureKind::FnOnce,
                             )
                             .expect("failed to normalize and resolve closure during codegen")
@@ -683,7 +691,11 @@ fn codegen_stmt<'tcx>(
                         _ => bug!("{} cannot be cast to a fn ptr", operand.layout().ty),
                     }
                 }
-                Rvalue::Cast(CastKind::Pointer(PointerCast::Unsize), ref operand, _to_ty) => {
+                Rvalue::Cast(
+                    CastKind::PointerCoercion(PointerCoercion::Unsize),
+                    ref operand,
+                    _to_ty,
+                ) => {
                     let operand = codegen_operand(fx, operand);
                     crate::unsize::coerce_unsized_into(fx, operand, lval);
                 }
@@ -702,12 +714,8 @@ fn codegen_stmt<'tcx>(
                 }
                 Rvalue::Repeat(ref operand, times) => {
                     let operand = codegen_operand(fx, operand);
-                    let times = fx
-                        .monomorphize(times)
-                        .eval(fx.tcx, ParamEnv::reveal_all())
-                        .kind()
-                        .try_to_bits(fx.tcx.data_layout.pointer_size)
-                        .unwrap();
+                    let times =
+                        fx.monomorphize(times).eval_target_usize(fx.tcx, ParamEnv::reveal_all());
                     if operand.layout().size.bytes() == 0 {
                         // Do nothing for ZST's
                     } else if fx.clif_type(operand.layout().ty) == Some(types::I8) {
@@ -746,7 +754,7 @@ fn codegen_stmt<'tcx>(
                 }
                 Rvalue::ShallowInitBox(ref operand, content_ty) => {
                     let content_ty = fx.monomorphize(content_ty);
-                    let box_layout = fx.layout_of(fx.tcx.mk_box(content_ty));
+                    let box_layout = fx.layout_of(Ty::new_box(fx.tcx, content_ty));
                     let operand = codegen_operand(fx, operand);
                     let operand = operand.load_scalar(fx);
                     lval.write_cvalue(fx, CValue::by_val(operand, box_layout));
@@ -758,7 +766,7 @@ fn codegen_stmt<'tcx>(
                         NullOp::SizeOf => layout.size.bytes(),
                         NullOp::AlignOf => layout.align.abi.bytes(),
                         NullOp::OffsetOf(fields) => {
-                            layout.offset_of_subfield(fx, fields.iter().map(|f| f.index())).bytes()
+                            layout.offset_of_subfield(fx, fields.iter()).bytes()
                         }
                     };
                     let val = CValue::by_val(
@@ -855,7 +863,8 @@ pub(crate) fn codegen_place<'tcx>(
             PlaceElem::Deref => {
                 cplace = cplace.place_deref(fx);
             }
-            PlaceElem::OpaqueCast(ty) => cplace = cplace.place_opaque_cast(fx, ty),
+            PlaceElem::OpaqueCast(ty) => bug!("encountered OpaqueCast({ty}) in codegen"),
+            PlaceElem::Subtype(ty) => cplace = cplace.place_transmute_type(fx, fx.monomorphize(ty)),
             PlaceElem::Field(field, _ty) => {
                 cplace = cplace.place_field(fx, field);
             }
@@ -887,7 +896,7 @@ pub(crate) fn codegen_place<'tcx>(
                         let ptr = cplace.to_ptr();
                         cplace = CPlace::for_ptr(
                             ptr.offset_i64(fx, elem_layout.size.bytes() as i64 * (from as i64)),
-                            fx.layout_of(fx.tcx.mk_array(*elem_ty, to - from)),
+                            fx.layout_of(Ty::new_array(fx.tcx, *elem_ty, to - from)),
                         );
                     }
                     ty::Slice(elem_ty) => {
@@ -951,13 +960,14 @@ pub(crate) fn codegen_panic_nounwind<'tcx>(
     codegen_panic_inner(fx, rustc_hir::LangItem::PanicNounwind, &args, source_info.span);
 }
 
-pub(crate) fn codegen_panic_cannot_unwind<'tcx>(
+pub(crate) fn codegen_unwind_terminate<'tcx>(
     fx: &mut FunctionCx<'_, '_, 'tcx>,
     source_info: mir::SourceInfo,
+    reason: UnwindTerminateReason,
 ) {
     let args = [];
 
-    codegen_panic_inner(fx, rustc_hir::LangItem::PanicCannotUnwind, &args, source_info.span);
+    codegen_panic_inner(fx, reason.lang_item(), &args, source_info.span);
 }
 
 fn codegen_panic_inner<'tcx>(
@@ -966,11 +976,7 @@ fn codegen_panic_inner<'tcx>(
     args: &[Value],
     span: Span,
 ) {
-    let def_id = fx
-        .tcx
-        .lang_items()
-        .require(lang_item)
-        .unwrap_or_else(|e| fx.tcx.sess.span_fatal(span, e.to_string()));
+    let def_id = fx.tcx.require_lang_item(lang_item, Some(span));
 
     let instance = Instance::mono(fx.tcx, def_id).polymorphize(fx.tcx);
     let symbol_name = fx.tcx.symbol_name(instance).name;

@@ -1,4 +1,3 @@
-//@run-rustfix
 #![feature(const_fn_floating_point_arithmetic)]
 #![warn(clippy::suboptimal_flops)]
 
@@ -33,6 +32,9 @@ fn main() {
     let _ = 1234.567_f64 * 45.67834_f64 + 0.0004_f64;
 
     let _ = (a * a + b).sqrt();
+
+    let u = 1usize;
+    let _ = a - (b * u as f64);
 
     // Cases where the lint shouldn't be applied
     let _ = (a * a + b * b).sqrt();

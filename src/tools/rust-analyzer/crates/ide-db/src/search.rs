@@ -4,17 +4,18 @@
 //! get a super-set of matches. Then, we we confirm each match using precise
 //! name resolution.
 
-use std::{mem, sync::Arc};
+use std::mem;
 
-use base_db::{FileId, FileRange, SourceDatabase, SourceDatabaseExt};
+use base_db::{salsa::Database, FileId, FileRange, SourceDatabase, SourceDatabaseExt};
 use hir::{
     AsAssocItem, DefWithBody, HasAttrs, HasSource, InFile, ModuleSource, Semantics, Visibility,
 };
 use memchr::memmem::Finder;
+use nohash_hasher::IntMap;
 use once_cell::unsync::Lazy;
 use parser::SyntaxKind;
-use stdx::hash::NoHashHashMap;
 use syntax::{ast, match_ast, AstNode, TextRange, TextSize};
+use triomphe::Arc;
 
 use crate::{
     defs::{Definition, NameClass, NameRefClass},
@@ -24,7 +25,7 @@ use crate::{
 
 #[derive(Debug, Default, Clone)]
 pub struct UsageSearchResult {
-    pub references: NoHashHashMap<FileId, Vec<FileReference>>,
+    pub references: IntMap<FileId, Vec<FileReference>>,
 }
 
 impl UsageSearchResult {
@@ -49,7 +50,7 @@ impl UsageSearchResult {
 
 impl IntoIterator for UsageSearchResult {
     type Item = (FileId, Vec<FileReference>);
-    type IntoIter = <NoHashHashMap<FileId, Vec<FileReference>> as IntoIterator>::IntoIter;
+    type IntoIter = <IntMap<FileId, Vec<FileReference>> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
         self.references.into_iter()
@@ -83,17 +84,17 @@ pub enum ReferenceCategory {
 /// e.g. for things like local variables.
 #[derive(Clone, Debug)]
 pub struct SearchScope {
-    entries: NoHashHashMap<FileId, Option<TextRange>>,
+    entries: IntMap<FileId, Option<TextRange>>,
 }
 
 impl SearchScope {
-    fn new(entries: NoHashHashMap<FileId, Option<TextRange>>) -> SearchScope {
+    fn new(entries: IntMap<FileId, Option<TextRange>>) -> SearchScope {
         SearchScope { entries }
     }
 
     /// Build a search scope spanning the entire crate graph of files.
     fn crate_graph(db: &RootDatabase) -> SearchScope {
-        let mut entries = NoHashHashMap::default();
+        let mut entries = IntMap::default();
 
         let graph = db.crate_graph();
         for krate in graph.iter() {
@@ -107,7 +108,7 @@ impl SearchScope {
 
     /// Build a search scope spanning all the reverse dependencies of the given crate.
     fn reverse_dependencies(db: &RootDatabase, of: hir::Crate) -> SearchScope {
-        let mut entries = NoHashHashMap::default();
+        let mut entries = IntMap::default();
         for rev_dep in of.transitive_reverse_dependencies(db) {
             let root_file = rev_dep.root_file(db);
             let source_root_id = db.file_source_root(root_file);
@@ -126,8 +127,8 @@ impl SearchScope {
     }
 
     /// Build a search scope spanning the given module and all its submodules.
-    fn module_and_children(db: &RootDatabase, module: hir::Module) -> SearchScope {
-        let mut entries = NoHashHashMap::default();
+    pub fn module_and_children(db: &RootDatabase, module: hir::Module) -> SearchScope {
+        let mut entries = IntMap::default();
 
         let (file_id, range) = {
             let InFile { file_id, value } = module.definition_source(db);
@@ -148,10 +149,8 @@ impl SearchScope {
 
         let mut to_visit: Vec<_> = module.children(db).collect();
         while let Some(module) = to_visit.pop() {
-            if let InFile { file_id, value: ModuleSource::SourceFile(_) } =
-                module.definition_source(db)
-            {
-                entries.insert(file_id.original_file(db), None);
+            if let Some(file_id) = module.as_source_file_id(db) {
+                entries.insert(file_id, None);
             }
             to_visit.extend(module.children(db));
         }
@@ -160,7 +159,7 @@ impl SearchScope {
 
     /// Build an empty search scope.
     pub fn empty() -> SearchScope {
-        SearchScope::new(NoHashHashMap::default())
+        SearchScope::new(IntMap::default())
     }
 
     /// Build a empty search scope spanning the given file.
@@ -222,9 +221,8 @@ impl Definition {
         }
 
         // def is crate root
-        // FIXME: We don't do searches for crates currently, as a crate does not actually have a single name
         if let &Definition::Module(module) = self {
-            if module.is_crate_root(db) {
+            if module.is_crate_root() {
                 return SearchScope::reverse_dependencies(db, module.krate());
             }
         }
@@ -242,6 +240,8 @@ impl Definition {
                 DefWithBody::Const(c) => c.source(db).map(|src| src.syntax().cloned()),
                 DefWithBody::Static(s) => s.source(db).map(|src| src.syntax().cloned()),
                 DefWithBody::Variant(v) => v.source(db).map(|src| src.syntax().cloned()),
+                // FIXME: implement
+                DefWithBody::InTypeConst(_) => return SearchScope::empty(),
             };
             return match def {
                 Some(def) => SearchScope::file_range(def.as_ref().original_file_range_full(db)),
@@ -328,7 +328,7 @@ impl Definition {
 pub struct FindUsages<'a> {
     def: Definition,
     sema: &'a Semantics<'a, RootDatabase>,
-    scope: Option<SearchScope>,
+    scope: Option<&'a SearchScope>,
     /// The container of our definition should it be an assoc item
     assoc_item_container: Option<hir::AssocItemContainer>,
     /// whether to search for the `Self` type of the definition
@@ -339,19 +339,19 @@ pub struct FindUsages<'a> {
 
 impl<'a> FindUsages<'a> {
     /// Enable searching for `Self` when the definition is a type or `self` for modules.
-    pub fn include_self_refs(mut self) -> FindUsages<'a> {
+    pub fn include_self_refs(mut self) -> Self {
         self.include_self_kw_refs = def_to_ty(self.sema, &self.def);
         self.search_self_mod = true;
         self
     }
 
     /// Limit the search to a given [`SearchScope`].
-    pub fn in_scope(self, scope: SearchScope) -> FindUsages<'a> {
+    pub fn in_scope(self, scope: &'a SearchScope) -> Self {
         self.set_scope(Some(scope))
     }
 
     /// Limit the search to a given [`SearchScope`].
-    pub fn set_scope(mut self, scope: Option<SearchScope>) -> FindUsages<'a> {
+    pub fn set_scope(mut self, scope: Option<&'a SearchScope>) -> Self {
         assert!(self.scope.is_none());
         self.scope = scope;
         self
@@ -375,7 +375,7 @@ impl<'a> FindUsages<'a> {
         res
     }
 
-    fn search(&self, sink: &mut dyn FnMut(FileId, FileReference) -> bool) {
+    pub fn search(&self, sink: &mut dyn FnMut(FileId, FileReference) -> bool) {
         let _p = profile::span("FindUsages:search");
         let sema = self.sema;
 
@@ -391,8 +391,11 @@ impl<'a> FindUsages<'a> {
 
         let name = match self.def {
             // special case crate modules as these do not have a proper name
-            Definition::Module(module) if module.is_crate_root(self.sema.db) => {
-                // FIXME: This assumes the crate name is always equal to its display name when it really isn't
+            Definition::Module(module) if module.is_crate_root() => {
+                // FIXME: This assumes the crate name is always equal to its display name when it
+                // really isn't
+                // we should instead look at the dependency edge name and recursively search our way
+                // up the ancestors
                 module
                     .krate()
                     .display_name(self.sema.db)
@@ -438,11 +441,11 @@ impl<'a> FindUsages<'a> {
         fn scope_files<'a>(
             sema: &'a Semantics<'_, RootDatabase>,
             scope: &'a SearchScope,
-        ) -> impl Iterator<Item = (Arc<String>, FileId, TextRange)> + 'a {
+        ) -> impl Iterator<Item = (Arc<str>, FileId, TextRange)> + 'a {
             scope.entries.iter().map(|(&file_id, &search_range)| {
                 let text = sema.db.file_text(file_id);
                 let search_range =
-                    search_range.unwrap_or_else(|| TextRange::up_to(TextSize::of(text.as_str())));
+                    search_range.unwrap_or_else(|| TextRange::up_to(TextSize::of(&*text)));
 
                 (text, file_id, search_range)
             })
@@ -455,18 +458,19 @@ impl<'a> FindUsages<'a> {
                     it.text().trim_start_matches("r#") == name
                 })
                 .into_iter()
-                .flat_map(|token| {
+                .flat_map(move |token| {
                     // FIXME: There should be optimization potential here
                     // Currently we try to descend everything we find which
                     // means we call `Semantics::descend_into_macros` on
                     // every textual hit. That function is notoriously
                     // expensive even for things that do not get down mapped
                     // into macros.
-                    sema.descend_into_macros(token).into_iter().filter_map(|it| it.parent())
+                    sema.descend_into_macros(token, offset).into_iter().filter_map(|it| it.parent())
                 })
         };
 
         for (text, file_id, search_range) in scope_files(sema, &search_scope) {
+            self.sema.db.unwind_if_cancelled();
             let tree = Lazy::new(move || sema.parse(file_id).syntax().clone());
 
             // Search for occurrences of the items name
@@ -499,10 +503,11 @@ impl<'a> FindUsages<'a> {
             let scope =
                 search_scope.intersection(&SearchScope::module_and_children(self.sema.db, module));
 
-            let is_crate_root = module.is_crate_root(self.sema.db).then(|| Finder::new("crate"));
+            let is_crate_root = module.is_crate_root().then(|| Finder::new("crate"));
             let finder = &Finder::new("super");
 
             for (text, file_id, search_range) in scope_files(sema, &scope) {
+                self.sema.db.unwind_if_cancelled();
                 let tree = Lazy::new(move || sema.parse(file_id).syntax().clone());
 
                 for offset in match_indices(&text, finder, search_range) {
@@ -553,7 +558,7 @@ impl<'a> FindUsages<'a> {
 
                 let text = sema.db.file_text(file_id);
                 let search_range =
-                    search_range.unwrap_or_else(|| TextRange::up_to(TextSize::of(text.as_str())));
+                    search_range.unwrap_or_else(|| TextRange::up_to(TextSize::of(&*text)));
 
                 let tree = Lazy::new(|| sema.parse(file_id).syntax().clone());
                 let finder = &Finder::new("self");
@@ -579,7 +584,7 @@ impl<'a> FindUsages<'a> {
     ) -> bool {
         match NameRefClass::classify(self.sema, name_ref) {
             Some(NameRefClass::Definition(Definition::SelfType(impl_)))
-                if impl_.self_ty(self.sema.db) == *self_ty =>
+                if impl_.self_ty(self.sema.db).as_adt() == self_ty.as_adt() =>
             {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                 let reference = FileReference {

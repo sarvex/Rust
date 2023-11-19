@@ -20,7 +20,7 @@ declare_clippy_lint! {
     /// instead.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let samples = vec![3, 1, 2];
     /// let mut sorted_samples = samples.clone();
     /// sorted_samples.sort();
@@ -29,7 +29,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # let samples = vec![3, 1, 2];
     /// let mut sorted_samples = samples.clone();
     /// sorted_samples.sort();
@@ -37,7 +37,7 @@ declare_clippy_lint! {
     ///     println!("{sample}");
     /// }
     /// ```
-    #[clippy::version = "1.69.0"]
+    #[clippy::version = "1.70.0"]
     pub COLLECTION_IS_NEVER_READ,
     nursery,
     "a collection is never queried"

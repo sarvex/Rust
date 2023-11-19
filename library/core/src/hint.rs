@@ -175,34 +175,27 @@ pub fn spin_loop() {
         unsafe { crate::arch::x86_64::_mm_pause() };
     }
 
-    // RISC-V platform spin loop hint implementation
+    #[cfg(target_arch = "riscv32")]
     {
-        // RISC-V RV32 and RV64 share the same PAUSE instruction, but they are located in different
-        // modules in `core::arch`.
-        // In this case, here we call `pause` function in each core arch module.
-        #[cfg(target_arch = "riscv32")]
-        {
-            crate::arch::riscv32::pause();
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            crate::arch::riscv64::pause();
-        }
+        crate::arch::riscv32::pause();
     }
 
-    #[cfg(any(target_arch = "aarch64", all(target_arch = "arm", target_feature = "v6")))]
+    #[cfg(target_arch = "riscv64")]
     {
-        #[cfg(target_arch = "aarch64")]
-        {
-            // SAFETY: the `cfg` attr ensures that we only execute this on aarch64 targets.
-            unsafe { crate::arch::aarch64::__isb(crate::arch::aarch64::SY) };
-        }
-        #[cfg(target_arch = "arm")]
-        {
-            // SAFETY: the `cfg` attr ensures that we only execute this on arm targets
-            // with support for the v6 feature.
-            unsafe { crate::arch::arm::__yield() };
-        }
+        crate::arch::riscv64::pause();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the `cfg` attr ensures that we only execute this on aarch64 targets.
+        unsafe { crate::arch::aarch64::__isb(crate::arch::aarch64::SY) };
+    }
+
+    #[cfg(all(target_arch = "arm", target_feature = "v6"))]
+    {
+        // SAFETY: the `cfg` attr ensures that we only execute this on arm targets
+        // with support for the v6 feature.
+        unsafe { crate::arch::arm::__yield() };
     }
 }
 
@@ -284,7 +277,7 @@ pub fn spin_loop() {
 /// - Treats the call to `contains` and its result as volatile: the body of `benchmark` cannot
 ///   optimize this away
 ///
-/// This makes our benchmark much more realistic to how the function would be used in situ, where
+/// This makes our benchmark much more realistic to how the function would actually be used, where
 /// arguments are usually not known at compile time and the result is used in some way.
 #[inline]
 #[stable(feature = "bench_black_box", since = "1.66.0")]

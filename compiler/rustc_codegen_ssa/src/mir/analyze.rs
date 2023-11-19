@@ -8,7 +8,7 @@ use rustc_index::bit_set::BitSet;
 use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::mir::traversal;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
-use rustc_middle::mir::{self, Location, TerminatorKind};
+use rustc_middle::mir::{self, DefLocation, Location, TerminatorKind};
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf};
 
 pub fn non_ssa_locals<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
@@ -36,7 +36,7 @@ pub fn non_ssa_locals<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
     // Arguments get assigned to by means of the function being called
     for arg in mir.args_iter() {
-        analyzer.assign(arg, DefLocation::Argument);
+        analyzer.define(arg, DefLocation::Argument);
     }
 
     // If there exists a local definition that dominates all uses of that local,
@@ -67,29 +67,14 @@ enum LocalKind {
     SSA(DefLocation),
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum DefLocation {
-    Argument,
-    Body(Location),
-}
-
-impl DefLocation {
-    fn dominates(self, location: Location, dominators: &Dominators<mir::BasicBlock>) -> bool {
-        match self {
-            DefLocation::Argument => true,
-            DefLocation::Body(def) => def.successor_within_block().dominates(location, dominators),
-        }
-    }
-}
-
 struct LocalAnalyzer<'mir, 'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> {
     fx: &'mir FunctionCx<'a, 'tcx, Bx>,
-    dominators: Dominators<mir::BasicBlock>,
+    dominators: &'mir Dominators<mir::BasicBlock>,
     locals: IndexVec<mir::Local, LocalKind>,
 }
 
 impl<'mir, 'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> LocalAnalyzer<'mir, 'a, 'tcx, Bx> {
-    fn assign(&mut self, local: mir::Local, location: DefLocation) {
+    fn define(&mut self, local: mir::Local, location: DefLocation) {
         let kind = &mut self.locals[local];
         match *kind {
             LocalKind::ZST => {}
@@ -177,7 +162,7 @@ impl<'mir, 'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> Visitor<'tcx>
         debug!("visit_assign(place={:?}, rvalue={:?})", place, rvalue);
 
         if let Some(local) = place.as_local() {
-            self.assign(local, DefLocation::Body(location));
+            self.define(local, DefLocation::Assignment(location));
             if self.locals[local] != LocalKind::Memory {
                 let decl_span = self.fx.mir.local_decls[local].source_info.span;
                 if !self.fx.rvalue_creates_operand(rvalue, decl_span) {
@@ -198,9 +183,14 @@ impl<'mir, 'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> Visitor<'tcx>
 
     fn visit_local(&mut self, local: mir::Local, context: PlaceContext, location: Location) {
         match context {
-            PlaceContext::MutatingUse(MutatingUseContext::Call)
-            | PlaceContext::MutatingUse(MutatingUseContext::Yield) => {
-                self.assign(local, DefLocation::Body(location));
+            PlaceContext::MutatingUse(MutatingUseContext::Call) => {
+                let call = location.block;
+                let TerminatorKind::Call { target, .. } =
+                    self.fx.mir.basic_blocks[call].terminator().kind
+                else {
+                    bug!()
+                };
+                self.define(local, DefLocation::CallReturn { call, target });
             }
 
             PlaceContext::NonUse(_)
@@ -234,8 +224,7 @@ impl<'mir, 'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> Visitor<'tcx>
             | PlaceContext::NonMutatingUse(
                 NonMutatingUseContext::Inspect
                 | NonMutatingUseContext::SharedBorrow
-                | NonMutatingUseContext::UniqueBorrow
-                | NonMutatingUseContext::ShallowBorrow
+                | NonMutatingUseContext::FakeBorrow
                 | NonMutatingUseContext::AddressOf
                 | NonMutatingUseContext::Projection,
             ) => {
@@ -253,6 +242,8 @@ impl<'mir, 'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> Visitor<'tcx>
                     }
                 }
             }
+
+            PlaceContext::MutatingUse(MutatingUseContext::Yield) => bug!(),
         }
     }
 }
@@ -285,10 +276,10 @@ pub fn cleanup_kinds(mir: &mir::Body<'_>) -> IndexVec<mir::BasicBlock, CleanupKi
         for (bb, data) in mir.basic_blocks.iter_enumerated() {
             match data.terminator().kind {
                 TerminatorKind::Goto { .. }
-                | TerminatorKind::Resume
-                | TerminatorKind::Terminate
+                | TerminatorKind::UnwindResume
+                | TerminatorKind::UnwindTerminate(_)
                 | TerminatorKind::Return
-                | TerminatorKind::GeneratorDrop
+                | TerminatorKind::CoroutineDrop
                 | TerminatorKind::Unreachable
                 | TerminatorKind::SwitchInt { .. }
                 | TerminatorKind::Yield { .. }

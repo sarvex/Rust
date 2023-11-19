@@ -1,6 +1,5 @@
 use std::num::NonZeroU32;
 
-use crate::cgu_reuse_tracker::CguReuse;
 use crate::parse::ParseSess;
 use rustc_ast::token;
 use rustc_ast::util::literal::LitError;
@@ -8,24 +7,6 @@ use rustc_errors::{error_code, DiagnosticMessage, EmissionGuarantee, IntoDiagnos
 use rustc_macros::Diagnostic;
 use rustc_span::{BytePos, Span, Symbol};
 use rustc_target::spec::{SplitDebuginfo, StackProtector, TargetTriple};
-
-#[derive(Diagnostic)]
-#[diag(session_incorrect_cgu_reuse_type)]
-pub struct IncorrectCguReuseType<'a> {
-    #[primary_span]
-    pub span: Span,
-    pub cgu_user_name: &'a str,
-    pub actual_reuse: CguReuse,
-    pub expected_reuse: CguReuse,
-    pub at_least: u8,
-}
-
-#[derive(Diagnostic)]
-#[diag(session_cgu_not_recorded)]
-pub struct CguNotRecorded<'a> {
-    pub cgu_user_name: &'a str,
-    pub cgu_name: &'a str,
-}
 
 pub struct FeatureGateError {
     pub span: MultiSpan,
@@ -54,6 +35,12 @@ pub struct FeatureDiagnosticForIssue {
 #[derive(Subdiagnostic)]
 #[help(session_feature_diagnostic_help)]
 pub struct FeatureDiagnosticHelp {
+    pub feature: Symbol,
+}
+
+#[derive(Subdiagnostic)]
+#[help(session_cli_feature_diagnostic_help)]
+pub struct CliFeatureDiagnosticHelp {
     pub feature: Symbol,
 }
 
@@ -115,6 +102,10 @@ pub struct CannotEnableCrtStaticLinux;
 pub struct SanitizerCfiRequiresLto;
 
 #[derive(Diagnostic)]
+#[diag(session_sanitizer_cfi_requires_single_codegen_unit)]
+pub struct SanitizerCfiRequiresSingleCodegenUnit;
+
+#[derive(Diagnostic)]
 #[diag(session_sanitizer_cfi_canonical_jump_tables_requires_cfi)]
 pub struct SanitizerCfiCanonicalJumpTablesRequiresCfi;
 
@@ -164,6 +155,13 @@ pub struct FileIsNotWriteable<'a> {
 }
 
 #[derive(Diagnostic)]
+#[diag(session_file_write_fail)]
+pub(crate) struct FileWriteFail<'a> {
+    pub path: &'a std::path::Path,
+    pub err: String,
+}
+
+#[derive(Diagnostic)]
 #[diag(session_crate_name_does_not_match)]
 pub struct CrateNameDoesNotMatch {
     #[primary_span]
@@ -192,6 +190,14 @@ pub struct InvalidCharacterInCrateName {
     pub span: Option<Span>,
     pub character: char,
     pub crate_name: Symbol,
+    #[subdiagnostic]
+    pub crate_name_help: Option<InvalidCrateNameHelp>,
+}
+
+#[derive(Subdiagnostic)]
+pub enum InvalidCrateNameHelp {
+    #[help(session_invalid_character_in_create_name_help)]
+    AddCrateName,
 }
 
 #[derive(Subdiagnostic)]
@@ -421,4 +427,12 @@ pub fn report_lit_error(sess: &ParseSess, err: LitError, lit: token::Lit, span: 
 #[diag(session_optimization_fuel_exhausted)]
 pub struct OptimisationFuelExhausted {
     pub msg: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(session_incompatible_linker_flavor)]
+#[note]
+pub struct IncompatibleLinkerFlavor {
+    pub flavor: &'static str,
+    pub compatible_list: String,
 }

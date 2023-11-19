@@ -83,7 +83,7 @@ impl Stack {
         self.borrows.truncate(write_idx);
 
         #[cfg(not(feature = "stack-cache"))]
-        drop(first_removed); // This is only needed for the stack-cache
+        let _unused = first_removed; // This is only needed for the stack-cache
 
         #[cfg(feature = "stack-cache")]
         if let Some(first_removed) = first_removed {
@@ -196,19 +196,19 @@ impl<'tcx> Stack {
         let ProvenanceExtra::Concrete(tag) = tag else {
             // Handle the wildcard case.
             // Go search the stack for an exposed tag.
-            if let Some(idx) =
-                self.borrows
-                    .iter()
-                    .enumerate() // we also need to know *where* in the stack
-                    .rev() // search top-to-bottom
-                    .find_map(|(idx, item)| {
-                        // If the item fits and *might* be this wildcard, use it.
-                        if item.perm().grants(access) && exposed_tags.contains(&item.tag()) {
-                            Some(idx)
-                        } else {
-                            None
-                        }
-                    })
+            if let Some(idx) = self
+                .borrows
+                .iter()
+                .enumerate() // we also need to know *where* in the stack
+                .rev() // search top-to-bottom
+                .find_map(|(idx, item)| {
+                    // If the item fits and *might* be this wildcard, use it.
+                    if item.perm().grants(access) && exposed_tags.contains(&item.tag()) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
             {
                 return Ok(Some(idx));
             }

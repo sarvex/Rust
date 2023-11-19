@@ -143,7 +143,7 @@ async function runTests(opts, framework_options, files, results, status_bar, sho
     const tests_queue = [];
 
     for (const testPath of files) {
-        const callback = runTest(testPath, framework_options)
+        const callback = runTest(testPath, {"options": framework_options})
             .then(out => {
                 const [output, nb_failures] = out;
                 results[nb_failures === 0 ? "successful" : "failed"].push({
@@ -201,8 +201,8 @@ async function main(argv) {
     try {
         // This is more convenient that setting fields one by one.
         const args = [
-            "--variable", "DOC_PATH", opts["doc_folder"], "--enable-fail-on-js-error",
-            "--allow-file-access-from-files",
+            "--variable", "DOC_PATH", opts["doc_folder"].split("\\").join("/"),
+            "--enable-fail-on-js-error", "--allow-file-access-from-files",
         ];
         if (opts["debug"]) {
             debug = true;
@@ -249,12 +249,17 @@ async function main(argv) {
         console.log("`--no-headless` option is active, disabling concurrency for running tests.");
     }
 
-    console.log(`Running ${files.length} rustdoc-gui (${opts["jobs"]} concurrently) ...`);
-
     if (opts["jobs"] < 1) {
+        const len = files.length;
+        console.log(
+            `Running ${len} rustdoc-gui (UNBOUNDED concurrency; use "-j#" for a limit) ...`,
+        );
         process.setMaxListeners(files.length + 1);
     } else if (headless) {
+        console.log(`Running ${files.length} rustdoc-gui (${opts["jobs"]} concurrently) ...`);
         process.setMaxListeners(opts["jobs"] + 1);
+    } else {
+        console.log(`Running ${files.length} rustdoc-gui ...`);
     }
 
     // We catch this "event" to display a nicer message in case of unexpected exit (because of a
@@ -323,6 +328,7 @@ async function main(argv) {
     if (results.failed.length > 0 || results.errored.length > 0) {
         process.exit(1);
     }
+    process.exit(0);
 }
 
 main(process.argv);

@@ -3,17 +3,18 @@ use crate::errors::{
     AssocTypeBindingNotAllowed, ManualImplementation, MissingTypeParams,
     ParenthesizedFnTraitExpansion,
 };
+use crate::traits::error_reporting::report_object_safety_error;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{pluralize, struct_span_err, Applicability, Diagnostic, ErrorGuaranteed};
 use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_infer::traits::FulfillmentError;
-use rustc_middle::ty::TyCtxt;
-use rustc_middle::ty::{self, Ty};
+use rustc_middle::ty::{self, suggest_constraining_type_param, Ty, TyCtxt};
 use rustc_session::parse::feature_err;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::symbol::{sym, Ident};
 use rustc_span::{Span, Symbol, DUMMY_SP};
+use rustc_trait_selection::traits::object_safety_violations_for_assoc_item;
 
 use std::collections::BTreeSet;
 
@@ -102,6 +103,7 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
         &self,
         all_candidates: impl Fn() -> I,
         ty_param_name: &str,
+        ty_param_def_id: Option<LocalDefId>,
         assoc_name: Ident,
         span: Span,
     ) -> ErrorGuaranteed
@@ -110,27 +112,36 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
     {
         // The fallback span is needed because `assoc_name` might be an `Fn()`'s `Output` without a
         // valid span, so we point at the whole path segment instead.
-        let span = if assoc_name.span != DUMMY_SP { assoc_name.span } else { span };
+        let is_dummy = assoc_name.span == DUMMY_SP;
+
         let mut err = struct_span_err!(
             self.tcx().sess,
-            span,
+            if is_dummy { span } else { assoc_name.span },
             E0220,
             "associated type `{}` not found for `{}`",
             assoc_name,
             ty_param_name
         );
 
+        if is_dummy {
+            err.span_label(span, format!("associated type `{assoc_name}` not found"));
+            return err.emit();
+        }
+
         let all_candidate_names: Vec<_> = all_candidates()
             .flat_map(|r| self.tcx().associated_items(r.def_id()).in_definition_order())
-            .filter_map(
-                |item| if item.kind == ty::AssocKind::Type { Some(item.name) } else { None },
-            )
+            .filter_map(|item| {
+                if !item.is_impl_trait_in_trait() && item.kind == ty::AssocKind::Type {
+                    Some(item.name)
+                } else {
+                    None
+                }
+            })
             .collect();
 
-        if let (Some(suggested_name), true) = (
-            find_best_match_for_name(&all_candidate_names, assoc_name.name, None),
-            assoc_name.span != DUMMY_SP,
-        ) {
+        if let Some(suggested_name) =
+            find_best_match_for_name(&all_candidate_names, assoc_name.name, None)
+        {
             err.span_suggestion(
                 assoc_name.span,
                 "there is an associated type with a similar name",
@@ -159,15 +170,18 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
             .flat_map(|trait_def_id| {
                 self.tcx().associated_items(*trait_def_id).in_definition_order()
             })
-            .filter_map(
-                |item| if item.kind == ty::AssocKind::Type { Some(item.name) } else { None },
-            )
+            .filter_map(|item| {
+                if !item.is_impl_trait_in_trait() && item.kind == ty::AssocKind::Type {
+                    Some(item.name)
+                } else {
+                    None
+                }
+            })
             .collect();
 
-        if let (Some(suggested_name), true) = (
-            find_best_match_for_name(&wider_candidate_names, assoc_name.name, None),
-            assoc_name.span != DUMMY_SP,
-        ) {
+        if let Some(suggested_name) =
+            find_best_match_for_name(&wider_candidate_names, assoc_name.name, None)
+        {
             if let [best_trait] = visible_traits
                 .iter()
                 .filter(|trait_def_id| {
@@ -178,18 +192,85 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
                 })
                 .collect::<Vec<_>>()[..]
             {
+                let trait_name = self.tcx().def_path_str(*best_trait);
+                let an = if suggested_name != assoc_name.name { "a similarly named" } else { "an" };
                 err.span_label(
                     assoc_name.span,
                     format!(
-                        "there is a similarly named associated type `{suggested_name}` in the trait `{}`",
-                        self.tcx().def_path_str(*best_trait)
+                        "there is {an} associated type `{suggested_name}` in the \
+                         trait `{trait_name}`",
                     ),
                 );
+                let hir = self.tcx().hir();
+                if let Some(def_id) = ty_param_def_id
+                    && let parent = hir.get_parent_item(hir.local_def_id_to_hir_id(def_id))
+                    && let Some(generics) = hir.get_generics(parent.def_id)
+                {
+                    if generics.bounds_for_param(def_id).flat_map(|pred| pred.bounds.iter()).any(
+                        |b| match b {
+                            hir::GenericBound::Trait(t, ..) => {
+                                t.trait_ref.trait_def_id().as_ref() == Some(best_trait)
+                            }
+                            _ => false,
+                        },
+                    ) {
+                        // The type param already has a bound for `trait_name`, we just need to
+                        // change the associated type.
+                        err.span_suggestion_verbose(
+                            assoc_name.span,
+                            format!(
+                                "change the associated type name to use `{suggested_name}` from \
+                                 `{trait_name}`",
+                            ),
+                            suggested_name.to_string(),
+                            Applicability::MaybeIncorrect,
+                        );
+                    } else if suggest_constraining_type_param(
+                        self.tcx(),
+                        generics,
+                        &mut err,
+                        &ty_param_name,
+                        &trait_name,
+                        None,
+                        None,
+                    ) && suggested_name != assoc_name.name
+                    {
+                        // We suggested constraining a type parameter, but the associated type on it
+                        // was also not an exact match, so we also suggest changing it.
+                        err.span_suggestion_verbose(
+                            assoc_name.span,
+                            "and also change the associated type name",
+                            suggested_name.to_string(),
+                            Applicability::MaybeIncorrect,
+                        );
+                    }
+                }
                 return err.emit();
             }
         }
 
-        err.span_label(span, format!("associated type `{}` not found", assoc_name));
+        // If we still couldn't find any associated type, and only one associated type exists,
+        // suggests using it.
+
+        if all_candidate_names.len() == 1 {
+            // this should still compile, except on `#![feature(associated_type_defaults)]`
+            // where it could suggests `type A = Self::A`, thus recursing infinitely
+            let applicability = if self.tcx().features().associated_type_defaults {
+                Applicability::Unspecified
+            } else {
+                Applicability::MaybeIncorrect
+            };
+
+            err.span_suggestion(
+                assoc_name.span,
+                format!("`{ty_param_name}` has the following associated type"),
+                all_candidate_names.first().unwrap().to_string(),
+                applicability,
+            );
+        } else {
+            err.span_label(assoc_name.span, format!("associated type `{assoc_name}` not found"));
+        }
+
         err.emit()
     }
 
@@ -239,7 +320,7 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
                 "the candidate".into()
             };
 
-            let impl_ty = tcx.at(span).type_of(impl_).subst_identity();
+            let impl_ty = tcx.at(span).type_of(impl_).instantiate_identity();
             let note = format!("{title} is defined in an impl for the type `{impl_ty}`");
 
             if let Some(span) = note_span {
@@ -287,7 +368,9 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
             let type_candidates = candidates
                 .iter()
                 .take(limit)
-                .map(|&(impl_, _)| format!("- `{}`", tcx.at(span).type_of(impl_).subst_identity()))
+                .map(|&(impl_, _)| {
+                    format!("- `{}`", tcx.at(span).type_of(impl_).instantiate_identity())
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             let additional_types = if candidates.len() > limit {
@@ -343,18 +426,18 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
         let format_pred = |pred: ty::Predicate<'tcx>| {
             let bound_predicate = pred.kind();
             match bound_predicate.skip_binder() {
-                ty::PredicateKind::Clause(ty::Clause::Projection(pred)) => {
+                ty::PredicateKind::Clause(ty::ClauseKind::Projection(pred)) => {
                     let pred = bound_predicate.rebind(pred);
                     // `<Foo as Iterator>::Item = String`.
                     let projection_ty = pred.skip_binder().projection_ty;
 
-                    let substs_with_infer_self = tcx.mk_substs_from_iter(
-                        std::iter::once(tcx.mk_ty_var(ty::TyVid::from_u32(0)).into())
-                            .chain(projection_ty.substs.iter().skip(1)),
+                    let args_with_infer_self = tcx.mk_args_from_iter(
+                        std::iter::once(Ty::new_var(tcx, ty::TyVid::from_u32(0)).into())
+                            .chain(projection_ty.args.iter().skip(1)),
                     );
 
                     let quiet_projection_ty =
-                        tcx.mk_alias_ty(projection_ty.def_id, substs_with_infer_self);
+                        ty::AliasTy::new(tcx, projection_ty.def_id, args_with_infer_self);
 
                     let term = pred.skip_binder().term;
 
@@ -364,7 +447,7 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
                     bound_span_label(projection_ty.self_ty(), &obligation, &quiet);
                     Some((obligation, projection_ty.self_ty()))
                 }
-                ty::PredicateKind::Clause(ty::Clause::Trait(poly_trait_ref)) => {
+                ty::PredicateKind::Clause(ty::ClauseKind::Trait(poly_trait_ref)) => {
                     let p = poly_trait_ref.trait_ref;
                     let self_ty = p.self_ty();
                     let path = p.print_only_trait_path();
@@ -383,7 +466,7 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
             .into_iter()
             .map(|error| error.root_obligation.predicate)
             .filter_map(format_pred)
-            .map(|(p, _)| format!("`{}`", p))
+            .map(|(p, _)| format!("`{p}`"))
             .collect();
         bounds.sort();
         bounds.dedup();
@@ -437,23 +520,32 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
                 (span, def_ids.into_iter().map(|did| tcx.associated_item(did)).collect())
             })
             .collect();
-        let mut names = vec![];
+        let mut names: FxHashMap<String, Vec<Symbol>> = Default::default();
+        let mut names_len = 0;
 
         // Account for things like `dyn Foo + 'a`, like in tests `issue-22434.rs` and
         // `issue-22560.rs`.
         let mut trait_bound_spans: Vec<Span> = vec![];
+        let mut object_safety_violations = false;
         for (span, items) in &associated_types {
             if !items.is_empty() {
                 trait_bound_spans.push(*span);
             }
             for assoc_item in items {
                 let trait_def_id = assoc_item.container_id(tcx);
-                names.push(format!(
-                    "`{}` (from trait `{}`)",
-                    assoc_item.name,
-                    tcx.def_path_str(trait_def_id),
-                ));
+                names.entry(tcx.def_path_str(trait_def_id)).or_default().push(assoc_item.name);
+                names_len += 1;
+
+                let violations =
+                    object_safety_violations_for_assoc_item(tcx, trait_def_id, *assoc_item);
+                if !violations.is_empty() {
+                    report_object_safety_error(tcx, *span, trait_def_id, &violations).emit();
+                    object_safety_violations = true;
+                }
             }
+        }
+        if object_safety_violations {
+            return;
         }
         if let ([], [bound]) = (&potential_assoc_types[..], &trait_bounds) {
             match bound.trait_ref.path.segments {
@@ -490,15 +582,35 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
                 _ => {}
             }
         }
+
+        let mut names = names
+            .into_iter()
+            .map(|(trait_, mut assocs)| {
+                assocs.sort();
+                format!(
+                    "{} in `{trait_}`",
+                    match &assocs[..] {
+                        [] => String::new(),
+                        [only] => format!("`{only}`"),
+                        [assocs @ .., last] => format!(
+                            "{} and `{last}`",
+                            assocs.iter().map(|a| format!("`{a}`")).collect::<Vec<_>>().join(", ")
+                        ),
+                    }
+                )
+            })
+            .collect::<Vec<String>>();
         names.sort();
+        let names = names.join(", ");
+
         trait_bound_spans.sort();
         let mut err = struct_span_err!(
             tcx.sess,
             trait_bound_spans,
             E0191,
             "the value of the associated type{} {} must be specified",
-            pluralize!(names.len()),
-            names.join(", "),
+            pluralize!(names_len),
+            names,
         );
         let mut suggestions = vec![];
         let mut types_count = 0;
@@ -587,7 +699,21 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
                 }
             }
         }
-        if !suggestions.is_empty() {
+        suggestions.sort_by_key(|&(span, _)| span);
+        // There are cases where one bound points to a span within another bound's span, like when
+        // you have code like the following (#115019), so we skip providing a suggestion in those
+        // cases to avoid having a malformed suggestion.
+        //
+        // pub struct Flatten<I> {
+        //     inner: <IntoIterator<Item: IntoIterator<Item: >>::IntoIterator as Item>::core,
+        //             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        //             |                  ^^^^^^^^^^^^^^^^^^^^^
+        //             |                  |
+        //             |                  associated types `Item`, `IntoIter` must be specified
+        //             associated types `Item`, `IntoIter` must be specified
+        // }
+        let overlaps = suggestions.windows(2).any(|pair| pair[0].0.overlaps(pair[1].0));
+        if !suggestions.is_empty() && !overlaps {
             err.multipart_suggestion(
                 format!("specify the associated type{}", pluralize!(types_count)),
                 suggestions,
@@ -642,7 +768,7 @@ pub(crate) fn fn_trait_to_string(
             }
             .map(|s| {
                 // `s.empty()` checks to see if the type is the unit tuple, if so we don't want a comma
-                if parenthesized || s.is_empty() { format!("({})", s) } else { format!("({},)", s) }
+                if parenthesized || s.is_empty() { format!("({s})") } else { format!("({s},)") }
             })
             .ok(),
             _ => None,

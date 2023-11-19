@@ -1,11 +1,11 @@
 use cranelift_codegen::isa::TargetFrontendConfig;
 use gimli::write::FileId;
-
 use rustc_data_structures::sync::Lrc;
 use rustc_index::IndexVec;
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOfHelpers,
 };
+use rustc_span::source_map::Spanned;
 use rustc_span::SourceFile;
 use rustc_target::abi::call::FnAbi;
 use rustc_target::abi::{Integer, Primitive};
@@ -98,7 +98,7 @@ fn clif_pair_type_from_ty<'tcx>(
 
 /// Is a pointer to this type a fat ptr?
 pub(crate) fn has_ptr_meta<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
-    let ptr_ty = tcx.mk_ptr(TypeAndMut { ty, mutbl: rustc_hir::Mutability::Not });
+    let ptr_ty = Ty::new_ptr(tcx, TypeAndMut { ty, mutbl: rustc_hir::Mutability::Not });
     match &tcx.layout_of(ParamEnv::reveal_all().and(ptr_ty)).unwrap().abi {
         Abi::Scalar(_) => false,
         Abi::ScalarPair(_, _) => true,
@@ -203,9 +203,9 @@ pub(crate) fn type_min_max_value(
         (types::I8, false) | (types::I16, false) | (types::I32, false) | (types::I64, false) => {
             0i64
         }
-        (types::I8, true) => i64::from(i8::MIN),
-        (types::I16, true) => i64::from(i16::MIN),
-        (types::I32, true) => i64::from(i32::MIN),
+        (types::I8, true) => i64::from(i8::MIN as u8),
+        (types::I16, true) => i64::from(i16::MIN as u16),
+        (types::I32, true) => i64::from(i32::MIN as u32),
         (types::I64, true) => i64::MIN,
         _ => unreachable!(),
     };
@@ -215,9 +215,9 @@ pub(crate) fn type_min_max_value(
         (types::I16, false) => i64::from(u16::MAX),
         (types::I32, false) => i64::from(u32::MAX),
         (types::I64, false) => u64::MAX as i64,
-        (types::I8, true) => i64::from(i8::MAX),
-        (types::I16, true) => i64::from(i16::MAX),
-        (types::I32, true) => i64::from(i32::MAX),
+        (types::I8, true) => i64::from(i8::MAX as u8),
+        (types::I16, true) => i64::from(i16::MAX as u16),
+        (types::I32, true) => i64::from(i32::MAX as u32),
         (types::I64, true) => i64::MAX,
         _ => unreachable!(),
     };
@@ -358,10 +358,10 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>> + Copy,
     {
-        self.instance.subst_mir_and_normalize_erasing_regions(
+        self.instance.instantiate_mir_and_normalize_erasing_regions(
             self.tcx,
             ty::ParamEnv::reveal_all(),
-            value,
+            ty::EarlyBinder::bind(value),
         )
     }
 
@@ -381,6 +381,25 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
         *self.local_map.get(local).unwrap_or_else(|| {
             panic!("Local {:?} doesn't exist", local);
         })
+    }
+
+    pub(crate) fn create_stack_slot(&mut self, size: u32, align: u32) -> Pointer {
+        if align <= 16 {
+            let stack_slot = self.bcx.create_sized_stack_slot(StackSlotData {
+                kind: StackSlotKind::ExplicitSlot,
+                // FIXME Don't force the size to a multiple of 16 bytes once Cranelift gets a way to
+                // specify stack slot alignment.
+                size: (size + 15) / 16 * 16,
+            });
+            Pointer::stack_slot(stack_slot)
+        } else {
+            // Alignment is too big to handle using the above hack. Dynamically realign a stack slot
+            // instead. This wastes some space for the realignment.
+            let base_ptr = self.create_stack_slot(size + align, 16).get_addr(self);
+            let misalign_offset = self.bcx.ins().urem_imm(base_ptr, i64::from(align));
+            let realign_offset = self.bcx.ins().irsub_imm(misalign_offset, i64::from(align));
+            Pointer::new(self.bcx.ins().iadd(base_ptr, realign_offset))
+        }
     }
 
     pub(crate) fn set_debug_loc(&mut self, source_info: mir::SourceInfo) {
@@ -411,59 +430,20 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
         }
     }
 
-    // Note: must be kept in sync with get_caller_location from cg_ssa
-    pub(crate) fn get_caller_location(&mut self, mut source_info: mir::SourceInfo) -> CValue<'tcx> {
-        let span_to_caller_location = |fx: &mut FunctionCx<'_, '_, 'tcx>, mut span: Span| {
-            // Remove `Inlined` marks as they pollute `expansion_cause`.
-            while span.is_inlined() {
-                span.remove_mark();
-            }
-            let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
-            let caller = fx.tcx.sess.source_map().lookup_char_pos(topmost.lo());
-            let const_loc = fx.tcx.const_caller_location((
-                rustc_span::symbol::Symbol::intern(
-                    &caller.file.name.prefer_remapped().to_string_lossy(),
-                ),
-                caller.line as u32,
-                caller.col_display as u32 + 1,
-            ));
-            crate::constant::codegen_const_value(fx, const_loc, fx.tcx.caller_location_ty())
-        };
-
-        // Walk up the `SourceScope`s, in case some of them are from MIR inlining.
-        // If so, the starting `source_info.span` is in the innermost inlined
-        // function, and will be replaced with outer callsite spans as long
-        // as the inlined functions were `#[track_caller]`.
-        loop {
-            let scope_data = &self.mir.source_scopes[source_info.scope];
-
-            if let Some((callee, callsite_span)) = scope_data.inlined {
-                // Stop inside the most nested non-`#[track_caller]` function,
-                // before ever reaching its caller (which is irrelevant).
-                if !callee.def.requires_caller_location(self.tcx) {
-                    return span_to_caller_location(self, source_info.span);
-                }
-                source_info.span = callsite_span;
-            }
-
-            // Skip past all of the parents with `inlined: None`.
-            match scope_data.inlined_parent_scope {
-                Some(parent) => source_info.scope = parent,
-                None => break,
-            }
-        }
-
-        // No inlined `SourceScope`s, or all of them were `#[track_caller]`.
-        self.caller_location.unwrap_or_else(|| span_to_caller_location(self, source_info.span))
+    pub(crate) fn get_caller_location(&mut self, source_info: mir::SourceInfo) -> CValue<'tcx> {
+        self.mir.caller_location_span(source_info, self.caller_location, self.tcx, |span| {
+            let const_loc = self.tcx.span_as_caller_location(span);
+            crate::constant::codegen_const_value(self, const_loc, self.tcx.caller_location_ty())
+        })
     }
 
     pub(crate) fn anonymous_str(&mut self, msg: &str) -> Value {
-        let mut data_ctx = DataContext::new();
-        data_ctx.define(msg.as_bytes().to_vec().into_boxed_slice());
+        let mut data = DataDescription::new();
+        data.define(msg.as_bytes().to_vec().into_boxed_slice());
         let msg_id = self.module.declare_anonymous_data(false, false).unwrap();
 
         // Ignore DuplicateDefinition error, as the data will be the same
-        let _ = self.module.define_data(msg_id, &data_ctx);
+        let _ = self.module.define_data(msg_id, &data);
 
         let local_msg_id = self.module.declare_data_in_func(msg_id, self.bcx.func);
         if self.clif_comments.enabled() {
@@ -480,10 +460,10 @@ impl<'tcx> LayoutOfHelpers<'tcx> for RevealAllLayoutCx<'tcx> {
 
     #[inline]
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
-        if let layout::LayoutError::SizeOverflow(_) = err {
+        if let LayoutError::SizeOverflow(_) | LayoutError::ReferencesError(_) = err {
             self.0.sess.span_fatal(span, err.to_string())
         } else {
-            span_bug!(span, "failed to get layout for `{}`: {}", ty, err)
+            self.0.sess.span_fatal(span, format!("failed to get layout for `{}`: {}", ty, err))
         }
     }
 }
@@ -499,25 +479,16 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for RevealAllLayoutCx<'tcx> {
         fn_abi_request: FnAbiRequest<'tcx>,
     ) -> ! {
         if let FnAbiError::Layout(LayoutError::SizeOverflow(_)) = err {
-            self.0.sess.span_fatal(span, err.to_string())
+            self.0.sess.emit_fatal(Spanned { span, node: err })
         } else {
             match fn_abi_request {
                 FnAbiRequest::OfFnPtr { sig, extra_args } => {
-                    span_bug!(
-                        span,
-                        "`fn_abi_of_fn_ptr({}, {:?})` failed: {}",
-                        sig,
-                        extra_args,
-                        err
-                    );
+                    span_bug!(span, "`fn_abi_of_fn_ptr({sig}, {extra_args:?})` failed: {err:?}");
                 }
                 FnAbiRequest::OfInstance { instance, extra_args } => {
                     span_bug!(
                         span,
-                        "`fn_abi_of_instance({}, {:?})` failed: {}",
-                        instance,
-                        extra_args,
-                        err
+                        "`fn_abi_of_instance({instance}, {extra_args:?})` failed: {err:?}"
                     );
                 }
             }

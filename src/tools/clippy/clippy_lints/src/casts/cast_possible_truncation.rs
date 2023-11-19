@@ -15,7 +15,7 @@ use rustc_target::abi::IntegerType;
 use super::{utils, CAST_ENUM_TRUNCATION, CAST_POSSIBLE_TRUNCATION};
 
 fn constant_int(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<u128> {
-    if let Some((Constant::Int(c), _)) = constant(cx, cx.typeck_results(), expr) {
+    if let Some(Constant::Int(c)) = constant(cx, cx.typeck_results(), expr) {
         Some(c)
     } else {
         None
@@ -44,7 +44,7 @@ fn apply_reductions(cx: &LateContext<'_>, nbits: u64, expr: &Expr<'_>, signed: b
                 .unwrap_or(u64::max_value())
                 .min(apply_reductions(cx, nbits, left, signed)),
             BinOpKind::Shr => apply_reductions(cx, nbits, left, signed)
-                .saturating_sub(constant_int(cx, right).map_or(0, |s| u64::try_from(s).expect("shift too high"))),
+                .saturating_sub(constant_int(cx, right).map_or(0, |s| u64::try_from(s).unwrap_or_default())),
             _ => nbits,
         },
         ExprKind::MethodCall(method, left, [right], _) => {

@@ -30,6 +30,7 @@ because that's clearly a non-descriptive name.
   - [Documentation](#documentation)
   - [Running rustfmt](#running-rustfmt)
   - [Debugging](#debugging)
+  - [Conflicting lints](#conflicting-lints)
   - [PR Checklist](#pr-checklist)
   - [Adding configuration to a lint](#adding-configuration-to-a-lint)
   - [Cheat Sheet](#cheat-sheet)
@@ -122,20 +123,17 @@ fn main() {
 }
 ```
 
-Now we can run the test with `TESTNAME=foo_functions cargo uitest`, currently
+Now we can run the test with `TESTNAME=foo_functions cargo uibless`, currently
 this test is meaningless though.
 
 While we are working on implementing our lint, we can keep running the UI test.
-That allows us to check if the output is turning into what we want.
+That allows us to check if the output is turning into what we want by checking the
+`.stderr` file that gets updated on every test run.
 
-Once we are satisfied with the output, we need to run `cargo dev bless` to
-update the `.stderr` file for our lint. Please note that, we should run
-`TESTNAME=foo_functions cargo uitest` every time before running `cargo dev
-bless`. Running `TESTNAME=foo_functions cargo uitest` should pass then. When we
+Running `TESTNAME=foo_functions cargo uitest` should pass on its own. When we
 commit our lint, we need to commit the generated `.stderr` files, too. In
-general, you should only commit files changed by `cargo dev bless` for the
-specific lint you are creating/editing. Note that if the generated files are
-empty, they should be removed.
+general, you should only commit files changed by `cargo bless` for the
+specific lint you are creating/editing.
 
 > _Note:_ you can run multiple test files by specifying a comma separated list:
 > `TESTNAME=foo_functions,test2,test3`.
@@ -164,12 +162,12 @@ The process of generating the `.stderr` file is the same, and prepending the
 ## Rustfix tests
 
 If the lint you are working on is making use of structured suggestions, the test
-file should include a `//@run-rustfix` comment at the top. This will
-additionally run [rustfix] for that test. Rustfix will apply the suggestions
+will create a `.fixed` file by running [rustfix] for that test.
+Rustfix will apply the suggestions
 from the lint to the code of the test file and compare that to the contents of a
 `.fixed` file.
 
-Use `cargo dev bless` to automatically generate the `.fixed` file after running
+Use `cargo bless` to automatically generate the `.fixed` file while running
 the tests.
 
 [rustfix]: https://github.com/rust-lang/rustfix
@@ -264,7 +262,7 @@ impl EarlyLintPass for FooFunctions {}
 [declare_clippy_lint]: https://github.com/rust-lang/rust-clippy/blob/557f6848bd5b7183f55c1e1522a326e9e1df6030/clippy_lints/src/lib.rs#L60
 [example_lint_page]: https://rust-lang.github.io/rust-clippy/master/index.html#redundant_closure
 [lint_naming]: https://rust-lang.github.io/rfcs/0344-conventions-galore.html#lints
-[category_level_mapping]: https://github.com/rust-lang/rust-clippy/blob/557f6848bd5b7183f55c1e1522a326e9e1df6030/clippy_lints/src/lib.rs#L110
+[category_level_mapping]: ../index.html
 
 ## Lint registration
 
@@ -272,7 +270,7 @@ When using `cargo dev new_lint`, the lint is automatically registered and
 nothing more has to be done.
 
 When declaring a new lint by hand and `cargo dev update_lints` is used, the lint
-pass may have to be registered manually in the `register_plugins` function in
+pass may have to be registered manually in the `register_lints` function in
 `clippy_lints/src/lib.rs`:
 
 ```rust,ignore
@@ -417,7 +415,7 @@ fn is_foo_fn(fn_kind: FnKind<'_>) -> bool {
 
 Now we should also run the full test suite with `cargo test`. At this point
 running `cargo test` should produce the expected output. Remember to run `cargo
-dev bless` to update the `.stderr` file.
+bless` to update the `.stderr` file.
 
 `cargo test` (as opposed to `cargo uitest`) will also ensure that our lint
 implementation is not violating any Clippy lints itself.
@@ -438,7 +436,7 @@ need to ensure that the MSRV configured for the project is >= the MSRV of the
 required Rust feature. If multiple features are required, just use the one with
 a lower MSRV.
 
-First, add an MSRV alias for the required feature in [`clippy_utils::msrvs`].
+First, add an MSRV alias for the required feature in [`clippy_config::msrvs`].
 This can be accessed later as `msrvs::STR_STRIP_PREFIX`, for example.
 
 ```rust
@@ -508,7 +506,7 @@ fn msrv_1_45() {
 ```
 
 As a last step, the lint should be added to the lint documentation. This is done
-in `clippy_lints/src/utils/conf.rs`:
+in `clippy_config/src/conf.rs`:
 
 ```rust
 define_Conf! {
@@ -518,7 +516,7 @@ define_Conf! {
 }
 ```
 
-[`clippy_utils::msrvs`]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_utils/msrvs/index.html
+[`clippy_config::msrvs`]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_config/msrvs/index.html
 
 ## Author lint
 
@@ -615,6 +613,24 @@ output in the `stdout` part.
 
 [`dbg!`]: https://doc.rust-lang.org/std/macro.dbg.html
 
+## Conflicting lints
+
+There are several lints that deal with the same pattern but suggest different approaches. In other words, some lints
+may suggest modifications that go in the opposite direction to what some other lints already propose for the same
+code, creating conflicting diagnostics.
+
+When you are creating a lint that ends up in this scenario, the following tips should be encouraged to guide
+classification:
+
+* The only case where they should be in the same category is if that category is `restriction`. For example,
+`semicolon_inside_block` and `semicolon_outside_block`.
+* For all the other cases, they should be in different categories with different levels of allowance. For example,
+`implicit_return` (restriction, allow) and `needless_return` (style, warn).
+
+For lints that are in different categories, it is also recommended that at least one of them should be in the
+`restriction` category. The reason for this is that the `restriction` group is the only group where we don't
+recommend to enable the entire set, but cherry pick lints out of.
+
 ## PR Checklist
 
 Before submitting your PR make sure you followed all the basic requirements:
@@ -630,12 +646,18 @@ Before submitting your PR make sure you followed all the basic requirements:
 
 ## Adding configuration to a lint
 
-Clippy supports the configuration of lints values using a `clippy.toml` file in
-the workspace directory. Adding a configuration to a lint can be useful for
+Clippy supports the configuration of lints values using a `clippy.toml` file which is searched for in:
+
+1. The directory specified by the `CLIPPY_CONF_DIR` environment variable, or
+2. The directory specified by the
+[CARGO_MANIFEST_DIR](https://doc.rust-lang.org/cargo/reference/environment-variables.html) environment variable, or
+3. The current directory.
+
+Adding a configuration to a lint can be useful for
 thresholds or to constrain some behavior that can be seen as a false positive
 for some users. Adding a configuration is done in the following steps:
 
-1. Adding a new configuration entry to [`clippy_lints::utils::conf`] like this:
+1. Adding a new configuration entry to [`clippy_config::conf`] like this:
 
    ```rust,ignore
    /// Lint: LINT_NAME.
@@ -714,7 +736,7 @@ for some users. Adding a configuration is done in the following steps:
 
    Run `cargo collect-metadata` to generate documentation changes for the book.
 
-[`clippy_lints::utils::conf`]: https://github.com/rust-lang/rust-clippy/blob/master/clippy_lints/src/utils/conf.rs
+[`clippy_config::conf`]: https://github.com/rust-lang/rust-clippy/blob/master/clippy_config/src/conf.rs
 [`clippy_lints` lib file]: https://github.com/rust-lang/rust-clippy/blob/master/clippy_lints/src/lib.rs
 [`tests/ui`]: https://github.com/rust-lang/rust-clippy/blob/master/tests/ui
 [`tests/ui-toml`]: https://github.com/rust-lang/rust-clippy/blob/master/tests/ui-toml

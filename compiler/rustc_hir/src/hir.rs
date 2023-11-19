@@ -19,6 +19,7 @@ use rustc_macros::HashStable_Generic;
 use rustc_span::hygiene::MacroKind;
 use rustc_span::source_map::Spanned;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
+use rustc_span::ErrorGuaranteed;
 use rustc_span::{def_id::LocalDefId, BytePos, Span, DUMMY_SP};
 use rustc_target::asm::InlineAsmRegOrRegClass;
 use rustc_target::spec::abi::Abi;
@@ -245,6 +246,8 @@ impl<'hir> PathSegment<'hir> {
 pub struct ConstArg {
     pub value: AnonConst,
     pub span: Span,
+    /// Indicates whether this comes from a `~const` desugaring.
+    pub is_desugared_from_effects: bool,
 }
 
 #[derive(Clone, Copy, Debug, HashStable_Generic)]
@@ -399,7 +402,14 @@ impl<'hir> GenericArgs<'hir> {
     /// This function returns the number of type and const generic params.
     /// It should only be used for diagnostics.
     pub fn num_generic_params(&self) -> usize {
-        self.args.iter().filter(|arg| !matches!(arg, GenericArg::Lifetime(_))).count()
+        self.args
+            .iter()
+            .filter(|arg| match arg {
+                GenericArg::Lifetime(_)
+                | GenericArg::Const(ConstArg { is_desugared_from_effects: true, .. }) => false,
+                _ => true,
+            })
+            .count()
     }
 
     /// The span encompassing the text inside the surrounding brackets.
@@ -787,7 +797,7 @@ pub struct WhereBoundPredicate<'hir> {
 impl<'hir> WhereBoundPredicate<'hir> {
     /// Returns `true` if `param_def_id` matches the `bounded_ty` of this predicate.
     pub fn is_param_bound(&self, param_def_id: DefId) -> bool {
-        self.bounded_ty.as_generic_param().map_or(false, |(def_id, _)| def_id == param_def_id)
+        self.bounded_ty.as_generic_param().is_some_and(|(def_id, _)| def_id == param_def_id)
     }
 }
 
@@ -1415,6 +1425,9 @@ pub struct Let<'hir> {
     pub pat: &'hir Pat<'hir>,
     pub ty: Option<&'hir Ty<'hir>>,
     pub init: &'hir Expr<'hir>,
+    /// `Some` when this let expressions is not in a syntanctically valid location.
+    /// Used to prevent building MIR in such situations.
+    pub is_recovered: Option<ErrorGuaranteed>,
 }
 
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
@@ -1481,7 +1494,7 @@ pub struct BodyId {
 ///
 /// - an `params` array containing the `(x, y)` pattern
 /// - a `value` containing the `x + y` expression (maybe wrapped in a block)
-/// - `generator_kind` would be `None`
+/// - `coroutine_kind` would be `None`
 ///
 /// All bodies have an **owner**, which can be accessed via the HIR
 /// map using `body_owner_def_id()`.
@@ -1489,7 +1502,7 @@ pub struct BodyId {
 pub struct Body<'hir> {
     pub params: &'hir [Param<'hir>],
     pub value: &'hir Expr<'hir>,
-    pub generator_kind: Option<GeneratorKind>,
+    pub coroutine_kind: Option<CoroutineKind>,
 }
 
 impl<'hir> Body<'hir> {
@@ -1497,75 +1510,75 @@ impl<'hir> Body<'hir> {
         BodyId { hir_id: self.value.hir_id }
     }
 
-    pub fn generator_kind(&self) -> Option<GeneratorKind> {
-        self.generator_kind
+    pub fn coroutine_kind(&self) -> Option<CoroutineKind> {
+        self.coroutine_kind
     }
 }
 
-/// The type of source expression that caused this generator to be created.
+/// The type of source expression that caused this coroutine to be created.
 #[derive(Clone, PartialEq, Eq, Debug, Copy, Hash)]
 #[derive(HashStable_Generic, Encodable, Decodable)]
-pub enum GeneratorKind {
+pub enum CoroutineKind {
     /// An explicit `async` block or the body of an async function.
-    Async(AsyncGeneratorKind),
+    Async(CoroutineSource),
 
-    /// A generator literal created via a `yield` inside a closure.
-    Gen,
+    /// An explicit `gen` block or the body of a `gen` function.
+    Gen(CoroutineSource),
+
+    /// A coroutine literal created via a `yield` inside a closure.
+    Coroutine,
 }
 
-impl fmt::Display for GeneratorKind {
+impl fmt::Display for CoroutineKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GeneratorKind::Async(k) => fmt::Display::fmt(k, f),
-            GeneratorKind::Gen => f.write_str("generator"),
+            CoroutineKind::Async(k) => {
+                if f.alternate() {
+                    f.write_str("`async` ")?;
+                } else {
+                    f.write_str("async ")?
+                }
+                k.fmt(f)
+            }
+            CoroutineKind::Coroutine => f.write_str("coroutine"),
+            CoroutineKind::Gen(k) => {
+                if f.alternate() {
+                    f.write_str("`gen` ")?;
+                } else {
+                    f.write_str("gen ")?
+                }
+                k.fmt(f)
+            }
         }
     }
 }
 
-impl GeneratorKind {
-    pub fn descr(&self) -> &'static str {
-        match self {
-            GeneratorKind::Async(ask) => ask.descr(),
-            GeneratorKind::Gen => "generator",
-        }
-    }
-}
-
-/// In the case of a generator created as part of an async construct,
-/// which kind of async construct caused it to be created?
+/// In the case of a coroutine created as part of an async/gen construct,
+/// which kind of async/gen construct caused it to be created?
 ///
 /// This helps error messages but is also used to drive coercions in
 /// type-checking (see #60424).
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Copy)]
 #[derive(HashStable_Generic, Encodable, Decodable)]
-pub enum AsyncGeneratorKind {
-    /// An explicit `async` block written by the user.
+pub enum CoroutineSource {
+    /// An explicit `async`/`gen` block written by the user.
     Block,
 
-    /// An explicit `async` closure written by the user.
+    /// An explicit `async`/`gen` closure written by the user.
     Closure,
 
-    /// The `async` block generated as the body of an async function.
+    /// The `async`/`gen` block generated as the body of an async/gen function.
     Fn,
 }
 
-impl fmt::Display for AsyncGeneratorKind {
+impl fmt::Display for CoroutineSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            AsyncGeneratorKind::Block => "async block",
-            AsyncGeneratorKind::Closure => "async closure body",
-            AsyncGeneratorKind::Fn => "async fn body",
-        })
-    }
-}
-
-impl AsyncGeneratorKind {
-    pub fn descr(&self) -> &'static str {
         match self {
-            AsyncGeneratorKind::Block => "`async` block",
-            AsyncGeneratorKind::Closure => "`async` closure body",
-            AsyncGeneratorKind::Fn => "`async fn` body",
+            CoroutineSource::Block => "block",
+            CoroutineSource::Closure => "closure body",
+            CoroutineSource::Fn => "fn body",
         }
+        .fmt(f)
     }
 }
 
@@ -1577,8 +1590,8 @@ pub enum BodyOwnerKind {
     /// Closures
     Closure,
 
-    /// Constants and associated constants.
-    Const,
+    /// Constants and associated constants, also including inline constants.
+    Const { inline: bool },
 
     /// Initializer of a `static` item.
     Static(Mutability),
@@ -1588,7 +1601,7 @@ impl BodyOwnerKind {
     pub fn is_fn_or_closure(self) -> bool {
         match self {
             BodyOwnerKind::Fn | BodyOwnerKind::Closure => true,
-            BodyOwnerKind::Const | BodyOwnerKind::Static(_) => false,
+            BodyOwnerKind::Const { .. } | BodyOwnerKind::Static(_) => false,
         }
     }
 }
@@ -1611,7 +1624,7 @@ pub enum ConstContext {
     ///
     /// For the most part, other contexts are treated just like a regular `const`, so they are
     /// lumped into the same category.
-    Const,
+    Const { inline: bool },
 }
 
 impl ConstContext {
@@ -1620,7 +1633,7 @@ impl ConstContext {
     /// E.g. `const` or `static mut`.
     pub fn keyword_name(self) -> &'static str {
         match self {
-            Self::Const => "const",
+            Self::Const { .. } => "const",
             Self::Static(Mutability::Not) => "static",
             Self::Static(Mutability::Mut) => "static mut",
             Self::ConstFn => "const fn",
@@ -1633,7 +1646,7 @@ impl ConstContext {
 impl fmt::Display for ConstContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::Const => write!(f, "constant"),
+            Self::Const { .. } => write!(f, "constant"),
             Self::Static(_) => write!(f, "static"),
             Self::ConstFn => write!(f, "constant function"),
         }
@@ -1675,6 +1688,14 @@ pub struct AnonConst {
     pub body: BodyId,
 }
 
+/// An inline constant expression `const { something }`.
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
+pub struct ConstBlock {
+    pub hir_id: HirId,
+    pub def_id: LocalDefId,
+    pub body: BodyId,
+}
+
 /// An expression.
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Expr<'hir> {
@@ -1711,6 +1732,7 @@ impl Expr<'_> {
             ExprKind::Break(..) => ExprPrecedence::Break,
             ExprKind::Continue(..) => ExprPrecedence::Continue,
             ExprKind::Ret(..) => ExprPrecedence::Ret,
+            ExprKind::Become(..) => ExprPrecedence::Become,
             ExprKind::InlineAsm(..) => ExprPrecedence::InlineAsm,
             ExprKind::OffsetOf(..) => ExprPrecedence::OffsetOf,
             ExprKind::Struct(..) => ExprPrecedence::Struct,
@@ -1745,7 +1767,7 @@ impl Expr<'_> {
 
             ExprKind::Unary(UnOp::Deref, _) => true,
 
-            ExprKind::Field(ref base, _) | ExprKind::Index(ref base, _) => {
+            ExprKind::Field(ref base, _) | ExprKind::Index(ref base, _, _) => {
                 allow_projections_from(base) || base.is_place_expr(allow_projections_from)
             }
 
@@ -1768,6 +1790,7 @@ impl Expr<'_> {
             | ExprKind::Break(..)
             | ExprKind::Continue(..)
             | ExprKind::Ret(..)
+            | ExprKind::Become(..)
             | ExprKind::Let(..)
             | ExprKind::Loop(..)
             | ExprKind::Assign(..)
@@ -1821,7 +1844,7 @@ impl Expr<'_> {
             ExprKind::Type(base, _)
             | ExprKind::Unary(_, base)
             | ExprKind::Field(base, _)
-            | ExprKind::Index(base, _)
+            | ExprKind::Index(base, _, _)
             | ExprKind::AddrOf(.., base)
             | ExprKind::Cast(base, _) => {
                 // This isn't exactly true for `Index` and all `Unary`, but we are using this
@@ -1833,7 +1856,7 @@ impl Expr<'_> {
                 .iter()
                 .map(|field| field.expr)
                 .chain(init.into_iter())
-                .all(|e| e.can_have_side_effects()),
+                .any(|e| e.can_have_side_effects()),
 
             ExprKind::Array(args)
             | ExprKind::Tup(args)
@@ -1847,7 +1870,7 @@ impl Expr<'_> {
                     ..
                 },
                 args,
-            ) => args.iter().all(|arg| arg.can_have_side_effects()),
+            ) => args.iter().any(|arg| arg.can_have_side_effects()),
             ExprKind::If(..)
             | ExprKind::Match(..)
             | ExprKind::MethodCall(..)
@@ -1858,6 +1881,7 @@ impl Expr<'_> {
             | ExprKind::Break(..)
             | ExprKind::Continue(..)
             | ExprKind::Ret(..)
+            | ExprKind::Become(..)
             | ExprKind::Let(..)
             | ExprKind::Loop(..)
             | ExprKind::Assign(..)
@@ -1922,7 +1946,7 @@ pub fn is_range_literal(expr: &Expr<'_>) -> bool {
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum ExprKind<'hir> {
     /// Allow anonymous constants from an inline `const` block
-    ConstBlock(AnonConst),
+    ConstBlock(ConstBlock),
     /// An array (e.g., `[a, b, c, d]`).
     Array(&'hir [Expr<'hir>]),
     /// A function call.
@@ -1989,7 +2013,7 @@ pub enum ExprKind<'hir> {
     ///
     /// The `Span` is the argument block `|...|`.
     ///
-    /// This may also be a generator literal or an `async block` as indicated by the
+    /// This may also be a coroutine literal or an `async block` as indicated by the
     /// `Option<Movability>`.
     Closure(&'hir Closure<'hir>),
     /// A block (e.g., `'label: { ... }`).
@@ -2004,7 +2028,9 @@ pub enum ExprKind<'hir> {
     /// Access of a named (e.g., `obj.foo`) or unnamed (e.g., `obj.0`) struct or tuple field.
     Field(&'hir Expr<'hir>, Ident),
     /// An indexing operation (`foo[2]`).
-    Index(&'hir Expr<'hir>, &'hir Expr<'hir>),
+    /// Similar to [`ExprKind::MethodCall`], the final `Span` represents the span of the brackets
+    /// and index.
+    Index(&'hir Expr<'hir>, &'hir Expr<'hir>, Span),
 
     /// Path to a definition, possibly containing lifetime or type parameters.
     Path(QPath<'hir>),
@@ -2017,6 +2043,8 @@ pub enum ExprKind<'hir> {
     Continue(Destination),
     /// A `return`, with an optional value to be returned.
     Ret(Option<&'hir Expr<'hir>>),
+    /// A `become`, with the value to be returned.
+    Become(&'hir Expr<'hir>),
 
     /// Inline assembly (from `asm!`), with its outputs and inputs.
     InlineAsm(&'hir InlineAsm<'hir>),
@@ -2036,7 +2064,7 @@ pub enum ExprKind<'hir> {
     /// to be repeated; the second is the number of times to repeat it.
     Repeat(&'hir Expr<'hir>, ArrayLen),
 
-    /// A suspension point for generators (i.e., `yield <expr>`).
+    /// A suspension point for coroutines (i.e., `yield <expr>`).
     Yield(&'hir Expr<'hir>, YieldSource),
 
     /// A placeholder for an expression that wasn't syntactically well formed in some way.
@@ -2133,7 +2161,7 @@ pub enum MatchSource {
     /// A desugared `for _ in _ { .. }` loop.
     ForLoopDesugar,
     /// A desugared `?` operator.
-    TryDesugar,
+    TryDesugar(HirId),
     /// A desugared `<expr>.await`.
     AwaitDesugar,
     /// A desugared `format_args!()`.
@@ -2147,7 +2175,7 @@ impl MatchSource {
         match self {
             Normal => "match",
             ForLoopDesugar => "for",
-            TryDesugar => "?",
+            TryDesugar(_) => "?",
             AwaitDesugar => ".await",
             FormatArgs => "format_args!()",
         }
@@ -2228,12 +2256,13 @@ impl fmt::Display for YieldSource {
     }
 }
 
-impl From<GeneratorKind> for YieldSource {
-    fn from(kind: GeneratorKind) -> Self {
+impl From<CoroutineKind> for YieldSource {
+    fn from(kind: CoroutineKind) -> Self {
         match kind {
-            // Guess based on the kind of the current generator.
-            GeneratorKind::Gen => Self::Yield,
-            GeneratorKind::Async(_) => Self::Await { expr: None },
+            // Guess based on the kind of the current coroutine.
+            CoroutineKind::Coroutine => Self::Yield,
+            CoroutineKind::Async(_) => Self::Await { expr: None },
+            CoroutineKind::Gen(_) => Self::Yield,
         }
     }
 }
@@ -2651,6 +2680,19 @@ pub struct OpaqueTy<'hir> {
     pub generics: &'hir Generics<'hir>,
     pub bounds: GenericBounds<'hir>,
     pub origin: OpaqueTyOrigin,
+    /// Return-position impl traits (and async futures) must "reify" any late-bound
+    /// lifetimes that are captured from the function signature they originate from.
+    ///
+    /// This is done by generating a new early-bound lifetime parameter local to the
+    /// opaque which is substituted in the function signature with the late-bound
+    /// lifetime.
+    ///
+    /// This mapping associated a captured lifetime (first parameter) with the new
+    /// early-bound lifetime that was generated for the opaque.
+    pub lifetime_mapping: &'hir [(&'hir Lifetime, LocalDefId)],
+    /// Whether the opaque is a return-position impl trait (or async future)
+    /// originating from a trait method. This makes it so that the opaque is
+    /// lowered as an associated type.
     pub in_trait: bool,
 }
 
@@ -2662,7 +2704,10 @@ pub enum OpaqueTyOrigin {
     /// `async fn`
     AsyncFn(LocalDefId),
     /// type aliases: `type Foo = impl Trait;`
-    TyAlias,
+    TyAlias {
+        /// associated types in impl blocks for traits.
+        in_assoc_ty: bool,
+    },
 }
 
 /// The various kinds of types recognized by the compiler.
@@ -2818,13 +2863,13 @@ impl ImplicitSelfKind {
 #[derive(Copy, Clone, PartialEq, Eq, Encodable, Decodable, Debug)]
 #[derive(HashStable_Generic)]
 pub enum IsAsync {
-    Async,
+    Async(Span),
     NotAsync,
 }
 
 impl IsAsync {
     pub fn is_async(self) -> bool {
-        self == IsAsync::Async
+        matches!(self, IsAsync::Async(_))
     }
 }
 
@@ -2984,8 +3029,7 @@ pub struct FieldDef<'hir> {
 impl FieldDef<'_> {
     // Still necessary in couple of places
     pub fn is_positional(&self) -> bool {
-        let first = self.ident.as_str().as_bytes()[0];
-        (b'0'..=b'9').contains(&first)
+        self.ident.as_str().as_bytes()[0].is_ascii_digit()
     }
 }
 
@@ -3102,9 +3146,9 @@ impl<'hir> Item<'hir> {
     }
     /// Expect an [`ItemKind::Const`] or panic.
     #[track_caller]
-    pub fn expect_const(&self) -> (&'hir Ty<'hir>, BodyId) {
-        let ItemKind::Const(ty, body) = self.kind else { self.expect_failed("a constant") };
-        (ty, body)
+    pub fn expect_const(&self) -> (&'hir Ty<'hir>, &'hir Generics<'hir>, BodyId) {
+        let ItemKind::Const(ty, gen, body) = self.kind else { self.expect_failed("a constant") };
+        (ty, gen, body)
     }
     /// Expect an [`ItemKind::Fn`] or panic.
     #[track_caller]
@@ -3130,7 +3174,9 @@ impl<'hir> Item<'hir> {
     /// Expect an [`ItemKind::ForeignMod`] or panic.
     #[track_caller]
     pub fn expect_foreign_mod(&self) -> (Abi, &'hir [ForeignItemRef]) {
-        let ItemKind::ForeignMod { abi, items } = self.kind else { self.expect_failed("a foreign module") };
+        let ItemKind::ForeignMod { abi, items } = self.kind else {
+            self.expect_failed("a foreign module")
+        };
         (abi, items)
     }
 
@@ -3181,14 +3227,18 @@ impl<'hir> Item<'hir> {
     pub fn expect_trait(
         self,
     ) -> (IsAuto, Unsafety, &'hir Generics<'hir>, GenericBounds<'hir>, &'hir [TraitItemRef]) {
-        let ItemKind::Trait(is_auto, unsafety, gen, bounds, items) = self.kind else { self.expect_failed("a trait") };
+        let ItemKind::Trait(is_auto, unsafety, gen, bounds, items) = self.kind else {
+            self.expect_failed("a trait")
+        };
         (is_auto, unsafety, gen, bounds, items)
     }
 
     /// Expect an [`ItemKind::TraitAlias`] or panic.
     #[track_caller]
     pub fn expect_trait_alias(&self) -> (&'hir Generics<'hir>, GenericBounds<'hir>) {
-        let ItemKind::TraitAlias(gen, bounds) = self.kind else { self.expect_failed("a trait alias") };
+        let ItemKind::TraitAlias(gen, bounds) = self.kind else {
+            self.expect_failed("a trait alias")
+        };
         (gen, bounds)
     }
 
@@ -3256,7 +3306,7 @@ pub struct FnHeader {
 
 impl FnHeader {
     pub fn is_async(&self) -> bool {
-        matches!(&self.asyncness, IsAsync::Async)
+        matches!(&self.asyncness, IsAsync::Async(_))
     }
 
     pub fn is_const(&self) -> bool {
@@ -3285,7 +3335,7 @@ pub enum ItemKind<'hir> {
     /// A `static` item.
     Static(&'hir Ty<'hir>, Mutability, BodyId),
     /// A `const` item.
-    Const(&'hir Ty<'hir>, BodyId),
+    Const(&'hir Ty<'hir>, &'hir Generics<'hir>, BodyId),
     /// A function declaration.
     Fn(FnSig<'hir>, &'hir Generics<'hir>, BodyId),
     /// A MBE macro definition (`macro_rules!` or `macro`).
@@ -3299,7 +3349,7 @@ pub enum ItemKind<'hir> {
     /// A type alias, e.g., `type Foo = Bar<u8>`.
     TyAlias(&'hir Ty<'hir>, &'hir Generics<'hir>),
     /// An opaque `impl Trait` type alias, e.g., `type Foo = impl Bar;`.
-    OpaqueTy(OpaqueTy<'hir>),
+    OpaqueTy(&'hir OpaqueTy<'hir>),
     /// An enum definition, e.g., `enum Foo<A, B> {C<A>, D<B>}`.
     Enum(EnumDef<'hir>, &'hir Generics<'hir>),
     /// A struct definition, e.g., `struct Foo<A> {x: A}`.
@@ -3323,7 +3373,6 @@ pub struct Impl<'hir> {
     // We do not put a `Span` in `Defaultness` because it breaks foreign crate metadata
     // decoding as `Span`s cannot be decoded when a `Session` is not available.
     pub defaultness_span: Option<Span>,
-    pub constness: Constness,
     pub generics: &'hir Generics<'hir>,
 
     /// The trait being implemented, if any.
@@ -3338,6 +3387,7 @@ impl ItemKind<'_> {
         Some(match *self {
             ItemKind::Fn(_, ref generics, _)
             | ItemKind::TyAlias(_, ref generics)
+            | ItemKind::Const(_, ref generics, _)
             | ItemKind::OpaqueTy(OpaqueTy { ref generics, .. })
             | ItemKind::Enum(_, ref generics)
             | ItemKind::Struct(_, ref generics)
@@ -3516,6 +3566,15 @@ impl<'hir> OwnerNode<'hir> {
         }
     }
 
+    pub fn fn_sig(self) -> Option<&'hir FnSig<'hir>> {
+        match self {
+            OwnerNode::TraitItem(TraitItem { kind: TraitItemKind::Fn(fn_sig, _), .. })
+            | OwnerNode::ImplItem(ImplItem { kind: ImplItemKind::Fn(fn_sig, _), .. })
+            | OwnerNode::Item(Item { kind: ItemKind::Fn(fn_sig, _, _), .. }) => Some(fn_sig),
+            _ => None,
+        }
+    }
+
     pub fn fn_decl(self) -> Option<&'hir FnDecl<'hir>> {
         match self {
             OwnerNode::TraitItem(TraitItem { kind: TraitItemKind::Fn(fn_sig, _), .. })
@@ -3533,7 +3592,9 @@ impl<'hir> OwnerNode<'hir> {
         match self {
             OwnerNode::Item(Item {
                 kind:
-                    ItemKind::Static(_, _, body) | ItemKind::Const(_, body) | ItemKind::Fn(_, _, body),
+                    ItemKind::Static(_, _, body)
+                    | ItemKind::Const(_, _, body)
+                    | ItemKind::Fn(_, _, body),
                 ..
             })
             | OwnerNode::TraitItem(TraitItem {
@@ -3638,6 +3699,7 @@ pub enum Node<'hir> {
     Variant(&'hir Variant<'hir>),
     Field(&'hir FieldDef<'hir>),
     AnonConst(&'hir AnonConst),
+    ConstBlock(&'hir ConstBlock),
     Expr(&'hir Expr<'hir>),
     ExprField(&'hir ExprField<'hir>),
     Stmt(&'hir Stmt<'hir>),
@@ -3690,15 +3752,16 @@ impl<'hir> Node<'hir> {
             Node::Lifetime(lt) => Some(lt.ident),
             Node::GenericParam(p) => Some(p.name.ident()),
             Node::TypeBinding(b) => Some(b.ident),
+            Node::PatField(f) => Some(f.ident),
+            Node::ExprField(f) => Some(f.ident),
             Node::Param(..)
             | Node::AnonConst(..)
+            | Node::ConstBlock(..)
             | Node::Expr(..)
             | Node::Stmt(..)
             | Node::Block(..)
             | Node::Ctor(..)
             | Node::Pat(..)
-            | Node::PatField(..)
-            | Node::ExprField(..)
             | Node::Arm(..)
             | Node::Local(..)
             | Node::Crate(..)
@@ -3730,6 +3793,30 @@ impl<'hir> Node<'hir> {
         }
     }
 
+    /// Get the type for constants, assoc types, type aliases and statics.
+    pub fn ty(self) -> Option<&'hir Ty<'hir>> {
+        match self {
+            Node::Item(it) => match it.kind {
+                ItemKind::TyAlias(ty, _)
+                | ItemKind::Static(ty, _, _)
+                | ItemKind::Const(ty, _, _) => Some(ty),
+                ItemKind::Impl(impl_item) => Some(&impl_item.self_ty),
+                _ => None,
+            },
+            Node::TraitItem(it) => match it.kind {
+                TraitItemKind::Const(ty, _) => Some(ty),
+                TraitItemKind::Type(_, ty) => ty,
+                _ => None,
+            },
+            Node::ImplItem(it) => match it.kind {
+                ImplItemKind::Const(ty, _) => Some(ty),
+                ImplItemKind::Type(ty) => Some(ty),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn alias_ty(self) -> Option<&'hir Ty<'hir>> {
         match self {
             Node::Item(Item { kind: ItemKind::TyAlias(ty, ..), .. }) => Some(ty),
@@ -3741,7 +3828,9 @@ impl<'hir> Node<'hir> {
         match self {
             Node::Item(Item {
                 kind:
-                    ItemKind::Static(_, _, body) | ItemKind::Const(_, body) | ItemKind::Fn(_, _, body),
+                    ItemKind::Static(_, _, body)
+                    | ItemKind::Const(_, _, body)
+                    | ItemKind::Fn(_, _, body),
                 ..
             })
             | Node::TraitItem(TraitItem {
@@ -3755,7 +3844,7 @@ impl<'hir> Node<'hir> {
             })
             | Node::Expr(Expr {
                 kind:
-                    ExprKind::ConstBlock(AnonConst { body, .. })
+                    ExprKind::ConstBlock(ConstBlock { body, .. })
                     | ExprKind::Closure(Closure { body, .. })
                     | ExprKind::Repeat(_, ArrayLen::Body(AnonConst { body, .. })),
                 ..
@@ -3872,6 +3961,13 @@ impl<'hir> Node<'hir> {
     #[track_caller]
     pub fn expect_anon_const(self) -> &'hir AnonConst {
         let Node::AnonConst(this) = self else { self.expect_failed("an anonymous constant") };
+        this
+    }
+
+    /// Expect a [`Node::ConstBlock`] or panic.
+    #[track_caller]
+    pub fn expect_inline_const(self) -> &'hir ConstBlock {
+        let Node::ConstBlock(this) = self else { self.expect_failed("an inline constant") };
         this
     }
 
@@ -4015,10 +4111,10 @@ mod size_asserts {
     static_assert_size!(GenericBound<'_>, 48);
     static_assert_size!(Generics<'_>, 56);
     static_assert_size!(Impl<'_>, 80);
-    static_assert_size!(ImplItem<'_>, 80);
-    static_assert_size!(ImplItemKind<'_>, 32);
-    static_assert_size!(Item<'_>, 80);
-    static_assert_size!(ItemKind<'_>, 48);
+    static_assert_size!(ImplItem<'_>, 88);
+    static_assert_size!(ImplItemKind<'_>, 40);
+    static_assert_size!(Item<'_>, 88);
+    static_assert_size!(ItemKind<'_>, 56);
     static_assert_size!(Local<'_>, 64);
     static_assert_size!(Param<'_>, 32);
     static_assert_size!(Pat<'_>, 72);
@@ -4029,8 +4125,8 @@ mod size_asserts {
     static_assert_size!(Res, 12);
     static_assert_size!(Stmt<'_>, 32);
     static_assert_size!(StmtKind<'_>, 16);
-    static_assert_size!(TraitItem<'_>, 80);
-    static_assert_size!(TraitItemKind<'_>, 40);
+    static_assert_size!(TraitItem<'_>, 88);
+    static_assert_size!(TraitItemKind<'_>, 48);
     static_assert_size!(Ty<'_>, 48);
     static_assert_size!(TyKind<'_>, 32);
     // tidy-alphabetical-end

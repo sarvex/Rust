@@ -17,7 +17,7 @@ use syntax::{
 };
 use text_edit::TextEdit;
 
-use crate::{fix, Diagnostic, DiagnosticsConfig, Severity};
+use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsConfig, Severity};
 
 #[derive(Default)]
 struct State {
@@ -117,11 +117,10 @@ pub(crate) fn json_in_items(
                 edit.insert(range.start(), state.result);
                 acc.push(
                     Diagnostic::new(
-                        "json-is-not-rust",
+                        DiagnosticCode::Ra("json-is-not-rust", Severity::WeakWarning),
                         "JSON syntax is not valid as a Rust item",
                         range,
                     )
-                    .severity(Severity::WeakWarning)
                     .with_fixes(Some(vec![{
                         let mut scb = SourceChangeBuilder::new(file_id);
                         let scope = match import_scope {
@@ -137,6 +136,7 @@ pub(crate) fn json_in_items(
                                     it,
                                     config.insert_use.prefix_kind,
                                     config.prefer_no_std,
+                                    config.prefer_prelude,
                                 ) {
                                     insert_use(&scope, mod_path_to_ast(&it), &config.insert_use);
                                 }
@@ -149,6 +149,7 @@ pub(crate) fn json_in_items(
                                     it,
                                     config.insert_use.prefix_kind,
                                     config.prefer_no_std,
+                                    config.prefer_prelude,
                                 ) {
                                     insert_use(&scope, mod_path_to_ast(&it), &config.insert_use);
                                 }

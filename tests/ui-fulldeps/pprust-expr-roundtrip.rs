@@ -38,9 +38,9 @@ use rustc_ast::*;
 use rustc_ast_pretty::pprust;
 use rustc_parse::new_parser_from_source_str;
 use rustc_session::parse::ParseSess;
-use rustc_span::source_map::FilePathMapping;
-use rustc_span::source_map::{FileName, Spanned, DUMMY_SP};
+use rustc_span::source_map::{FilePathMapping, Spanned};
 use rustc_span::symbol::Ident;
+use rustc_span::{FileName, DUMMY_SP};
 use thin_vec::{thin_vec, ThinVec};
 
 fn parse_expr(ps: &ParseSess, src: &str) -> Option<P<Expr>> {
@@ -80,14 +80,20 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
                 let seg = PathSegment::from_ident(Ident::from_str("x"));
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::MethodCall(Box::new(MethodCall {
-                        seg: seg.clone(), receiver: e, args: thin_vec![make_x()], span: DUMMY_SP
-                    }))
-                )});
+                        seg: seg.clone(),
+                        receiver: e,
+                        args: thin_vec![make_x()],
+                        span: DUMMY_SP,
+                    })))
+                });
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::MethodCall(Box::new(MethodCall {
-                        seg: seg.clone(), receiver: make_x(), args: thin_vec![e], span: DUMMY_SP
-                    }))
-                )});
+                        seg: seg.clone(),
+                        receiver: make_x(),
+                        args: thin_vec![e],
+                        span: DUMMY_SP,
+                    })))
+                });
             }
             2..=7 => {
                 let op = Spanned {
@@ -124,7 +130,7 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::Closure(Box::new(Closure {
                         binder: ClosureBinder::NotPresent,
-                        capture_clause: CaptureBy::Value,
+                        capture_clause: CaptureBy::Value { move_kw: DUMMY_SP },
                         constness: Const::No,
                         asyncness: Async::No,
                         movability: Movability::Movable,
@@ -174,7 +180,7 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
             18 => {
                 let pat =
                     P(Pat { id: DUMMY_NODE_ID, kind: PatKind::Wild, span: DUMMY_SP, tokens: None });
-                iter_exprs(depth - 1, &mut |e| g(ExprKind::Let(pat.clone(), e, DUMMY_SP)))
+                iter_exprs(depth - 1, &mut |e| g(ExprKind::Let(pat.clone(), e, DUMMY_SP, None)))
             }
             _ => panic!("bad counter value in iter_exprs"),
         }

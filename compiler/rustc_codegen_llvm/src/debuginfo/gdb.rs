@@ -9,17 +9,15 @@ use rustc_ast::attr;
 use rustc_codegen_ssa::base::collect_debugger_visualizers_transitive;
 use rustc_codegen_ssa::traits::*;
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_middle::bug;
+use rustc_middle::{bug, middle::debugger_visualizer::DebuggerVisualizerType};
 use rustc_session::config::{CrateType, DebugInfo};
 use rustc_span::symbol::sym;
-use rustc_span::DebuggerVisualizerType;
 
 /// Inserts a side-effect free instruction sequence that makes sure that the
 /// .debug_gdb_scripts global is referenced, so it isn't removed by the linker.
 pub fn insert_reference_to_gdb_debug_scripts_section_global(bx: &mut Builder<'_, '_, '_>) {
     if needs_gdb_debug_scripts_section(bx) {
-        let gdb_debug_scripts_section =
-            bx.const_bitcast(get_or_insert_gdb_debug_scripts_section_global(bx), bx.type_i8p());
+        let gdb_debug_scripts_section = get_or_insert_gdb_debug_scripts_section_global(bx);
         // Load just the first byte as that's all that's necessary to force
         // LLVM to keep around the reference to the global.
         let volatile_load_instruction = bx.volatile_load(bx.type_i8(), gdb_debug_scripts_section);
@@ -55,7 +53,7 @@ pub fn get_or_insert_gdb_debug_scripts_section_global<'ll>(cx: &CodegenCx<'ll, '
             // The initial byte `4` instructs GDB that the following pretty printer
             // is defined inline as opposed to in a standalone file.
             section_contents.extend_from_slice(b"\x04");
-            let vis_name = format!("pretty-printer-{}-{}\n", crate_name, index);
+            let vis_name = format!("pretty-printer-{crate_name}-{index}\n");
             section_contents.extend_from_slice(vis_name.as_bytes());
             section_contents.extend_from_slice(&visualizer.src);
 
@@ -94,7 +92,7 @@ pub fn needs_gdb_debug_scripts_section(cx: &CodegenCx<'_, '_>) -> bool {
     // each rlib could produce a different set of visualizers that would be embedded
     // in the `.debug_gdb_scripts` section. For that reason, we make sure that the
     // section is only emitted for leaf crates.
-    let embed_visualizers = cx.sess().crate_types().iter().any(|&crate_type| match crate_type {
+    let embed_visualizers = cx.tcx.crate_types().iter().any(|&crate_type| match crate_type {
         CrateType::Executable | CrateType::Dylib | CrateType::Cdylib | CrateType::Staticlib => {
             // These are crate types for which we will embed pretty printers since they
             // are treated as leaf crates.

@@ -4,11 +4,10 @@ use crate::BorrowckInferCtxt;
 use rustc_index::IndexSlice;
 use rustc_infer::infer::NllRegionVariableOrigin;
 use rustc_middle::mir::visit::{MutVisitor, TyContext};
-use rustc_middle::mir::Constant;
-use rustc_middle::mir::{Body, Location, Promoted};
-use rustc_middle::ty::subst::SubstsRef;
+use rustc_middle::mir::{Body, ConstOperand, Location, Promoted};
+use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable};
-use rustc_span::{Span, Symbol};
+use rustc_span::Symbol;
 
 /// Replaces all free regions appearing in the MIR with fresh
 /// inference variables, returning the number of variables created.
@@ -29,21 +28,18 @@ pub fn renumber_mir<'tcx>(
     renumberer.visit_body(body);
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) enum BoundRegionInfo {
-    Name(Symbol),
-    Span(Span),
-}
-
+// FIXME(@lcnr): A lot of these variants overlap and it seems like
+// this type is only used to decide which region should be used
+// as representative. This should be cleaned up.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum RegionCtxt {
     Location(Location),
     TyContext(TyContext),
     Free(Symbol),
-    Bound(BoundRegionInfo),
-    LateBound(BoundRegionInfo),
+    Bound(Symbol),
+    LateBound(Symbol),
     Existential(Option<Symbol>),
-    Placeholder(BoundRegionInfo),
+    Placeholder(Symbol),
     Unknown,
 }
 
@@ -88,16 +84,20 @@ impl<'a, 'tcx> MutVisitor<'tcx> for RegionRenumberer<'a, 'tcx> {
 
     #[instrument(skip(self), level = "debug")]
     fn visit_ty(&mut self, ty: &mut Ty<'tcx>, ty_context: TyContext) {
+        if matches!(ty_context, TyContext::ReturnTy(_)) {
+            // We will renumber the return ty when called again with `TyContext::LocalDecl`
+            return;
+        }
         *ty = self.renumber_regions(*ty, || RegionCtxt::TyContext(ty_context));
 
         debug!(?ty);
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn visit_substs(&mut self, substs: &mut SubstsRef<'tcx>, location: Location) {
-        *substs = self.renumber_regions(*substs, || RegionCtxt::Location(location));
+    fn visit_args(&mut self, args: &mut GenericArgsRef<'tcx>, location: Location) {
+        *args = self.renumber_regions(*args, || RegionCtxt::Location(location));
 
-        debug!(?substs);
+        debug!(?args);
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -117,9 +117,9 @@ impl<'a, 'tcx> MutVisitor<'tcx> for RegionRenumberer<'a, 'tcx> {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn visit_constant(&mut self, constant: &mut Constant<'tcx>, location: Location) {
-        let literal = constant.literal;
-        constant.literal = self.renumber_regions(literal, || RegionCtxt::Location(location));
+    fn visit_constant(&mut self, constant: &mut ConstOperand<'tcx>, location: Location) {
+        let const_ = constant.const_;
+        constant.const_ = self.renumber_regions(const_, || RegionCtxt::Location(location));
         debug!("constant: {:#?}", constant);
     }
 }

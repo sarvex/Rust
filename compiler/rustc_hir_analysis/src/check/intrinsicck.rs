@@ -44,20 +44,7 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
         false
     }
 
-    fn check_asm_operand_type(
-        &self,
-        idx: usize,
-        reg: InlineAsmRegOrRegClass,
-        expr: &'tcx hir::Expr<'tcx>,
-        template: &[InlineAsmTemplatePiece],
-        is_input: bool,
-        tied_input: Option<(&'tcx hir::Expr<'tcx>, Option<InlineAsmType>)>,
-        target_features: &FxIndexSet<Symbol>,
-    ) -> Option<InlineAsmType> {
-        let ty = (self.get_operand_ty)(expr);
-        if ty.has_non_region_infer() {
-            bug!("inference variable in asm operand ty: {:?} {:?}", expr, ty);
-        }
+    fn get_asm_ty(&self, ty: Ty<'tcx>) -> Option<InlineAsmType> {
         let asm_ty_isize = match self.tcx.sess.target.pointer_width {
             16 => InlineAsmType::I16,
             32 => InlineAsmType::I32,
@@ -65,10 +52,7 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
             _ => unreachable!(),
         };
 
-        let asm_ty = match *ty.kind() {
-            // `!` is allowed for input but not for output (issue #87802)
-            ty::Never if is_input => return None,
-            ty::Error(_) => return None,
+        match *ty.kind() {
             ty::Int(IntTy::I8) | ty::Uint(UintTy::U8) => Some(InlineAsmType::I8),
             ty::Int(IntTy::I16) | ty::Uint(UintTy::U16) => Some(InlineAsmType::I16),
             ty::Int(IntTy::I32) | ty::Uint(UintTy::U32) => Some(InlineAsmType::I32),
@@ -81,9 +65,9 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
             ty::RawPtr(ty::TypeAndMut { ty, mutbl: _ }) if self.is_thin_ptr_ty(ty) => {
                 Some(asm_ty_isize)
             }
-            ty::Adt(adt, substs) if adt.repr().simd() => {
+            ty::Adt(adt, args) if adt.repr().simd() => {
                 let fields = &adt.non_enum_variant().fields;
-                let elem_ty = fields[FieldIdx::from_u32(0)].ty(self.tcx, substs);
+                let elem_ty = fields[FieldIdx::from_u32(0)].ty(self.tcx, args);
 
                 let (size, ty) = match elem_ty.kind() {
                     ty::Array(ty, len) => {
@@ -99,7 +83,6 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
                 };
 
                 match ty.kind() {
-                    ty::Never | ty::Error(_) => return None,
                     ty::Int(IntTy::I8) | ty::Uint(UintTy::U8) => Some(InlineAsmType::VecI8(size)),
                     ty::Int(IntTy::I16) | ty::Uint(UintTy::U16) => {
                         Some(InlineAsmType::VecI16(size))
@@ -128,6 +111,38 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
             }
             ty::Infer(_) => unreachable!(),
             _ => None,
+        }
+    }
+
+    fn check_asm_operand_type(
+        &self,
+        idx: usize,
+        reg: InlineAsmRegOrRegClass,
+        expr: &'tcx hir::Expr<'tcx>,
+        template: &[InlineAsmTemplatePiece],
+        is_input: bool,
+        tied_input: Option<(&'tcx hir::Expr<'tcx>, Option<InlineAsmType>)>,
+        target_features: &FxIndexSet<Symbol>,
+    ) -> Option<InlineAsmType> {
+        let ty = (self.get_operand_ty)(expr);
+        if ty.has_non_region_infer() {
+            bug!("inference variable in asm operand ty: {:?} {:?}", expr, ty);
+        }
+
+        let asm_ty = match *ty.kind() {
+            // `!` is allowed for input but not for output (issue #87802)
+            ty::Never if is_input => return None,
+            _ if ty.references_error() => return None,
+            ty::Adt(adt, args) if Some(adt.did()) == self.tcx.lang_items().maybe_uninit() => {
+                let fields = &adt.non_enum_variant().fields;
+                let ty = fields[FieldIdx::from_u32(1)].ty(self.tcx, args);
+                let ty::Adt(ty, args) = ty.kind() else { unreachable!() };
+                assert!(ty.is_manually_drop());
+                let fields = &ty.non_enum_variant().fields;
+                let ty = fields[FieldIdx::from_u32(0)].ty(self.tcx, args);
+                self.get_asm_ty(ty)
+            }
+            _ => self.get_asm_ty(ty),
         };
         let Some(asm_ty) = asm_ty else {
             let msg = format!("cannot use value of type `{ty}` for inline assembly");
@@ -186,18 +201,14 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
         let Some((_, feature)) = supported_tys.iter().find(|&&(t, _)| t == asm_ty) else {
             let msg = format!("type `{ty}` cannot be used with this register class");
             let mut err = self.tcx.sess.struct_span_err(expr.span, msg);
-            let supported_tys: Vec<_> =
-                supported_tys.iter().map(|(t, _)| t.to_string()).collect();
+            let supported_tys: Vec<_> = supported_tys.iter().map(|(t, _)| t.to_string()).collect();
             err.note(format!(
                 "register class `{}` supports these types: {}",
                 reg_class.name(),
                 supported_tys.join(", "),
             ));
             if let Some(suggest) = reg_class.suggest_class(asm_arch, asm_ty) {
-                err.help(format!(
-                    "consider using the `{}` register class instead",
-                    suggest.name()
-                ));
+                err.help(format!("consider using the `{}` register class instead", suggest.name()));
             }
             err.emit();
             return Some(asm_ty);
@@ -215,7 +226,7 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
         // register class is usable at all.
         if let Some(feature) = feature {
             if !target_features.contains(feature) {
-                let msg = format!("`{}` target feature is not enabled", feature);
+                let msg = format!("`{feature}` target feature is not enabled");
                 let mut err = self.tcx.sess.struct_span_err(expr.span, msg);
                 err.note(format!(
                     "this is required to use type `{}` with register class `{}`",
@@ -427,7 +438,7 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
                 // Check that sym actually points to a function. Later passes
                 // depend on this.
                 hir::InlineAsmOperand::SymFn { anon_const } => {
-                    let ty = self.tcx.type_of(anon_const.def_id).subst_identity();
+                    let ty = self.tcx.type_of(anon_const.def_id).instantiate_identity();
                     match ty.kind() {
                         ty::Never | ty::Error(_) => {}
                         ty::FnDef(..) => {}

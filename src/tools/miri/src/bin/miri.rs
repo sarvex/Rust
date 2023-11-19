@@ -9,11 +9,12 @@ extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
+extern crate rustc_log;
 extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 
-use std::env;
+use std::env::{self, VarError};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -29,11 +30,12 @@ use rustc_middle::{
         ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
     },
     query::LocalCrate,
-    ty::{query::ExternProviders, TyCtxt},
+    ty::TyCtxt,
+    util::Providers,
 };
-use rustc_session::config::OptLevel;
-
-use rustc_session::{config::CrateType, search_paths::PathKind, CtfeBacktrace};
+use rustc_session::config::{CrateType, ErrorOutputType, OptLevel};
+use rustc_session::search_paths::PathKind;
+use rustc_session::{CtfeBacktrace, EarlyErrorHandler};
 
 use miri::{BacktraceStyle, BorrowTrackerMethod, ProvenanceMode, RetagFields};
 
@@ -43,11 +45,11 @@ struct MiriCompilerCalls {
 
 impl rustc_driver::Callbacks for MiriCompilerCalls {
     fn config(&mut self, config: &mut Config) {
-        config.override_queries = Some(|_, _, external_providers| {
-            external_providers.used_crate_source = |tcx, cnum| {
-                let mut providers = ExternProviders::default();
-                rustc_metadata::provide_extern(&mut providers);
-                let mut crate_source = (providers.used_crate_source)(tcx, cnum);
+        config.override_queries = Some(|_, providers| {
+            providers.extern_queries.used_crate_source = |tcx, cnum| {
+                let mut providers = Providers::default();
+                rustc_metadata::provide(&mut providers);
+                let mut crate_source = (providers.extern_queries.used_crate_source)(tcx, cnum);
                 // HACK: rustc will emit "crate ... required to be available in rlib format, but
                 // was not found in this form" errors once we use `tcx.dependency_formats()` if
                 // there's no rlib provided, so setting a dummy path here to workaround those errors.
@@ -63,10 +65,13 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
         queries: &'tcx rustc_interface::Queries<'tcx>,
     ) -> Compilation {
         queries.global_ctxt().unwrap().enter(|tcx| {
-            tcx.sess.abort_if_errors();
+            if tcx.sess.compile_status().is_err() {
+                tcx.sess.fatal("miri cannot be run on programs that fail compilation");
+            }
 
-            init_late_loggers(tcx);
-            if !tcx.sess.crate_types().contains(&CrateType::Executable) {
+            let handler = EarlyErrorHandler::new(tcx.sess.opts.error_format);
+            init_late_loggers(&handler, tcx);
+            if !tcx.crate_types().contains(&CrateType::Executable) {
                 tcx.sess.fatal("miri only makes sense on bin crates");
             }
 
@@ -122,7 +127,7 @@ impl rustc_driver::Callbacks for MiriBeRustCompilerCalls {
         if config.opts.prints.is_empty() && self.target_crate {
             // Queries overridden here affect the data stored in `rmeta` files of dependencies,
             // which will be used later in non-`MIRI_BE_RUSTC` mode.
-            config.override_queries = Some(|_, local_providers, _| {
+            config.override_queries = Some(|_, local_providers| {
                 // `exported_symbols` and `reachable_non_generics` provided by rustc always returns
                 // an empty result if `tcx.sess.opts.output_types.should_codegen()` is false.
                 local_providers.exported_symbols = |tcx, LocalCrate| {
@@ -179,45 +184,54 @@ macro_rules! show_error {
     ($($tt:tt)*) => { show_error(&format_args!($($tt)*)) };
 }
 
-fn init_early_loggers() {
-    // Note that our `extern crate log` is *not* the same as rustc's; as a result, we have to
-    // initialize them both, and we always initialize `miri`'s first.
-    let env = env_logger::Env::new().filter("MIRI_LOG").write_style("MIRI_LOG_STYLE");
-    env_logger::init_from_env(env);
-    // Enable verbose entry/exit logging by default if MIRI_LOG is set.
-    if env::var_os("MIRI_LOG").is_some() && env::var_os("RUSTC_LOG_ENTRY_EXIT").is_none() {
-        env::set_var("RUSTC_LOG_ENTRY_EXIT", "1");
-    }
-    // We only initialize `rustc` if the env var is set (so the user asked for it).
-    // If it is not set, we avoid initializing now so that we can initialize
-    // later with our custom settings, and *not* log anything for what happens before
-    // `miri` gets started.
-    if env::var_os("RUSTC_LOG").is_some() {
-        rustc_driver::init_rustc_env_logger();
-    }
-}
+fn rustc_logger_config() -> rustc_log::LoggerConfig {
+    // Start with the usual env vars.
+    let mut cfg = rustc_log::LoggerConfig::from_env("RUSTC_LOG");
 
-fn init_late_loggers(tcx: TyCtxt<'_>) {
-    // We initialize loggers right before we start evaluation. We overwrite the `RUSTC_LOG`
-    // env var if it is not set, control it based on `MIRI_LOG`.
-    // (FIXME: use `var_os`, but then we need to manually concatenate instead of `format!`.)
+    // Overwrite if MIRI_LOG is set.
     if let Ok(var) = env::var("MIRI_LOG") {
-        if env::var_os("RUSTC_LOG").is_none() {
+        // MIRI_LOG serves as default for RUSTC_LOG, if that is not set.
+        if matches!(cfg.filter, Err(VarError::NotPresent)) {
             // We try to be a bit clever here: if `MIRI_LOG` is just a single level
             // used for everything, we only apply it to the parts of rustc that are
             // CTFE-related. Otherwise, we use it verbatim for `RUSTC_LOG`.
             // This way, if you set `MIRI_LOG=trace`, you get only the right parts of
             // rustc traced, but you can also do `MIRI_LOG=miri=trace,rustc_const_eval::interpret=debug`.
             if log::Level::from_str(&var).is_ok() {
-                env::set_var(
-                    "RUSTC_LOG",
-                    format!("rustc_middle::mir::interpret={var},rustc_const_eval::interpret={var}"),
-                );
+                cfg.filter = Ok(format!(
+                    "rustc_middle::mir::interpret={var},rustc_const_eval::interpret={var}"
+                ));
             } else {
-                env::set_var("RUSTC_LOG", &var);
+                cfg.filter = Ok(var);
             }
-            rustc_driver::init_rustc_env_logger();
         }
+        // Enable verbose entry/exit logging by default if MIRI_LOG is set.
+        if matches!(cfg.verbose_entry_exit, Err(VarError::NotPresent)) {
+            cfg.verbose_entry_exit = Ok(format!("1"));
+        }
+    }
+
+    cfg
+}
+
+fn init_early_loggers(handler: &EarlyErrorHandler) {
+    // Note that our `extern crate log` is *not* the same as rustc's; as a result, we have to
+    // initialize them both, and we always initialize `miri`'s first.
+    let env = env_logger::Env::new().filter("MIRI_LOG").write_style("MIRI_LOG_STYLE");
+    env_logger::init_from_env(env);
+    // Now for rustc. We only initialize `rustc` if the env var is set (so the user asked for it).
+    // If it is not set, we avoid initializing now so that we can initialize later with our custom
+    // settings, and *not* log anything for what happens before `miri` gets started.
+    if env::var_os("RUSTC_LOG").is_some() {
+        rustc_driver::init_logger(handler, rustc_logger_config());
+    }
+}
+
+fn init_late_loggers(handler: &EarlyErrorHandler, tcx: TyCtxt<'_>) {
+    // If `RUSTC_LOG` is not set, then `init_early_loggers` did not call
+    // `rustc_driver::init_logger`, so we have to do this now.
+    if env::var_os("RUSTC_LOG").is_none() {
+        rustc_driver::init_logger(handler, rustc_logger_config());
     }
 
     // If `MIRI_BACKTRACE` is set and `RUSTC_CTFE_BACKTRACE` is not, set `RUSTC_CTFE_BACKTRACE`.
@@ -237,6 +251,7 @@ fn run_compiler(
     mut args: Vec<String>,
     target_crate: bool,
     callbacks: &mut (dyn rustc_driver::Callbacks + Send),
+    using_internal_features: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> ! {
     if target_crate {
         // Miri needs a custom sysroot for target crates.
@@ -269,7 +284,9 @@ fn run_compiler(
 
     // Invoke compiler, and handle return code.
     let exit_code = rustc_driver::catch_with_exit_code(move || {
-        rustc_driver::RunCompiler::new(&args, callbacks).run()
+        rustc_driver::RunCompiler::new(&args, callbacks)
+            .set_using_internal_features(using_internal_features)
+            .run()
     });
     std::process::exit(exit_code)
 }
@@ -282,6 +299,8 @@ fn parse_comma_list<T: FromStr>(input: &str) -> Result<Vec<T>, T::Err> {
 }
 
 fn main() {
+    let handler = EarlyErrorHandler::new(ErrorOutputType::default());
+
     // Snapshot a copy of the environment before `rustc` starts messing with it.
     // (`install_ice_hook` might change `RUST_BACKTRACE`.)
     let env_snapshot = env::vars_os().collect::<Vec<_>>();
@@ -289,8 +308,9 @@ fn main() {
     // If the environment asks us to actually be rustc, then do that.
     if let Some(crate_kind) = env::var_os("MIRI_BE_RUSTC") {
         // Earliest rustc setup.
-        rustc_driver::install_ice_hook(rustc_driver::DEFAULT_BUG_REPORT_URL, |_| ());
-        rustc_driver::init_rustc_env_logger();
+        let using_internal_features =
+            rustc_driver::install_ice_hook(rustc_driver::DEFAULT_BUG_REPORT_URL, |_| ());
+        rustc_driver::init_rustc_env_logger(&handler);
 
         let target_crate = if crate_kind == "target" {
             true
@@ -305,14 +325,16 @@ fn main() {
             env::args().collect(),
             target_crate,
             &mut MiriBeRustCompilerCalls { target_crate },
+            using_internal_features,
         )
     }
 
     // Add an ICE bug report hook.
-    rustc_driver::install_ice_hook("https://github.com/rust-lang/miri/issues/new", |_| ());
+    let using_internal_features =
+        rustc_driver::install_ice_hook("https://github.com/rust-lang/miri/issues/new", |_| ());
 
     // Init loggers the Miri way.
-    init_early_loggers();
+    init_early_loggers(&handler);
 
     // Parse our arguments and split them across `rustc` and `miri`.
     let mut miri_config = miri::MiriConfig::default();
@@ -338,6 +360,8 @@ fn main() {
             miri_config.borrow_tracker = None;
         } else if arg == "-Zmiri-tree-borrows" {
             miri_config.borrow_tracker = Some(BorrowTrackerMethod::TreeBorrows);
+        } else if arg == "-Zmiri-unique-is-unique" {
+            miri_config.unique_is_unique = true;
         } else if arg == "-Zmiri-disable-data-race-detector" {
             miri_config.data_race_detector = false;
             miri_config.weak_memory_emulation = false;
@@ -351,6 +375,10 @@ fn main() {
                         since it is now enabled by default"
             );
         } else if arg == "-Zmiri-disable-abi-check" {
+            eprintln!(
+                "WARNING: the flag `-Zmiri-disable-abi-check` is deprecated and planned to be removed.\n\
+                If you have a use-case for it, please file an issue."
+            );
             miri_config.check_abi = false;
         } else if arg == "-Zmiri-disable-isolation" {
             if matches!(isolation_enabled, Some(true)) {
@@ -555,8 +583,21 @@ fn main() {
             rustc_args.push(arg);
         }
     }
+    // `-Zmiri-unique-is-unique` should only be used with `-Zmiri-tree-borrows`
+    if miri_config.unique_is_unique
+        && !matches!(miri_config.borrow_tracker, Some(BorrowTrackerMethod::TreeBorrows))
+    {
+        show_error!(
+            "-Zmiri-unique-is-unique only has an effect when -Zmiri-tree-borrows is also used"
+        );
+    }
 
     debug!("rustc arguments: {:?}", rustc_args);
     debug!("crate arguments: {:?}", miri_config.args);
-    run_compiler(rustc_args, /* target_crate: */ true, &mut MiriCompilerCalls { miri_config })
+    run_compiler(
+        rustc_args,
+        /* target_crate: */ true,
+        &mut MiriCompilerCalls { miri_config },
+        using_internal_features,
+    )
 }

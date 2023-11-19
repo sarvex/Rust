@@ -12,23 +12,20 @@ macro_rules! intrinsic_args {
     }
 }
 
-mod cpuid;
 mod llvm;
 mod llvm_aarch64;
 mod llvm_x86;
 mod simd;
 
-pub(crate) use cpuid::codegen_cpuid_call;
-pub(crate) use llvm::codegen_llvm_intrinsic_call;
-
+use cranelift_codegen::ir::AtomicRmwOp;
 use rustc_middle::ty;
 use rustc_middle::ty::layout::{HasParamEnv, ValidityRequirement};
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
-use rustc_middle::ty::subst::SubstsRef;
+use rustc_middle::ty::GenericArgsRef;
 use rustc_span::symbol::{kw, sym, Symbol};
 
+pub(crate) use self::llvm::codegen_llvm_intrinsic_call;
 use crate::prelude::*;
-use cranelift_codegen::ir::AtomicRmwOp;
 
 fn bug_on_incorrect_arg_count(intrinsic: impl std::fmt::Display) -> ! {
     bug!("wrong number of args for intrinsic {}", intrinsic);
@@ -135,6 +132,65 @@ fn simd_pair_for_each_lane<'tcx>(
     }
 }
 
+fn simd_horizontal_pair_for_each_lane<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
+    x: CValue<'tcx>,
+    y: CValue<'tcx>,
+    ret: CPlace<'tcx>,
+    f: &dyn Fn(&mut FunctionCx<'_, '_, 'tcx>, Ty<'tcx>, Ty<'tcx>, Value, Value) -> Value,
+) {
+    assert_eq!(x.layout(), y.layout());
+    let layout = x.layout();
+
+    let (lane_count, lane_ty) = layout.ty.simd_size_and_type(fx.tcx);
+    let lane_layout = fx.layout_of(lane_ty);
+    let (ret_lane_count, ret_lane_ty) = ret.layout().ty.simd_size_and_type(fx.tcx);
+    let ret_lane_layout = fx.layout_of(ret_lane_ty);
+    assert_eq!(lane_count, ret_lane_count);
+
+    for lane_idx in 0..lane_count {
+        let src = if lane_idx < (lane_count / 2) { x } else { y };
+        let src_idx = lane_idx % (lane_count / 2);
+
+        let lhs_lane = src.value_lane(fx, src_idx * 2).load_scalar(fx);
+        let rhs_lane = src.value_lane(fx, src_idx * 2 + 1).load_scalar(fx);
+
+        let res_lane = f(fx, lane_layout.ty, ret_lane_layout.ty, lhs_lane, rhs_lane);
+        let res_lane = CValue::by_val(res_lane, ret_lane_layout);
+
+        ret.place_lane(fx, lane_idx).write_cvalue(fx, res_lane);
+    }
+}
+
+fn simd_trio_for_each_lane<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
+    x: CValue<'tcx>,
+    y: CValue<'tcx>,
+    z: CValue<'tcx>,
+    ret: CPlace<'tcx>,
+    f: &dyn Fn(&mut FunctionCx<'_, '_, 'tcx>, Ty<'tcx>, Ty<'tcx>, Value, Value, Value) -> Value,
+) {
+    assert_eq!(x.layout(), y.layout());
+    let layout = x.layout();
+
+    let (lane_count, lane_ty) = layout.ty.simd_size_and_type(fx.tcx);
+    let lane_layout = fx.layout_of(lane_ty);
+    let (ret_lane_count, ret_lane_ty) = ret.layout().ty.simd_size_and_type(fx.tcx);
+    let ret_lane_layout = fx.layout_of(ret_lane_ty);
+    assert_eq!(lane_count, ret_lane_count);
+
+    for lane_idx in 0..lane_count {
+        let x_lane = x.value_lane(fx, lane_idx).load_scalar(fx);
+        let y_lane = y.value_lane(fx, lane_idx).load_scalar(fx);
+        let z_lane = z.value_lane(fx, lane_idx).load_scalar(fx);
+
+        let res_lane = f(fx, lane_layout.ty, ret_lane_layout.ty, x_lane, y_lane, z_lane);
+        let res_lane = CValue::by_val(res_lane, ret_lane_layout);
+
+        ret.place_lane(fx, lane_idx).write_cvalue(fx, res_lane);
+    }
+}
+
 fn simd_reduce<'tcx>(
     fx: &mut FunctionCx<'_, '_, 'tcx>,
     val: CValue<'tcx>,
@@ -213,13 +269,13 @@ pub(crate) fn codegen_intrinsic_call<'tcx>(
     source_info: mir::SourceInfo,
 ) {
     let intrinsic = fx.tcx.item_name(instance.def_id());
-    let substs = instance.substs;
+    let instance_args = instance.args;
 
     if intrinsic.as_str().starts_with("simd_") {
         self::simd::codegen_simd_intrinsic_call(
             fx,
             intrinsic,
-            substs,
+            instance_args,
             args,
             destination,
             target.expect("target for simd intrinsic"),
@@ -233,7 +289,7 @@ pub(crate) fn codegen_intrinsic_call<'tcx>(
             fx,
             instance,
             intrinsic,
-            substs,
+            instance_args,
             args,
             destination,
             target,
@@ -365,7 +421,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
     fx: &mut FunctionCx<'_, '_, 'tcx>,
     instance: Instance<'tcx>,
     intrinsic: Symbol,
-    substs: SubstsRef<'tcx>,
+    generic_args: GenericArgsRef<'tcx>,
     args: &[mir::Operand<'tcx>],
     ret: CPlace<'tcx>,
     destination: Option<BasicBlock>,
@@ -394,7 +450,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
             let dst = dst.load_scalar(fx);
             let count = count.load_scalar(fx);
 
-            let elem_ty = substs.type_at(0);
+            let elem_ty = generic_args.type_at(0);
             let elem_size: u64 = fx.layout_of(elem_ty).size.bytes();
             assert_eq!(args.len(), 3);
             let byte_amount =
@@ -410,7 +466,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
             let src = src.load_scalar(fx);
             let count = count.load_scalar(fx);
 
-            let elem_ty = substs.type_at(0);
+            let elem_ty = generic_args.type_at(0);
             let elem_size: u64 = fx.layout_of(elem_ty).size.bytes();
             assert_eq!(args.len(), 3);
             let byte_amount =
@@ -428,7 +484,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
         sym::size_of_val => {
             intrinsic_args!(fx, args => (ptr); intrinsic);
 
-            let layout = fx.layout_of(substs.type_at(0));
+            let layout = fx.layout_of(generic_args.type_at(0));
             // Note: Can't use is_unsized here as truly unsized types need to take the fixed size
             // branch
             let size = if let Abi::ScalarPair(_, _) = ptr.layout().abi {
@@ -443,7 +499,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
         sym::min_align_of_val => {
             intrinsic_args!(fx, args => (ptr); intrinsic);
 
-            let layout = fx.layout_of(substs.type_at(0));
+            let layout = fx.layout_of(generic_args.type_at(0));
             // Note: Can't use is_unsized here as truly unsized types need to take the fixed size
             // branch
             let align = if let Abi::ScalarPair(_, _) = ptr.layout().abi {
@@ -472,28 +528,11 @@ fn codegen_regular_intrinsic_call<'tcx>(
             ret.write_cvalue(fx, CValue::by_val(align, usize_layout));
         }
 
-        sym::unchecked_add
-        | sym::unchecked_sub
-        | sym::unchecked_mul
-        | sym::unchecked_div
-        | sym::exact_div
-        | sym::unchecked_rem
-        | sym::unchecked_shl
-        | sym::unchecked_shr => {
+        sym::exact_div => {
             intrinsic_args!(fx, args => (x, y); intrinsic);
 
-            // FIXME trap on overflow
-            let bin_op = match intrinsic {
-                sym::unchecked_add => BinOp::Add,
-                sym::unchecked_sub => BinOp::Sub,
-                sym::unchecked_mul => BinOp::Mul,
-                sym::unchecked_div | sym::exact_div => BinOp::Div,
-                sym::unchecked_rem => BinOp::Rem,
-                sym::unchecked_shl => BinOp::Shl,
-                sym::unchecked_shr => BinOp::Shr,
-                _ => unreachable!(),
-            };
-            let res = crate::num::codegen_int_binop(fx, bin_op, x, y);
+            // FIXME trap on inexact
+            let res = crate::num::codegen_int_binop(fx, BinOp::Div, x, y);
             ret.write_cvalue(fx, res);
         }
         sym::saturating_add | sym::saturating_sub => {
@@ -619,7 +658,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
         sym::assert_inhabited | sym::assert_zero_valid | sym::assert_mem_uninitialized_valid => {
             intrinsic_args!(fx, args => (); intrinsic);
 
-            let ty = substs.type_at(0);
+            let ty = generic_args.type_at(0);
 
             let requirement = ValidityRequirement::from_intrinsic(intrinsic);
 
@@ -664,12 +703,13 @@ fn codegen_regular_intrinsic_call<'tcx>(
             let val = CValue::by_ref(Pointer::new(ptr.load_scalar(fx)), inner_layout);
             ret.write_cvalue(fx, val);
         }
-        sym::volatile_store | sym::unaligned_volatile_store => {
+        sym::volatile_store | sym::unaligned_volatile_store | sym::nontemporal_store => {
             intrinsic_args!(fx, args => (ptr, val); intrinsic);
             let ptr = ptr.load_scalar(fx);
 
             // Cranelift treats stores as volatile by default
             // FIXME correctly handle unaligned_volatile_store
+            // FIXME actually do nontemporal stores if requested
             let dest = CPlace::for_ptr(Pointer::new(ptr), val.layout());
             dest.write_cvalue(fx, val);
         }
@@ -691,7 +731,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
             intrinsic_args!(fx, args => (ptr, base); intrinsic);
             let ptr = ptr.load_scalar(fx);
             let base = base.load_scalar(fx);
-            let ty = substs.type_at(0);
+            let ty = generic_args.type_at(0);
 
             let pointee_size: u64 = fx.layout_of(ty).size.bytes();
             let diff_bytes = fx.bcx.ins().isub(ptr, base);
@@ -737,7 +777,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
             intrinsic_args!(fx, args => (ptr); intrinsic);
             let ptr = ptr.load_scalar(fx);
 
-            let ty = substs.type_at(0);
+            let ty = generic_args.type_at(0);
             match ty.kind() {
                 ty::Uint(UintTy::U128) | ty::Int(IntTy::I128) => {
                     // FIXME implement 128bit atomics
@@ -768,7 +808,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
             intrinsic_args!(fx, args => (ptr, val); intrinsic);
             let ptr = ptr.load_scalar(fx);
 
-            let ty = substs.type_at(0);
+            let ty = generic_args.type_at(0);
             match ty.kind() {
                 ty::Uint(UintTy::U128) | ty::Int(IntTy::I128) => {
                     // FIXME implement 128bit atomics
@@ -1145,7 +1185,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
             let lhs_ref = lhs_ref.load_scalar(fx);
             let rhs_ref = rhs_ref.load_scalar(fx);
 
-            let size = fx.layout_of(substs.type_at(0)).layout.size();
+            let size = fx.layout_of(generic_args.type_at(0)).layout.size();
             // FIXME add and use emit_small_memcmp
             let is_eq_value = if size == Size::ZERO {
                 // No bytes means they're trivially equal
@@ -1169,6 +1209,20 @@ fn codegen_regular_intrinsic_call<'tcx>(
                 fx.bcx.ins().icmp_imm(IntCC::Equal, cmp, 0)
             };
             ret.write_cvalue(fx, CValue::by_val(is_eq_value, ret.layout()));
+        }
+
+        sym::compare_bytes => {
+            intrinsic_args!(fx, args => (lhs_ptr, rhs_ptr, bytes_val); intrinsic);
+            let lhs_ptr = lhs_ptr.load_scalar(fx);
+            let rhs_ptr = rhs_ptr.load_scalar(fx);
+            let bytes_val = bytes_val.load_scalar(fx);
+
+            let params = vec![AbiParam::new(fx.pointer_type); 3];
+            let returns = vec![AbiParam::new(types::I32)];
+            let args = &[lhs_ptr, rhs_ptr, bytes_val];
+            // Here we assume that the `memcmp` provided by the target is a NOP for size 0.
+            let cmp = fx.lib_call("memcmp", params, returns, args)[0];
+            ret.write_cvalue(fx, CValue::by_val(cmp, ret.layout()));
         }
 
         sym::const_allocate => {

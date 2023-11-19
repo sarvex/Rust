@@ -25,9 +25,7 @@
 //! to: `rustc_span::create_default_session_globals_then(|| { test_here(); })`.
 
 use super::counters;
-use super::debug;
-use super::graph;
-use super::spans;
+use super::graph::{self, BasicCoverageBlock};
 
 use coverage_test_macros::let_bcb;
 
@@ -35,7 +33,6 @@ use itertools::Itertools;
 use rustc_data_structures::graph::WithNumNodes;
 use rustc_data_structures::graph::WithSuccessors;
 use rustc_index::{Idx, IndexVec};
-use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::mir::*;
 use rustc_middle::ty;
 use rustc_span::{self, BytePos, Pos, Span, DUMMY_SP};
@@ -141,7 +138,7 @@ impl<'tcx> MockBlocks<'tcx> {
                 destination: self.dummy_place.clone(),
                 target: Some(TEMP_BLOCK),
                 unwind: UnwindAction::Continue,
-                from_hir_call: false,
+                call_source: CallSource::Misc,
                 fn_span: DUMMY_SP,
             },
         )
@@ -188,12 +185,12 @@ fn debug_basic_blocks(mir_body: &Body<'_>) -> String {
                     | TerminatorKind::Goto { target }
                     | TerminatorKind::InlineAsm { destination: Some(target), .. }
                     | TerminatorKind::Yield { resume: target, .. } => {
-                        format!("{}{:?}:{} -> {:?}", sp, bb, debug::term_type(kind), target)
+                        format!("{}{:?}:{} -> {:?}", sp, bb, kind.name(), target)
                     }
                     TerminatorKind::SwitchInt { targets, .. } => {
-                        format!("{}{:?}:{} -> {:?}", sp, bb, debug::term_type(kind), targets)
+                        format!("{}{:?}:{} -> {:?}", sp, bb, kind.name(), targets)
                     }
-                    _ => format!("{}{:?}:{}", sp, bb, debug::term_type(kind)),
+                    _ => format!("{}{:?}:{}", sp, bb, kind.name()),
                 }
             })
             .collect::<Vec<_>>()
@@ -215,7 +212,7 @@ fn print_mir_graphviz(name: &str, mir_body: &Body<'_>) {
                         "    {:?} [label=\"{:?}: {}\"];\n{}",
                         bb,
                         bb,
-                        debug::term_type(&data.terminator().kind),
+                        data.terminator().kind.name(),
                         mir_body
                             .basic_blocks
                             .successors(bb)
@@ -244,7 +241,7 @@ fn print_coverage_graphviz(
                         "    {:?} [label=\"{:?}: {}\"];\n{}",
                         bcb,
                         bcb,
-                        debug::term_type(&bcb_data.terminator(mir_body).kind),
+                        mir_body[bcb_data.last_bb()].terminator().kind.name(),
                         basic_coverage_blocks
                             .successors(bcb)
                             .map(|successor| { format!("    {:?} -> {:?};", bcb, successor) })
@@ -631,7 +628,7 @@ fn test_traverse_coverage_with_loops() {
     let basic_coverage_blocks = graph::CoverageGraph::from_mir(&mir_body);
     let mut traversed_in_order = Vec::new();
     let mut traversal = graph::TraverseCoverageGraphWithLoops::new(&basic_coverage_blocks);
-    while let Some(bcb) = traversal.next(&basic_coverage_blocks) {
+    while let Some(bcb) = traversal.next() {
         traversed_in_order.push(bcb);
     }
 
@@ -646,47 +643,24 @@ fn test_traverse_coverage_with_loops() {
     );
 }
 
-fn synthesize_body_span_from_terminators(mir_body: &Body<'_>) -> Span {
-    let mut some_span: Option<Span> = None;
-    for (_, data) in mir_body.basic_blocks.iter_enumerated() {
-        let term_span = data.terminator().source_info.span;
-        if let Some(span) = some_span.as_mut() {
-            *span = span.to(term_span);
-        } else {
-            some_span = Some(term_span)
-        }
-    }
-    some_span.expect("body must have at least one BasicBlock")
-}
-
 #[test]
 fn test_make_bcb_counters() {
     rustc_span::create_default_session_globals_then(|| {
         let mir_body = goto_switchint();
-        let body_span = synthesize_body_span_from_terminators(&mir_body);
-        let mut basic_coverage_blocks = graph::CoverageGraph::from_mir(&mir_body);
-        let mut coverage_spans = Vec::new();
-        for (bcb, data) in basic_coverage_blocks.iter_enumerated() {
-            if let Some(span) = spans::filtered_terminator_span(data.terminator(&mir_body)) {
-                coverage_spans.push(spans::CoverageSpan::for_terminator(
-                    spans::function_source_span(span, body_span),
-                    span,
-                    bcb,
-                    data.last_bb(),
-                ));
-            }
-        }
-        let mut coverage_counters = counters::CoverageCounters::new(0);
-        let intermediate_expressions = coverage_counters
-            .make_bcb_counters(&mut basic_coverage_blocks, &coverage_spans)
-            .expect("should be Ok");
-        assert_eq!(intermediate_expressions.len(), 0);
+        let basic_coverage_blocks = graph::CoverageGraph::from_mir(&mir_body);
+        // Historically this test would use `spans` internals to set up fake
+        // coverage spans for BCBs 1 and 2. Now we skip that step and just tell
+        // BCB counter construction that those BCBs have spans.
+        let bcb_has_coverage_spans = |bcb: BasicCoverageBlock| (1..=2).contains(&bcb.as_usize());
+        let mut coverage_counters = counters::CoverageCounters::new(&basic_coverage_blocks);
+        coverage_counters.make_bcb_counters(&basic_coverage_blocks, bcb_has_coverage_spans);
+        assert_eq!(coverage_counters.num_expressions(), 0);
 
         let_bcb!(1);
         assert_eq!(
-            1, // coincidentally, bcb1 has a `Counter` with id = 1
-            match basic_coverage_blocks[bcb1].counter().expect("should have a counter") {
-                CoverageKind::Counter { id, .. } => id,
+            0, // bcb1 has a `Counter` with id = 0
+            match coverage_counters.bcb_counter(bcb1).expect("should have a counter") {
+                counters::BcbCounter::Counter { id, .. } => id,
                 _ => panic!("expected a Counter"),
             }
             .as_u32()
@@ -694,9 +668,9 @@ fn test_make_bcb_counters() {
 
         let_bcb!(2);
         assert_eq!(
-            2, // coincidentally, bcb2 has a `Counter` with id = 2
-            match basic_coverage_blocks[bcb2].counter().expect("should have a counter") {
-                CoverageKind::Counter { id, .. } => id,
+            1, // bcb2 has a `Counter` with id = 1
+            match coverage_counters.bcb_counter(bcb2).expect("should have a counter") {
+                counters::BcbCounter::Counter { id, .. } => id,
                 _ => panic!("expected a Counter"),
             }
             .as_u32()

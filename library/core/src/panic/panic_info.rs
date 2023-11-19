@@ -28,6 +28,7 @@ pub struct PanicInfo<'a> {
     message: Option<&'a fmt::Arguments<'a>>,
     location: &'a Location<'a>,
     can_unwind: bool,
+    force_no_backtrace: bool,
 }
 
 impl<'a> PanicInfo<'a> {
@@ -42,9 +43,10 @@ impl<'a> PanicInfo<'a> {
         message: Option<&'a fmt::Arguments<'a>>,
         location: &'a Location<'a>,
         can_unwind: bool,
+        force_no_backtrace: bool,
     ) -> Self {
         struct NoPayload;
-        PanicInfo { location, message, payload: &NoPayload, can_unwind }
+        PanicInfo { location, message, payload: &NoPayload, can_unwind, force_no_backtrace }
     }
 
     #[unstable(
@@ -134,12 +136,23 @@ impl<'a> PanicInfo<'a> {
     /// whose ABI does not support unwinding.
     ///
     /// It is safe for a panic handler to unwind even when this function returns
-    /// true, however this will simply cause the panic handler to be called
+    /// false, however this will simply cause the panic handler to be called
     /// again.
     #[must_use]
     #[unstable(feature = "panic_can_unwind", issue = "92988")]
     pub fn can_unwind(&self) -> bool {
         self.can_unwind
+    }
+
+    #[unstable(
+        feature = "panic_internals",
+        reason = "internal details of the implementation of the `panic!` and related macros",
+        issue = "none"
+    )]
+    #[doc(hidden)]
+    #[inline]
+    pub fn force_no_backtrace(&self) -> bool {
+        self.force_no_backtrace
     }
 }
 
@@ -147,16 +160,18 @@ impl<'a> PanicInfo<'a> {
 impl fmt::Display for PanicInfo<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("panicked at ")?;
+        self.location.fmt(formatter)?;
         if let Some(message) = self.message {
-            write!(formatter, "'{}', ", message)?
+            formatter.write_str(":\n")?;
+            formatter.write_fmt(*message)?;
         } else if let Some(payload) = self.payload.downcast_ref::<&'static str>() {
-            write!(formatter, "'{}', ", payload)?
+            formatter.write_str(":\n")?;
+            formatter.write_str(payload)?;
         }
         // NOTE: we cannot use downcast_ref::<String>() here
         // since String is not available in core!
         // The payload is a String when `std::panic!` is called with multiple arguments,
         // but in that case the message is also available.
-
-        self.location.fmt(formatter)
+        Ok(())
     }
 }

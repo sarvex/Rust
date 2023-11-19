@@ -146,26 +146,49 @@ pub fn print_crate<'a>(
     s.s.eof()
 }
 
-/// This makes printed token streams look slightly nicer,
-/// and also addresses some specific regressions described in #63896 and #73345.
-fn tt_prepend_space(tt: &TokenTree, prev: &TokenTree) -> bool {
-    if let TokenTree::Token(token, _) = prev {
-        if matches!(token.kind, token::Dot | token::Dollar) {
-            return false;
-        }
-        if let token::DocComment(comment_kind, ..) = token.kind {
-            return comment_kind != CommentKind::Line;
-        }
-    }
-    match tt {
-        TokenTree::Token(token, _) => !matches!(token.kind, token::Comma | token::Not | token::Dot),
-        TokenTree::Delimited(_, Delimiter::Parenthesis, _) => {
-            !matches!(prev, TokenTree::Token(Token { kind: token::Ident(..), .. }, _))
-        }
-        TokenTree::Delimited(_, Delimiter::Bracket, _) => {
-            !matches!(prev, TokenTree::Token(Token { kind: token::Pound, .. }, _))
-        }
-        TokenTree::Delimited(..) => true,
+/// Should two consecutive tokens be printed with a space between them?
+///
+/// Note: some old proc macros parse pretty-printed output, so changes here can
+/// break old code. For example:
+/// - #63896: `#[allow(unused,` must be printed rather than `#[allow(unused ,`
+/// - #73345: `#[allow(unused)] must be printed rather than `# [allow(unused)]
+///
+fn space_between(tt1: &TokenTree, tt2: &TokenTree) -> bool {
+    use token::*;
+    use Delimiter::*;
+    use TokenTree::Delimited as Del;
+    use TokenTree::Token as Tok;
+
+    // Each match arm has one or more examples in comments. The default is to
+    // insert space between adjacent tokens, except for the cases listed in
+    // this match.
+    match (tt1, tt2) {
+        // No space after line doc comments.
+        (Tok(Token { kind: DocComment(CommentKind::Line, ..), .. }, _), _) => false,
+
+        // `.` + ANYTHING: `x.y`, `tup.0`
+        // `$` + ANYTHING: `$e`
+        (Tok(Token { kind: Dot | Dollar, .. }, _), _) => false,
+
+        // ANYTHING + `,`: `foo,`
+        // ANYTHING + `.`: `x.y`, `tup.0`
+        // ANYTHING + `!`: `foo! { ... }`
+        //
+        // FIXME: Incorrect cases:
+        // - Logical not: `x =! y`, `if! x { f(); }`
+        // - Never type: `Fn() ->!`
+        (_, Tok(Token { kind: Comma | Dot | Not, .. }, _)) => false,
+
+        // IDENT + `(`: `f(3)`
+        //
+        // FIXME: Incorrect cases:
+        // - Let: `let(a, b) = (1, 2)`
+        (Tok(Token { kind: Ident(..), .. }, _), Del(_, Parenthesis, _)) => false,
+
+        // `#` + `[`: `#[attr]`
+        (Tok(Token { kind: Pound, .. }, _), Del(_, Bracket, _)) => false,
+
+        _ => true,
     }
 }
 
@@ -476,7 +499,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
                 Some(MacHeader::Path(&item.path)),
                 false,
                 None,
-                delim.to_token(),
+                *delim,
                 tokens,
                 true,
                 span,
@@ -564,7 +587,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
         while let Some(tt) = iter.next() {
             self.print_tt(tt, convert_dollar_crate);
             if let Some(next) = iter.peek() {
-                if tt_prepend_space(next, tt) {
+                if space_between(tt, next) {
                     self.space();
                 }
             }
@@ -640,7 +663,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
             Some(MacHeader::Keyword(kw)),
             has_bang,
             Some(*ident),
-            macro_def.body.delim.to_token(),
+            macro_def.body.delim,
             &macro_def.body.tokens.clone(),
             true,
             sp,
@@ -802,7 +825,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
             }
             token::Eof => "<eof>".into(),
 
-            token::Interpolated(ref nt) => self.nonterminal_to_string(nt).into(),
+            token::Interpolated(ref nt) => self.nonterminal_to_string(&nt.0).into(),
         }
     }
 
@@ -822,6 +845,13 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
 
     fn bounds_to_string(&self, bounds: &[ast::GenericBound]) -> String {
         Self::to_string(|s| s.print_type_bounds(bounds))
+    }
+
+    fn where_bound_predicate_to_string(
+        &self,
+        where_bound_predicate: &ast::WhereBoundPredicate,
+    ) -> String {
+        Self::to_string(|s| s.print_where_bound_predicate(where_bound_predicate))
     }
 
     fn pat_to_string(&self, pat: &ast::Pat) -> String {
@@ -1046,6 +1076,14 @@ impl<'a> State<'a> {
                 }
                 self.pclose();
             }
+            ast::TyKind::AnonStruct(fields) => {
+                self.head("struct");
+                self.print_record_struct_body(&fields, ty.span);
+            }
+            ast::TyKind::AnonUnion(fields) => {
+                self.head("union");
+                self.print_record_struct_body(&fields, ty.span);
+            }
             ast::TyKind::Paren(typ) => {
                 self.popen();
                 self.print_type(typ);
@@ -1233,7 +1271,7 @@ impl<'a> State<'a> {
             Some(MacHeader::Path(&m.path)),
             true,
             None,
-            m.args.delim.to_token(),
+            m.args.delim,
             &m.args.tokens.clone(),
             true,
             m.span(),

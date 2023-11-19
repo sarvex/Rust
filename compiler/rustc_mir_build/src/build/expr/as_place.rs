@@ -75,7 +75,7 @@ pub(in crate::build) struct PlaceBuilder<'tcx> {
 
 /// Given a list of MIR projections, convert them to list of HIR ProjectionKind.
 /// The projections are truncated to represent a path that might be captured by a
-/// closure/generator. This implies the vector returned from this function doesn't contain
+/// closure/coroutine. This implies the vector returned from this function doesn't contain
 /// ProjectionElems `Downcast`, `ConstantIndex`, `Index`, or `Subslice` because those will never be
 /// part of a path that is captured by a closure. We stop applying projections once we see the first
 /// projection that isn't captured by a closure.
@@ -102,7 +102,7 @@ fn convert_to_hir_projections_and_truncate_for_capture(
                 continue;
             }
             // These do not affect anything, they just make sure we know the right type.
-            ProjectionElem::OpaqueCast(_) => continue,
+            ProjectionElem::OpaqueCast(_) | ProjectionElem::Subtype(..) => continue,
             ProjectionElem::Index(..)
             | ProjectionElem::ConstantIndex { .. }
             | ProjectionElem::Subslice { .. } => {
@@ -175,11 +175,8 @@ fn to_upvars_resolved_place_builder<'tcx>(
     projection: &[PlaceElem<'tcx>],
 ) -> Option<PlaceBuilder<'tcx>> {
     let Some((capture_index, capture)) =
-        find_capture_matching_projections(
-            &cx.upvars,
-            var_hir_id,
-            &projection,
-        ) else {
+        find_capture_matching_projections(&cx.upvars, var_hir_id, &projection)
+    else {
         let closure_span = cx.tcx.def_span(closure_def_id);
         if !enable_precise_capture(closure_span) {
             bug!(
@@ -189,10 +186,7 @@ fn to_upvars_resolved_place_builder<'tcx>(
                 projection
             )
         } else {
-            debug!(
-                "No associated capture found for {:?}[{:#?}]",
-                var_hir_id, projection,
-            );
+            debug!("No associated capture found for {:?}[{:#?}]", var_hir_id, projection,);
         }
         return None;
     };
@@ -219,7 +213,7 @@ fn to_upvars_resolved_place_builder<'tcx>(
 /// projections.
 ///
 /// Supports only HIR projection kinds that represent a path that might be
-/// captured by a closure or a generator, i.e., an `Index` or a `Subslice`
+/// captured by a closure or a coroutine, i.e., an `Index` or a `Subslice`
 /// projection kinds are unsupported.
 fn strip_prefix<'a, 'tcx>(
     mut base_ty: Ty<'tcx>,
@@ -241,6 +235,9 @@ fn strip_prefix<'a, 'tcx>(
                     assert_matches!(iter.next(), Some(ProjectionElem::Downcast(..)));
                 }
                 assert_matches!(iter.next(), Some(ProjectionElem::Field(..)));
+            }
+            HirProjectionKind::OpaqueCast => {
+                assert_matches!(iter.next(), Some(ProjectionElem::OpaqueCast(..)));
             }
             HirProjectionKind::Index | HirProjectionKind::Subslice => {
                 bug!("unexpected projection kind: {:?}", projection);
@@ -535,7 +532,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Cast { .. }
             | ExprKind::Use { .. }
             | ExprKind::NeverToAny { .. }
-            | ExprKind::Pointer { .. }
+            | ExprKind::PointerCoercion { .. }
             | ExprKind::Repeat { .. }
             | ExprKind::Borrow { .. }
             | ExprKind::AddressOf { .. }
@@ -549,6 +546,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Break { .. }
             | ExprKind::Continue { .. }
             | ExprKind::Return { .. }
+            | ExprKind::Become { .. }
             | ExprKind::Literal { .. }
             | ExprKind::NamedConst { .. }
             | ExprKind::NonHirLiteral { .. }
@@ -677,40 +675,29 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             // check that we just did stays valid. Since we can't assign to
             // unsized values, we only need to ensure that none of the
             // pointers in the base place are modified.
-            for (idx, elem) in base_place.projection.iter().enumerate().rev() {
+            for (base_place, elem) in base_place.iter_projections().rev() {
                 match elem {
                     ProjectionElem::Deref => {
-                        let fake_borrow_deref_ty = Place::ty_from(
-                            base_place.local,
-                            &base_place.projection[..idx],
-                            &self.local_decls,
-                            tcx,
-                        )
-                        .ty;
+                        let fake_borrow_deref_ty = base_place.ty(&self.local_decls, tcx).ty;
                         let fake_borrow_ty =
-                            tcx.mk_imm_ref(tcx.lifetimes.re_erased, fake_borrow_deref_ty);
+                            Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, fake_borrow_deref_ty);
                         let fake_borrow_temp =
                             self.local_decls.push(LocalDecl::new(fake_borrow_ty, expr_span));
-                        let projection = tcx.mk_place_elems(&base_place.projection[..idx]);
+                        let projection = tcx.mk_place_elems(&base_place.projection);
                         self.cfg.push_assign(
                             block,
                             source_info,
                             fake_borrow_temp.into(),
                             Rvalue::Ref(
                                 tcx.lifetimes.re_erased,
-                                BorrowKind::Shallow,
+                                BorrowKind::Fake,
                                 Place { local: base_place.local, projection },
                             ),
                         );
                         fake_borrow_temps.push(fake_borrow_temp);
                     }
                     ProjectionElem::Index(_) => {
-                        let index_ty = Place::ty_from(
-                            base_place.local,
-                            &base_place.projection[..idx],
-                            &self.local_decls,
-                            tcx,
-                        );
+                        let index_ty = base_place.ty(&self.local_decls, tcx);
                         match index_ty.ty.kind() {
                             // The previous index expression has already
                             // done any index expressions needed here.
@@ -722,6 +709,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     ProjectionElem::Field(..)
                     | ProjectionElem::Downcast(..)
                     | ProjectionElem::OpaqueCast(..)
+                    | ProjectionElem::Subtype(..)
                     | ProjectionElem::ConstantIndex { .. }
                     | ProjectionElem::Subslice { .. } => (),
                 }
@@ -746,5 +734,5 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
 /// Precise capture is enabled if user is using Rust Edition 2021 or higher.
 fn enable_precise_capture(closure_span: Span) -> bool {
-    closure_span.rust_2021()
+    closure_span.at_least_rust_2021()
 }

@@ -81,8 +81,8 @@
 //!
 //! [mm]: https://github.com/rust-lang/measureme/
 
-use crate::cold_path;
 use crate::fx::FxHashMap;
+use crate::outline;
 
 use std::borrow::Borrow;
 use std::collections::hash_map::Entry;
@@ -101,7 +101,7 @@ use parking_lot::RwLock;
 use smallvec::SmallVec;
 
 bitflags::bitflags! {
-    struct EventFilter: u32 {
+    struct EventFilter: u16 {
         const GENERIC_ACTIVITIES  = 1 << 0;
         const QUERY_PROVIDERS     = 1 << 1;
         const QUERY_CACHE_HITS    = 1 << 2;
@@ -697,7 +697,7 @@ impl<'a> TimingGuard<'a> {
     #[inline]
     pub fn finish_with_query_invocation_id(self, query_invocation_id: QueryInvocationId) {
         if let Some(guard) = self.0 {
-            cold_path(|| {
+            outline(|| {
                 let event_id = StringId::new_virtual(query_invocation_id.0);
                 let event_id = EventId::from_virtual(event_id);
                 guard.finish_with_override_event_id(event_id);
@@ -859,20 +859,22 @@ fn get_thread_id() -> u32 {
 }
 
 // Memory reporting
-cfg_if! {
-    if #[cfg(windows)] {
+cfg_match! {
+    cfg(windows) => {
         pub fn get_resident_set_size() -> Option<usize> {
             use std::mem;
 
             use windows::{
-                Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+                // FIXME: change back to K32GetProcessMemoryInfo when windows crate
+                // updated to 0.49.0+ to drop dependency on psapi.dll
+                Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
                 Win32::System::Threading::GetCurrentProcess,
             };
 
             let mut pmc = PROCESS_MEMORY_COUNTERS::default();
             let pmc_size = mem::size_of_val(&pmc);
             unsafe {
-                K32GetProcessMemoryInfo(
+                GetProcessMemoryInfo(
                     GetCurrentProcess(),
                     &mut pmc,
                     pmc_size as u32,
@@ -883,7 +885,8 @@ cfg_if! {
 
             Some(pmc.WorkingSetSize)
         }
-    } else if #[cfg(target_os = "macos")] {
+    }
+    cfg(target_os = "macos")  => {
         pub fn get_resident_set_size() -> Option<usize> {
             use libc::{c_int, c_void, getpid, proc_pidinfo, proc_taskinfo, PROC_PIDTASKINFO};
             use std::mem;
@@ -901,7 +904,8 @@ cfg_if! {
                 }
             }
         }
-    } else if #[cfg(unix)] {
+    }
+    cfg(unix) => {
         pub fn get_resident_set_size() -> Option<usize> {
             let field = 1;
             let contents = fs::read("/proc/self/statm").ok()?;
@@ -910,7 +914,8 @@ cfg_if! {
             let npages = s.parse::<usize>().ok()?;
             Some(npages * 4096)
         }
-    } else {
+    }
+    _ => {
         pub fn get_resident_set_size() -> Option<usize> {
             None
         }

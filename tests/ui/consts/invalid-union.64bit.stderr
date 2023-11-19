@@ -6,20 +6,22 @@ LL | fn main() {
    |
    = note: The rules on what exactly is undefined behavior aren't clear, so this check might be overzealous. Please open an issue on the rustc repository if you believe it should not be considered undefined behavior.
    = note: the raw bytes of the constant (size: 8, align: 8) {
-               ╾───────alloc7────────╼                         │ ╾──────╼
+               ╾ALLOC0╼                         │ ╾──────╼
            }
 
-note: erroneous constant used
+note: erroneous constant encountered
   --> $DIR/invalid-union.rs:43:25
    |
 LL |     let _: &'static _ = &C;
    |                         ^^
 
-note: erroneous constant used
+note: erroneous constant encountered
   --> $DIR/invalid-union.rs:43:25
    |
 LL |     let _: &'static _ = &C;
    |                         ^^
+   |
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
 
 error: aborting due to previous error
 

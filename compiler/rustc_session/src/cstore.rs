@@ -6,12 +6,14 @@ use crate::search_paths::PathKind;
 use crate::utils::NativeLibKind;
 use crate::Session;
 use rustc_ast as ast;
-use rustc_data_structures::sync::{self, AppendOnlyIndexVec, MetadataRef, RwLock};
+use rustc_data_structures::owned_slice::OwnedSlice;
+use rustc_data_structures::sync::{self, AppendOnlyIndexVec, FreezeLock};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, StableCrateId, LOCAL_CRATE};
 use rustc_hir::definitions::{DefKey, DefPath, DefPathHash, Definitions};
 use rustc_span::hygiene::{ExpnHash, ExpnId};
 use rustc_span::symbol::Symbol;
 use rustc_span::Span;
+use rustc_target::spec::abi::Abi;
 use rustc_target::spec::Target;
 
 use std::any::Any;
@@ -146,6 +148,7 @@ pub enum DllCallingConvention {
 pub struct ForeignModule {
     pub foreign_items: Vec<DefId>,
     pub def_id: DefId,
+    pub abi: Abi,
 }
 
 #[derive(Copy, Clone, Debug, HashStable_Generic)]
@@ -203,11 +206,11 @@ pub enum ExternCrateSource {
 /// metadata in library -- this trait just serves to decouple rustc_metadata from
 /// the archive reader, which depends on LLVM.
 pub trait MetadataLoader: std::fmt::Debug {
-    fn get_rlib_metadata(&self, target: &Target, filename: &Path) -> Result<MetadataRef, String>;
-    fn get_dylib_metadata(&self, target: &Target, filename: &Path) -> Result<MetadataRef, String>;
+    fn get_rlib_metadata(&self, target: &Target, filename: &Path) -> Result<OwnedSlice, String>;
+    fn get_dylib_metadata(&self, target: &Target, filename: &Path) -> Result<OwnedSlice, String>;
 }
 
-pub type MetadataLoaderDyn = dyn MetadataLoader + Send + Sync;
+pub type MetadataLoaderDyn = dyn MetadataLoader + Send + Sync + sync::DynSend + sync::DynSync;
 
 /// A store of Rust crates, through which their metadata can be accessed.
 ///
@@ -252,11 +255,11 @@ pub trait CrateStore: std::fmt::Debug {
     fn import_source_files(&self, sess: &Session, cnum: CrateNum);
 }
 
-pub type CrateStoreDyn = dyn CrateStore + sync::Sync + sync::Send;
+pub type CrateStoreDyn = dyn CrateStore + sync::DynSync + sync::DynSend;
 
 pub struct Untracked {
-    pub cstore: RwLock<Box<CrateStoreDyn>>,
+    pub cstore: FreezeLock<Box<CrateStoreDyn>>,
     /// Reference span for definitions.
     pub source_span: AppendOnlyIndexVec<LocalDefId, Span>,
-    pub definitions: RwLock<Definitions>,
+    pub definitions: FreezeLock<Definitions>,
 }

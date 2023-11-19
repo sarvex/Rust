@@ -6,10 +6,12 @@
 #![feature(option_get_or_insert_default)]
 #![feature(rustc_attrs)]
 #![feature(map_many_mut)]
+#![feature(iter_intersperse)]
 #![recursion_limit = "256"]
 #![allow(rustc::potential_query_instability)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
+#![allow(internal_features)]
 
 #[macro_use]
 extern crate rustc_macros;
@@ -21,13 +23,12 @@ extern crate tracing;
 use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
 use rustc_fluent_macro::fluent_messages;
 
-pub mod cgu_reuse_tracker;
 pub mod utils;
 pub use lint::{declare_lint, declare_lint_pass, declare_tool_lint, impl_lint_pass};
 pub use rustc_lint_defs as lint;
 pub mod parse;
 
-mod code_stats;
+pub mod code_stats;
 #[macro_use]
 pub mod config;
 pub mod cstore;
@@ -41,6 +42,9 @@ pub use session::*;
 pub mod output;
 
 pub use getopts;
+
+mod version;
+pub use version::RustcVersion;
 
 fluent_messages! { "../messages.ftl" }
 

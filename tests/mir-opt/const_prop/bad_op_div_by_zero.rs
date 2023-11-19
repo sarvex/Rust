@@ -1,4 +1,5 @@
-// ignore-wasm32 compiled with panic=abort by default
+// skip-filecheck
+// EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 // unit-test: ConstProp
 // EMIT_MIR bad_op_div_by_zero.main.ConstProp.diff
 #[allow(unconditional_panic)]

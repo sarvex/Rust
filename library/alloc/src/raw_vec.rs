@@ -305,10 +305,13 @@ impl<T, A: Allocator> RawVec<T, A> {
     /// The same as `reserve`, but returns on errors instead of panicking or aborting.
     pub fn try_reserve(&mut self, len: usize, additional: usize) -> Result<(), TryReserveError> {
         if self.needs_to_grow(len, additional) {
-            self.grow_amortized(len, additional)
-        } else {
-            Ok(())
+            self.grow_amortized(len, additional)?;
         }
+        unsafe {
+            // Inform the optimizer that the reservation has succeeded or wasn't needed
+            core::intrinsics::assume(!self.needs_to_grow(len, additional));
+        }
+        Ok(())
     }
 
     /// Ensures that the buffer contains at least enough space to hold `len +
@@ -339,7 +342,14 @@ impl<T, A: Allocator> RawVec<T, A> {
         len: usize,
         additional: usize,
     ) -> Result<(), TryReserveError> {
-        if self.needs_to_grow(len, additional) { self.grow_exact(len, additional) } else { Ok(()) }
+        if self.needs_to_grow(len, additional) {
+            self.grow_exact(len, additional)?;
+        }
+        unsafe {
+            // Inform the optimizer that the reservation has succeeded or wasn't needed
+            core::intrinsics::assume(!self.needs_to_grow(len, additional));
+        }
+        Ok(())
     }
 
     /// Shrinks the buffer down to the specified capacity. If the given amount
@@ -432,16 +442,26 @@ impl<T, A: Allocator> RawVec<T, A> {
         let (ptr, layout) = if let Some(mem) = self.current_memory() { mem } else { return Ok(()) };
         // See current_memory() why this assert is here
         let _: () = const { assert!(mem::size_of::<T>() % mem::align_of::<T>() == 0) };
-        let ptr = unsafe {
-            // `Layout::array` cannot overflow here because it would have
-            // overflowed earlier when capacity was larger.
-            let new_size = mem::size_of::<T>().unchecked_mul(cap);
-            let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-            self.alloc
-                .shrink(ptr, layout, new_layout)
-                .map_err(|_| AllocError { layout: new_layout, non_exhaustive: () })?
-        };
-        self.set_ptr_and_cap(ptr, cap);
+
+        // If shrinking to 0, deallocate the buffer. We don't reach this point
+        // for the T::IS_ZST case since current_memory() will have returned
+        // None.
+        if cap == 0 {
+            unsafe { self.alloc.deallocate(ptr, layout) };
+            self.ptr = Unique::dangling();
+            self.cap = 0;
+        } else {
+            let ptr = unsafe {
+                // `Layout::array` cannot overflow here because it would have
+                // overflowed earlier when capacity was larger.
+                let new_size = mem::size_of::<T>().unchecked_mul(cap);
+                let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+                self.alloc
+                    .shrink(ptr, layout, new_layout)
+                    .map_err(|_| AllocError { layout: new_layout, non_exhaustive: () })?
+            };
+            self.set_ptr_and_cap(ptr, cap);
+        }
         Ok(())
     }
 }
@@ -520,6 +540,7 @@ fn alloc_guard(alloc_size: usize) -> Result<(), TryReserveError> {
 // ensure that the code generation related to these panics is minimal as there's
 // only one location which panics rather than a bunch throughout the module.
 #[cfg(not(no_global_oom_handling))]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
 fn capacity_overflow() -> ! {
     panic!("capacity overflow");
 }

@@ -29,7 +29,7 @@ pub(crate) enum ItemType {
     Struct = 3,
     Enum = 4,
     Function = 5,
-    Typedef = 6,
+    TypeAlias = 6,
     Static = 7,
     Trait = 8,
     Impl = 9,
@@ -75,7 +75,7 @@ impl<'a> From<&'a clean::Item> for ItemType {
             clean::UnionItem(..) => ItemType::Union,
             clean::EnumItem(..) => ItemType::Enum,
             clean::FunctionItem(..) => ItemType::Function,
-            clean::TypedefItem(..) => ItemType::Typedef,
+            clean::TypeAliasItem(..) => ItemType::TypeAlias,
             clean::OpaqueTyItem(..) => ItemType::OpaqueTy,
             clean::StaticItem(..) => ItemType::Static,
             clean::ConstantItem(..) => ItemType::Constant,
@@ -115,7 +115,7 @@ impl From<DefKind> for ItemType {
             DefKind::Struct => Self::Struct,
             DefKind::Union => Self::Union,
             DefKind::Trait => Self::Trait,
-            DefKind::TyAlias => Self::Typedef,
+            DefKind::TyAlias => Self::TypeAlias,
             DefKind::TraitAlias => Self::TraitAlias,
             DefKind::Macro(kind) => match kind {
                 MacroKind::Bang => ItemType::Macro,
@@ -136,13 +136,12 @@ impl From<DefKind> for ItemType {
             | DefKind::AnonConst
             | DefKind::InlineConst
             | DefKind::OpaqueTy
-            | DefKind::ImplTraitPlaceholder
             | DefKind::Field
             | DefKind::LifetimeParam
             | DefKind::GlobalAsm
             | DefKind::Impl { .. }
             | DefKind::Closure
-            | DefKind::Generator => Self::ForeignType,
+            | DefKind::Coroutine => Self::ForeignType,
         }
     }
 }
@@ -157,7 +156,7 @@ impl ItemType {
             ItemType::Union => "union",
             ItemType::Enum => "enum",
             ItemType::Function => "fn",
-            ItemType::Typedef => "type",
+            ItemType::TypeAlias => "type",
             ItemType::Static => "static",
             ItemType::Trait => "trait",
             ItemType::Impl => "impl",
@@ -180,6 +179,9 @@ impl ItemType {
     }
     pub(crate) fn is_method(&self) -> bool {
         matches!(*self, ItemType::Method | ItemType::TyMethod)
+    }
+    pub(crate) fn is_adt(&self) -> bool {
+        matches!(*self, ItemType::Struct | ItemType::Union | ItemType::Enum)
     }
 }
 

@@ -50,8 +50,8 @@ impl OutlivesSuggestionBuilder {
     // naming the `'self` lifetime in methods, etc.
     fn region_name_is_suggestable(name: &RegionName) -> bool {
         match name.source {
-            RegionNameSource::NamedEarlyBoundRegion(..)
-            | RegionNameSource::NamedFreeRegion(..)
+            RegionNameSource::NamedEarlyParamRegion(..)
+            | RegionNameSource::NamedLateParamRegion(..)
             | RegionNameSource::Static => true,
 
             // Don't give suggestions for upvars, closure return types, or other unnameable
@@ -125,8 +125,7 @@ impl OutlivesSuggestionBuilder {
                     |(r, _)| {
                         self.constraints_to_add
                             .get(r)
-                            .map(|r_outlived| r_outlived.as_slice().contains(fr))
-                            .unwrap_or(false)
+                            .is_some_and(|r_outlived| r_outlived.as_slice().contains(fr))
                     },
                 );
 

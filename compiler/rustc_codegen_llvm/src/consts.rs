@@ -1,7 +1,9 @@
 use crate::base;
 use crate::common::{self, CodegenCx};
 use crate::debuginfo;
-use crate::errors::{InvalidMinimumAlignment, SymbolAlreadyDefined};
+use crate::errors::{
+    InvalidMinimumAlignmentNotPowerOfTwo, InvalidMinimumAlignmentTooLarge, SymbolAlreadyDefined,
+};
 use crate::llvm::{self, True};
 use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
@@ -19,7 +21,9 @@ use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, Instance, Ty};
 use rustc_middle::{bug, span_bug};
 use rustc_session::config::Lto;
-use rustc_target::abi::{Align, HasDataLayout, Primitive, Scalar, Size, WrappingRange};
+use rustc_target::abi::{
+    Align, AlignFromBytesError, HasDataLayout, Primitive, Scalar, Size, WrappingRange,
+};
 use std::ops::Range;
 
 pub fn const_alloc_to_llvm<'ll>(cx: &CodegenCx<'ll, '_>, alloc: ConstAllocation<'_>) -> &'ll Value {
@@ -99,7 +103,7 @@ pub fn const_alloc_to_llvm<'ll>(cx: &CodegenCx<'ll, '_>, alloc: ConstAllocation<
                 value: Primitive::Pointer(address_space),
                 valid_range: WrappingRange::full(dl.pointer_size),
             },
-            cx.type_i8p_ext(address_space),
+            cx.type_ptr_ext(address_space),
         ));
         next_offset = offset + pointer_size;
     }
@@ -129,9 +133,14 @@ fn set_global_alignment<'ll>(cx: &CodegenCx<'ll, '_>, gv: &'ll Value, mut align:
     if let Some(min) = cx.sess().target.min_global_align {
         match Align::from_bits(min) {
             Ok(min) => align = align.max(min),
-            Err(err) => {
-                cx.sess().emit_err(InvalidMinimumAlignment { err });
-            }
+            Err(err) => match err {
+                AlignFromBytesError::NotPowerOfTwo(align) => {
+                    cx.sess().emit_err(InvalidMinimumAlignmentNotPowerOfTwo { align });
+                }
+                AlignFromBytesError::TooLarge(align) => {
+                    cx.sess().emit_err(InvalidMinimumAlignmentTooLarge { align });
+                }
+            },
         }
     }
     unsafe {
@@ -170,22 +179,25 @@ fn check_and_apply_linkage<'ll, 'tcx>(
                 })
             });
             llvm::LLVMRustSetLinkage(g2, llvm::Linkage::InternalLinkage);
-            llvm::LLVMSetInitializer(g2, cx.const_ptrcast(g1, llty));
+            llvm::LLVMSetInitializer(g2, g1);
             g2
         }
-    } else if cx.tcx.sess.target.arch == "x86" &&
-        let Some(dllimport) = common::get_dllimport(cx.tcx, def_id, sym)
+    } else if cx.tcx.sess.target.arch == "x86"
+        && let Some(dllimport) = common::get_dllimport(cx.tcx, def_id, sym)
     {
-        cx.declare_global(&common::i686_decorated_name(&dllimport, common::is_mingw_gnu_toolchain(&cx.tcx.sess.target), true), llty)
+        cx.declare_global(
+            &common::i686_decorated_name(
+                &dllimport,
+                common::is_mingw_gnu_toolchain(&cx.tcx.sess.target),
+                true,
+            ),
+            llty,
+        )
     } else {
         // Generate an external declaration.
         // FIXME(nagisa): investigate whether it can be changed into define_global
         cx.declare_global(sym, llty)
     }
-}
-
-pub fn ptrcast<'ll>(val: &'ll Value, ty: &'ll Type) -> &'ll Value {
-    unsafe { llvm::LLVMConstPointerCast(val, ty) }
 }
 
 impl<'ll> CodegenCx<'ll, '_> {
@@ -229,8 +241,7 @@ impl<'ll> CodegenCx<'ll, '_> {
         assert!(
             !defined_in_current_codegen_unit,
             "consts::get_static() should always hit the cache for \
-                 statics defined in the same CGU, but did not for `{:?}`",
-            def_id
+                 statics defined in the same CGU, but did not for `{def_id:?}`"
         );
 
         let ty = instance.ty(self.tcx, ty::ParamEnv::reveal_all());
@@ -242,7 +253,7 @@ impl<'ll> CodegenCx<'ll, '_> {
         let g = if def_id.is_local() && !self.tcx.is_foreign_item(def_id) {
             let llty = self.layout_of(ty).llvm_type(self);
             if let Some(g) = self.get_declared_value(sym) {
-                if self.val_ty(g) != self.type_ptr_to(llty) {
+                if self.val_ty(g) != self.type_ptr() {
                     span_bug!(self.tcx.def_span(def_id), "Conflicting types for static");
                 }
             }
@@ -363,15 +374,7 @@ impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
 
             let g = self.get_static(def_id);
 
-            // boolean SSA values are i1, but they have to be stored in i8 slots,
-            // otherwise some LLVM optimization passes don't work as expected
-            let mut val_llty = self.val_ty(v);
-            let v = if val_llty == self.type_i1() {
-                val_llty = self.type_i8();
-                llvm::LLVMConstZExt(v, val_llty)
-            } else {
-                v
-            };
+            let val_llty = self.val_ty(v);
 
             let instance = Instance::mono(self.tcx, def_id);
             let ty = instance.ty(self.tcx, ty::ParamEnv::reveal_all());
@@ -543,16 +546,14 @@ impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
         }
     }
 
-    /// Add a global value to a list to be stored in the `llvm.used` variable, an array of i8*.
+    /// Add a global value to a list to be stored in the `llvm.used` variable, an array of ptr.
     fn add_used_global(&self, global: &'ll Value) {
-        let cast = unsafe { llvm::LLVMConstPointerCast(global, self.type_i8p()) };
-        self.used_statics.borrow_mut().push(cast);
+        self.used_statics.borrow_mut().push(global);
     }
 
     /// Add a global value to a list to be stored in the `llvm.compiler.used` variable,
-    /// an array of i8*.
+    /// an array of ptr.
     fn add_compiler_used_global(&self, global: &'ll Value) {
-        let cast = unsafe { llvm::LLVMConstPointerCast(global, self.type_i8p()) };
-        self.compiler_used_statics.borrow_mut().push(cast);
+        self.compiler_used_statics.borrow_mut().push(global);
     }
 }

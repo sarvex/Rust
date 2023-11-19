@@ -14,8 +14,7 @@ use rustc_span::{symbol::Ident, BytePos, Span};
 
 use crate::fluent_generated as fluent;
 use crate::infer::error_reporting::{
-    need_type_info::{GeneratorKindAsDiagArg, UnderspecifiedArgKind},
-    nice_region_error::placeholder_error::Highlighted,
+    need_type_info::UnderspecifiedArgKind, nice_region_error::placeholder_error::Highlighted,
     ObligationCauseAsDiagArg,
 };
 
@@ -84,16 +83,6 @@ pub struct AmbiguousReturn<'a> {
     pub infer_subdiags: Vec<SourceKindSubdiag<'a>>,
     #[subdiagnostic]
     pub multi_suggestions: Vec<SourceKindMultiSuggestion<'a>>,
-}
-
-#[derive(Diagnostic)]
-#[diag(infer_need_type_info_in_generator, code = "E0698")]
-pub struct NeedTypeInfoInGenerator<'a> {
-    #[primary_span]
-    pub span: Span,
-    pub generator_kind: GeneratorKindAsDiagArg,
-    #[subdiagnostic]
-    pub bad_label: InferenceBadError<'a>,
 }
 
 // Used when a better one isn't available
@@ -205,15 +194,13 @@ impl<'a> SourceKindMultiSuggestion<'a> {
         data: &'a FnRetTy<'a>,
         should_wrap_expr: Option<Span>,
     ) -> Self {
-        let (arrow, post) = match data {
-            FnRetTy::DefaultReturn(_) => ("-> ", " "),
-            _ => ("", ""),
+        let arrow = match data {
+            FnRetTy::DefaultReturn(_) => " -> ",
+            _ => "",
         };
         let (start_span, start_span_code, end_span) = match should_wrap_expr {
-            Some(end_span) => {
-                (data.span(), format!("{}{}{}{{ ", arrow, ty_info, post), Some(end_span))
-            }
-            None => (data.span(), format!("{}{}{}", arrow, ty_info, post), None),
+            Some(end_span) => (data.span(), format!("{arrow}{ty_info} {{"), Some(end_span)),
+            None => (data.span(), format!("{arrow}{ty_info}"), None),
         };
         Self::ClosureReturn { start_span, start_span_code, end_span }
     }
@@ -363,7 +350,8 @@ impl AddToDiagnostic for AddLifetimeParamsSuggestion<'_> {
             let (
                 hir::Ty { kind: hir::TyKind::Ref(lifetime_sub, _), .. },
                 hir::Ty { kind: hir::TyKind::Ref(lifetime_sup, _), .. },
-            ) = (self.ty_sub, self.ty_sup) else {
+            ) = (self.ty_sub, self.ty_sup)
+            else {
                 return false;
             };
 
@@ -403,9 +391,9 @@ impl AddToDiagnostic for AddLifetimeParamsSuggestion<'_> {
             debug!(?lifetime_sub.ident.span);
             let make_suggestion = |ident: Ident| {
                 let sugg = if ident.name == kw::Empty {
-                    format!("{}, ", suggestion_param_name)
+                    format!("{suggestion_param_name}, ")
                 } else if ident.name == kw::UnderscoreLifetime && ident.span.is_empty() {
-                    format!("{} ", suggestion_param_name)
+                    format!("{suggestion_param_name} ")
                 } else {
                     suggestion_param_name.clone()
                 };
@@ -418,9 +406,9 @@ impl AddToDiagnostic for AddLifetimeParamsSuggestion<'_> {
                 let new_param_suggestion = if let Some(first) =
                     generics.params.iter().find(|p| !p.name.ident().span.is_empty())
                 {
-                    (first.span.shrink_to_lo(), format!("{}, ", suggestion_param_name))
+                    (first.span.shrink_to_lo(), format!("{suggestion_param_name}, "))
                 } else {
-                    (generics.span, format!("<{}>", suggestion_param_name))
+                    (generics.span, format!("<{suggestion_param_name}>"))
                 };
 
                 suggestions.push(new_param_suggestion);
@@ -1247,30 +1235,6 @@ pub struct FnConsiderCasting {
 }
 
 #[derive(Subdiagnostic)]
-pub enum SuggestAsRefWhereAppropriate<'a> {
-    #[suggestion(
-        infer_sarwa_option,
-        code = "{snippet}.as_ref()",
-        applicability = "machine-applicable"
-    )]
-    Option {
-        #[primary_span]
-        span: Span,
-        snippet: &'a str,
-    },
-    #[suggestion(
-        infer_sarwa_result,
-        code = "{snippet}.as_ref()",
-        applicability = "machine-applicable"
-    )]
-    Result {
-        #[primary_span]
-        span: Span,
-        snippet: &'a str,
-    },
-}
-
-#[derive(Subdiagnostic)]
 pub enum SuggestAccessingField<'a> {
     #[suggestion(
         infer_suggest_accessing_field,
@@ -1343,7 +1307,7 @@ impl AddToDiagnostic for SuggestTuplePatternMany {
             message,
             self.compatible_variants.into_iter().map(|variant| {
                 vec![
-                    (self.cause_span.shrink_to_lo(), format!("{}(", variant)),
+                    (self.cause_span.shrink_to_lo(), format!("{variant}(")),
                     (self.cause_span.shrink_to_hi(), ")".to_string()),
                 ]
             }),
@@ -1487,6 +1451,14 @@ pub enum ObligationCauseFailureCode {
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_fn_lang_correct_type, code = "E0308")]
+    FnLangCorrectType {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+        lang_item_name: Symbol,
     },
     #[diag(infer_oc_intrinsic_correct_type, code = "E0308")]
     IntrinsicCorrectType {

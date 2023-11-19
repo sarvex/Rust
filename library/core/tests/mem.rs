@@ -366,7 +366,6 @@ fn const_maybe_uninit() {
 }
 
 #[test]
-#[cfg(not(bootstrap))]
 fn offset_of() {
     #[repr(C)]
     struct Foo {
@@ -386,10 +385,29 @@ fn offset_of() {
     // Layout of tuples is unstable
     assert!(offset_of!((u8, u16), 0) <= size_of::<(u8, u16)>() - 1);
     assert!(offset_of!((u8, u16), 1) <= size_of::<(u8, u16)>() - 2);
+
+    #[repr(C)]
+    struct Generic<T> {
+        x: u8,
+        y: u32,
+        z: T,
+    }
+
+    trait Trait {}
+
+    // Ensure that this type of generics works
+    fn offs_of_z<T>() -> usize {
+        offset_of!(Generic<T>, z)
+    }
+
+    assert_eq!(offset_of!(Generic<u8>, z), 8);
+    assert_eq!(offs_of_z::<u8>(), 8);
+
+    // Ensure that it works with the implicit lifetime in `Box<dyn Trait + '_>`.
+    assert_eq!(offset_of!(Generic<Box<dyn Trait>>, z), 8);
 }
 
 #[test]
-#[cfg(not(bootstrap))]
 fn offset_of_union() {
     #[repr(C)]
     union Foo {
@@ -409,7 +427,6 @@ fn offset_of_union() {
 }
 
 #[test]
-#[cfg(not(bootstrap))]
 fn offset_of_dst() {
     #[repr(C)]
     struct Alpha {
@@ -449,7 +466,6 @@ fn offset_of_dst() {
 }
 
 #[test]
-#[cfg(not(bootstrap))]
 fn offset_of_packed() {
     #[repr(C, packed)]
     struct Foo {
@@ -462,7 +478,6 @@ fn offset_of_packed() {
 }
 
 #[test]
-#[cfg(not(bootstrap))]
 fn offset_of_projection() {
     #[repr(C)]
     struct Foo {
@@ -483,7 +498,6 @@ fn offset_of_projection() {
 }
 
 #[test]
-#[cfg(not(bootstrap))]
 fn offset_of_alias() {
     #[repr(C)]
     struct Foo {
@@ -498,7 +512,6 @@ fn offset_of_alias() {
 }
 
 #[test]
-#[cfg(not(bootstrap))]
 fn const_offset_of() {
     #[repr(C)]
     struct Foo {
@@ -514,7 +527,6 @@ fn const_offset_of() {
 }
 
 #[test]
-#[cfg(not(bootstrap))]
 fn offset_of_without_const_promotion() {
     #[repr(C)]
     struct Foo<SuppressConstPromotion> {
@@ -535,7 +547,6 @@ fn offset_of_without_const_promotion() {
 }
 
 #[test]
-#[cfg(not(bootstrap))]
 fn offset_of_addr() {
     #[repr(C)]
     struct Foo {
@@ -553,4 +564,25 @@ fn offset_of_addr() {
     assert_eq!(ptr::addr_of!(base).addr() + offset_of!(Foo, y), ptr::addr_of!(base.y).addr());
     assert_eq!(ptr::addr_of!(base).addr() + offset_of!(Foo, z.0), ptr::addr_of!(base.z.0).addr());
     assert_eq!(ptr::addr_of!(base).addr() + offset_of!(Foo, z.1), ptr::addr_of!(base.z.1).addr());
+}
+
+#[test]
+fn const_maybe_uninit_zeroed() {
+    // Sanity check for `MaybeUninit::zeroed` in a realistic const situation (plugin array term)
+    #[repr(C)]
+    struct Foo {
+        a: Option<&'static str>,
+        b: Bar,
+        c: f32,
+        d: *const u8,
+    }
+    #[repr(C)]
+    struct Bar(usize);
+    struct FooPtr(*const Foo);
+    unsafe impl Sync for FooPtr {}
+
+    static UNINIT: FooPtr = FooPtr([unsafe { MaybeUninit::zeroed().assume_init() }].as_ptr());
+    const SIZE: usize = size_of::<Foo>();
+
+    assert_eq!(unsafe { (*UNINIT.0.cast::<[[u8; SIZE]; 1]>())[0] }, [0u8; SIZE]);
 }

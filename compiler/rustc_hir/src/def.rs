@@ -109,8 +109,6 @@ pub enum DefKind {
     InlineConst,
     /// Opaque type, aka `impl Trait`.
     OpaqueTy,
-    /// A return-position `impl Trait` in a trait definition
-    ImplTraitPlaceholder,
     Field,
     /// Lifetime parameter: the `'a` in `struct Foo<'a> { ... }`
     LifetimeParam,
@@ -120,7 +118,7 @@ pub enum DefKind {
         of_trait: bool,
     },
     Closure,
-    Generator,
+    Coroutine,
 }
 
 impl DefKind {
@@ -128,7 +126,7 @@ impl DefKind {
     ///
     /// If you have access to `TyCtxt`, use `TyCtxt::def_descr` or
     /// `TyCtxt::def_kind_descr` instead, because they give better
-    /// information for generators and associated functions.
+    /// information for coroutines and associated functions.
     pub fn descr(self, def_id: DefId) -> &'static str {
         match self {
             DefKind::Fn => "function",
@@ -143,7 +141,6 @@ impl DefKind {
             DefKind::Ctor(CtorOf::Struct, CtorKind::Fn) => "tuple struct",
             DefKind::Ctor(CtorOf::Struct, CtorKind::Const) => "unit struct",
             DefKind::OpaqueTy => "opaque type",
-            DefKind::ImplTraitPlaceholder => "opaque type in trait",
             DefKind::TyAlias => "type alias",
             DefKind::TraitAlias => "trait alias",
             DefKind::AssocTy => "associated type",
@@ -164,7 +161,7 @@ impl DefKind {
             DefKind::Field => "field",
             DefKind::Impl { .. } => "implementation",
             DefKind::Closure => "closure",
-            DefKind::Generator => "generator",
+            DefKind::Coroutine => "coroutine",
             DefKind::ExternCrate => "extern crate",
             DefKind::GlobalAsm => "global assembly block",
         }
@@ -174,7 +171,7 @@ impl DefKind {
     ///
     /// If you have access to `TyCtxt`, use `TyCtxt::def_descr_article` or
     /// `TyCtxt::def_kind_descr_article` instead, because they give better
-    /// information for generators and associated functions.
+    /// information for coroutines and associated functions.
     pub fn article(&self) -> &'static str {
         match *self {
             DefKind::AssocTy
@@ -223,18 +220,17 @@ impl DefKind {
             | DefKind::LifetimeParam
             | DefKind::ExternCrate
             | DefKind::Closure
-            | DefKind::Generator
+            | DefKind::Coroutine
             | DefKind::Use
             | DefKind::ForeignMod
             | DefKind::GlobalAsm
-            | DefKind::Impl { .. }
-            | DefKind::ImplTraitPlaceholder => None,
+            | DefKind::Impl { .. } => None,
         }
     }
 
     #[inline]
     pub fn is_fn_like(self) -> bool {
-        matches!(self, DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Generator)
+        matches!(self, DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Coroutine)
     }
 
     /// Whether `query get_codegen_attrs` should be used with this definition.
@@ -244,7 +240,7 @@ impl DefKind {
             | DefKind::AssocFn
             | DefKind::Ctor(..)
             | DefKind::Closure
-            | DefKind::Generator
+            | DefKind::Coroutine
             | DefKind::Static(_) => true,
             DefKind::Mod
             | DefKind::Struct
@@ -262,7 +258,6 @@ impl DefKind {
             | DefKind::Use
             | DefKind::ForeignMod
             | DefKind::OpaqueTy
-            | DefKind::ImplTraitPlaceholder
             | DefKind::Impl { .. }
             | DefKind::Field
             | DefKind::TyParam

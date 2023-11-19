@@ -44,9 +44,10 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                     let is_target_supported = |reg_class: InlineAsmRegClass| {
                         for &(_, feature) in reg_class.supported_types(asm_arch) {
                             if let Some(feature) = feature {
-                                let codegen_fn_attrs = self.tcx.codegen_fn_attrs(instance.def_id());
-                                if self.tcx.sess.target_features.contains(&feature)
-                                    || codegen_fn_attrs.target_features.contains(&feature)
+                                if self
+                                    .tcx
+                                    .asm_target_features(instance.def_id())
+                                    .contains(&feature)
                                 {
                                     return true;
                                 }
@@ -236,9 +237,22 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 InlineAsmArch::Nvptx64 => {}
                 InlineAsmArch::PowerPC | InlineAsmArch::PowerPC64 => {}
                 InlineAsmArch::Hexagon => {}
-                InlineAsmArch::LoongArch64 => {}
+                InlineAsmArch::LoongArch64 => {
+                    constraints.extend_from_slice(&[
+                        "~{$fcc0}".to_string(),
+                        "~{$fcc1}".to_string(),
+                        "~{$fcc2}".to_string(),
+                        "~{$fcc3}".to_string(),
+                        "~{$fcc4}".to_string(),
+                        "~{$fcc5}".to_string(),
+                        "~{$fcc6}".to_string(),
+                        "~{$fcc7}".to_string(),
+                    ]);
+                }
                 InlineAsmArch::Mips | InlineAsmArch::Mips64 => {}
-                InlineAsmArch::S390x => {}
+                InlineAsmArch::S390x => {
+                    constraints.push("~{cc}".to_string());
+                }
                 InlineAsmArch::SpirV => {}
                 InlineAsmArch::Wasm32 | InlineAsmArch::Wasm64 => {}
                 InlineAsmArch::Bpf => {}
@@ -248,6 +262,7 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 InlineAsmArch::M68k => {
                     constraints.push("~{ccr}".to_string());
                 }
+                InlineAsmArch::CSKY => {}
             }
         }
         if !options.contains(InlineAsmOptions::NOMEM) {
@@ -680,6 +695,8 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) ->
             InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg_addr) => "a",
             InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg_data) => "d",
+            InlineAsmRegClass::CSKY(CSKYInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::CSKY(CSKYInlineAsmRegClass::freg) => "f",
             InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
                 bug!("LLVM backend does not support SPIR-V")
             }
@@ -779,6 +796,7 @@ fn modifier_to_llvm(
             bug!("LLVM backend does not support SPIR-V")
         }
         InlineAsmRegClass::M68k(_) => None,
+        InlineAsmRegClass::CSKY(_) => None,
         InlineAsmRegClass::Err => unreachable!(),
     }
 }
@@ -855,6 +873,8 @@ fn dummy_output_type<'ll>(cx: &CodegenCx<'ll, '_>, reg: InlineAsmRegClass) -> &'
         InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg_addr) => cx.type_i32(),
         InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg_data) => cx.type_i32(),
+        InlineAsmRegClass::CSKY(CSKYInlineAsmRegClass::reg) => cx.type_i32(),
+        InlineAsmRegClass::CSKY(CSKYInlineAsmRegClass::freg) => cx.type_f32(),
         InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
             bug!("LLVM backend does not support SPIR-V")
         }

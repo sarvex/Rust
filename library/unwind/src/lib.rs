@@ -4,7 +4,9 @@
 #![feature(staged_api)]
 #![feature(c_unwind)]
 #![feature(cfg_target_abi)]
+#![feature(strict_provenance)]
 #![cfg_attr(not(target_env = "msvc"), feature(libc))]
+#![allow(internal_features)]
 
 cfg_if::cfg_if! {
     if #[cfg(target_env = "msvc")] {
@@ -74,13 +76,9 @@ cfg_if::cfg_if! {
 cfg_if::cfg_if! {
     if #[cfg(feature = "llvm-libunwind")] {
         compile_error!("`llvm-libunwind` is not supported for Android targets");
-    } else if #[cfg(feature = "system-llvm-libunwind")] {
+    } else {
         #[link(name = "unwind", kind = "static", modifiers = "-bundle", cfg(target_feature = "crt-static"))]
         #[link(name = "unwind", cfg(not(target_feature = "crt-static")))]
-        extern "C" {}
-    } else {
-        #[link(name = "gcc", kind = "static", modifiers = "-bundle", cfg(target_feature = "crt-static"))]
-        #[link(name = "gcc", cfg(not(target_feature = "crt-static")))]
         extern "C" {}
     }
 }
@@ -144,6 +142,14 @@ extern "C" {}
 #[link(name = "gcc_s")]
 extern "C" {}
 
+#[cfg(target_os = "aix")]
+#[link(name = "unwind")]
+extern "C" {}
+
 #[cfg(target_os = "nto")]
+#[link(name = "gcc_s")]
+extern "C" {}
+
+#[cfg(target_os = "hurd")]
 #[link(name = "gcc_s")]
 extern "C" {}

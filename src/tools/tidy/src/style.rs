@@ -296,9 +296,11 @@ pub fn check(path: &Path, bad: &mut bool) {
         if filename.contains("ignore-tidy") {
             return;
         }
-        // apfloat shouldn't be changed because of license problems
-        if is_in(file, "compiler", "rustc_apfloat") {
-            return;
+        // Shell completions are automatically generated
+        if let Some(p) = file.parent() {
+            if p.ends_with(Path::new("src/etc/completions")) {
+                return;
+            }
         }
         let mut skip_cr = contains_ignore_directive(can_contain, &contents, "cr");
         let mut skip_undocumented_unsafe =
@@ -425,9 +427,12 @@ pub fn check(path: &Path, bad: &mut bool) {
                     "copyright notices attributed to the Rust Project Developers are deprecated"
                 );
             }
-            if is_unexplained_ignore(&extension, line) {
-                err(UNEXPLAINED_IGNORE_DOCTEST_INFO);
+            if !file.components().any(|c| c.as_os_str() == "rustc_baked_icu_data") {
+                if is_unexplained_ignore(&extension, line) {
+                    err(UNEXPLAINED_IGNORE_DOCTEST_INFO);
+                }
             }
+
             if filename.ends_with(".cpp") && line.contains("llvm_unreachable") {
                 err(LLVM_UNREACHABLE_INFO);
             }

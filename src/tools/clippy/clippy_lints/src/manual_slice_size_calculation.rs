@@ -22,12 +22,12 @@ declare_clippy_lint! {
     /// * Less turbofishing
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let data : &[i32] = &[1, 2, 3];
     /// let newlen = data.len() * std::mem::size_of::<i32>();
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # let data : &[i32] = &[1, 2, 3];
     /// let newlen = std::mem::size_of_val(data);
     /// ```
@@ -92,7 +92,7 @@ fn simplify_half<'tcx>(
         && let ExprKind::Path(ref func_qpath) = func.kind
         && let Some(def_id) = cx.qpath_res(func_qpath, func.hir_id).opt_def_id()
         && cx.tcx.is_diagnostic_item(sym::mem_size_of, def_id)
-        && let Some(ty2) = cx.typeck_results().node_substs(func.hir_id).types().next()
+        && let Some(ty2) = cx.typeck_results().node_args(func.hir_id).types().next()
         // T1 == T2?
         && *ty1 == ty2
     {

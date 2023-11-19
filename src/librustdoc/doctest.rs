@@ -1,7 +1,7 @@
 use rustc_ast as ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::{ColorConfig, ErrorGuaranteed, FatalError, TerminalUrl};
+use rustc_errors::{ColorConfig, ErrorGuaranteed, FatalError};
 use rustc_hir::def_id::{LocalDefId, CRATE_DEF_ID, LOCAL_CRATE};
 use rustc_hir::{self as hir, intravisit, CRATE_HIR_ID};
 use rustc_interface::interface;
@@ -10,6 +10,7 @@ use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::TyCtxt;
 use rustc_parse::maybe_new_parser_from_source_str;
 use rustc_parse::parser::attr::InnerAttrPolicy;
+use rustc_resolve::rustdoc::span_of_fragments;
 use rustc_session::config::{self, CrateType, ErrorOutputType};
 use rustc_session::parse::ParseSess;
 use rustc_session::{lint, Session};
@@ -33,7 +34,6 @@ use crate::clean::{types::AttributesExt, Attributes};
 use crate::config::Options as RustdocOptions;
 use crate::html::markdown::{self, ErrorCodes, Ignore, LangString};
 use crate::lint::init_lints;
-use crate::passes::span_of_attrs;
 
 /// Options that apply to all doctests in a crate or Markdown file (for `rustdoc foo.md`).
 #[derive(Clone, Default)]
@@ -90,8 +90,8 @@ pub(crate) fn run(options: RustdocOptions) -> Result<(), ErrorGuaranteed> {
     cfgs.push("doctest".to_owned());
     let config = interface::Config {
         opts: sessopts,
-        crate_cfg: interface::parse_cfgspecs(cfgs),
-        crate_check_cfg: interface::parse_check_cfg(options.check_cfgs.clone()),
+        crate_cfg: cfgs,
+        crate_check_cfg: options.check_cfgs.clone(),
         input,
         output_file: None,
         output_dir: None,
@@ -99,10 +99,14 @@ pub(crate) fn run(options: RustdocOptions) -> Result<(), ErrorGuaranteed> {
         locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES,
         lint_caps,
         parse_sess_created: None,
+        hash_untracked_state: None,
         register_lints: Some(Box::new(crate::lint::register_lints)),
         override_queries: None,
         make_codegen_backend: None,
         registry: rustc_driver::diagnostics_registry(),
+        ice_file: None,
+        using_internal_features: Arc::default(),
+        expanded_args: options.expanded_args.clone(),
     };
 
     let test_args = options.test_args.clone();
@@ -186,7 +190,7 @@ pub(crate) fn run(options: RustdocOptions) -> Result<(), ErrorGuaranteed> {
                     // The allow lint level is not expected,
                     // as if allow is specified, no message
                     // is to be emitted.
-                    v => unreachable!("Invalid lint level '{}'", v),
+                    v => unreachable!("Invalid lint level '{v}'"),
                 })
                 .unwrap_or("warn")
                 .to_string();
@@ -398,7 +402,7 @@ fn run_test(
     compiler.stdin(Stdio::piped());
     compiler.stderr(Stdio::piped());
 
-    debug!("compiler invocation for doctest: {:?}", compiler);
+    debug!("compiler invocation for doctest: {compiler:?}");
 
     let mut child = compiler.spawn().expect("Failed to spawn rustc process");
     {
@@ -463,7 +467,9 @@ fn run_test(
     // Run the code!
     let mut cmd;
 
+    let output_file = make_maybe_absolute_path(output_file);
     if let Some(tool) = runtool {
+        let tool = make_maybe_absolute_path(tool.into());
         cmd = Command::new(tool);
         cmd.args(runtool_args);
         cmd.arg(output_file);
@@ -495,6 +501,20 @@ fn run_test(
     }
 
     Ok(())
+}
+
+/// Converts a path intended to use as a command to absolute if it is
+/// relative, and not a single component.
+///
+/// This is needed to deal with relative paths interacting with
+/// `Command::current_dir` in a platform-specific way.
+fn make_maybe_absolute_path(path: PathBuf) -> PathBuf {
+    if path.components().count() == 1 {
+        // Look up process via PATH.
+        path
+    } else {
+        std::env::current_dir().map(|c| c.join(&path)).unwrap_or_else(|_| path)
+    }
 }
 
 /// Transforms a test into code that can be compiled into a Rust binary, and returns the number of
@@ -552,36 +572,14 @@ pub(crate) fn make_test(
                 rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
                 false,
             );
-            supports_color = EmitterWriter::stderr(
-                ColorConfig::Auto,
-                None,
-                None,
-                fallback_bundle.clone(),
-                false,
-                false,
-                Some(80),
-                false,
-                false,
-                TerminalUrl::No,
-            )
-            .supports_color();
+            supports_color = EmitterWriter::stderr(ColorConfig::Auto, fallback_bundle.clone())
+                .diagnostic_width(Some(80))
+                .supports_color();
 
-            let emitter = EmitterWriter::new(
-                Box::new(io::sink()),
-                None,
-                None,
-                fallback_bundle,
-                false,
-                false,
-                false,
-                None,
-                false,
-                false,
-                TerminalUrl::No,
-            );
+            let emitter = EmitterWriter::new(Box::new(io::sink()), fallback_bundle);
 
             // FIXME(misdreavus): pass `-Z treat-err-as-bug` to the doctest parser
-            let handler = Handler::with_emitter(false, None, Box::new(emitter));
+            let handler = Handler::with_emitter(Box::new(emitter)).disable_warnings();
             let sess = ParseSess::with_span_handler(handler, sm);
 
             let mut found_main = false;
@@ -599,15 +597,15 @@ pub(crate) fn make_test(
             loop {
                 match parser.parse_item(ForceCollect::No) {
                     Ok(Some(item)) => {
-                        if !found_main &&
-                            let ast::ItemKind::Fn(..) = item.kind &&
-                            item.ident.name == sym::main
+                        if !found_main
+                            && let ast::ItemKind::Fn(..) = item.kind
+                            && item.ident.name == sym::main
                         {
                             found_main = true;
                         }
 
-                        if !found_extern_crate &&
-                            let ast::ItemKind::ExternCrate(original) = item.kind
+                        if !found_extern_crate
+                            && let ast::ItemKind::ExternCrate(original) = item.kind
                         {
                             // This code will never be reached if `crate_name` is none because
                             // `found_extern_crate` is initialized to `true` if it is none.
@@ -648,8 +646,7 @@ pub(crate) fn make_test(
             (found_main, found_extern_crate, found_macro)
         })
     });
-    let Ok((already_has_main, already_has_extern_crate, found_macro)) = result
-    else {
+    let Ok((already_has_main, already_has_extern_crate, found_macro)) = result else {
         // If the parser panicked due to a fatal error, pass the test code through unchanged.
         // The error will be reported during compilation.
         return (s.to_owned(), 0, false);
@@ -681,7 +678,7 @@ pub(crate) fn make_test(
             if s.contains(crate_name) {
                 // rustdoc implicitly inserts an `extern crate` item for the own crate
                 // which may be unused, so we need to allow the lint.
-                prog.push_str(&format!("#[allow(unused_extern_crates)]\n"));
+                prog.push_str("#[allow(unused_extern_crates)]\n");
 
                 prog.push_str(&format!("extern crate r#{crate_name};\n"));
                 line_offset += 1;
@@ -755,21 +752,9 @@ fn check_if_attr_is_complete(source: &str, edition: Edition) -> bool {
                 false,
             );
 
-            let emitter = EmitterWriter::new(
-                Box::new(io::sink()),
-                None,
-                None,
-                fallback_bundle,
-                false,
-                false,
-                false,
-                None,
-                false,
-                false,
-                TerminalUrl::No,
-            );
+            let emitter = EmitterWriter::new(Box::new(io::sink()), fallback_bundle);
 
-            let handler = Handler::with_emitter(false, None, Box::new(emitter));
+            let handler = Handler::with_emitter(Box::new(emitter)).disable_warnings();
             let sess = ParseSess::with_span_handler(handler, sm);
             let mut parser =
                 match maybe_new_parser_from_source_str(&sess, filename, source.to_owned()) {
@@ -962,7 +947,7 @@ impl Collector {
         if !item_path.is_empty() {
             item_path.push(' ');
         }
-        format!("{} - {}(line {})", filename.prefer_local(), item_path, line)
+        format!("{} - {item_path}(line {line})", filename.prefer_local())
     }
 
     pub(crate) fn set_position(&mut self, position: Span) {
@@ -972,10 +957,10 @@ impl Collector {
     fn get_filename(&self) -> FileName {
         if let Some(ref source_map) = self.source_map {
             let filename = source_map.span_to_filename(self.position);
-            if let FileName::Real(ref filename) = filename &&
-                let Ok(cur_dir) = env::current_dir() &&
-                let Some(local_path) = filename.local_path() &&
-                let Ok(path) = local_path.strip_prefix(&cur_dir)
+            if let FileName::Real(ref filename) = filename
+                && let Ok(cur_dir) = env::current_dir()
+                && let Some(local_path) = filename.local_path()
+                && let Ok(path) = local_path.strip_prefix(&cur_dir)
             {
                 return path.to_owned().into();
             }
@@ -1039,7 +1024,7 @@ impl Tester for Collector {
             path.push(&test_id);
 
             if let Err(err) = std::fs::create_dir_all(&path) {
-                eprintln!("Couldn't create directory for doctest executables: {}", err);
+                eprintln!("Couldn't create directory for doctest executables: {err}");
                 panic::resume_unwind(Box::new(()));
             }
 
@@ -1108,7 +1093,7 @@ impl Tester for Collector {
                             eprint!("Test executable succeeded, but it's marked `should_panic`.");
                         }
                         TestFailure::MissingErrorCodes(codes) => {
-                            eprint!("Some expected error codes were not found: {:?}", codes);
+                            eprint!("Some expected error codes were not found: {codes:?}");
                         }
                         TestFailure::ExecutionError(err) => {
                             eprint!("Couldn't run the test: {err}");
@@ -1237,7 +1222,7 @@ impl<'a, 'hir, 'tcx> HirCollector<'a, 'hir, 'tcx> {
         // The collapse-docs pass won't combine sugared/raw doc attributes, or included files with
         // anything else, this will combine them for us.
         let attrs = Attributes::from_ast(ast_attrs);
-        if let Some(doc) = attrs.collapsed_doc_value() {
+        if let Some(doc) = attrs.opt_doc_value() {
             // Use the outermost invocation, so that doctest names come from where the docs were written.
             let span = ast_attrs
                 .iter()
@@ -1253,8 +1238,9 @@ impl<'a, 'hir, 'tcx> HirCollector<'a, 'hir, 'tcx> {
                 Some(&crate::html::markdown::ExtraInfo::new(
                     self.tcx,
                     def_id.to_def_id(),
-                    span_of_attrs(&attrs).unwrap_or(sp),
+                    span_of_fragments(&attrs.doc_strings).unwrap_or(sp),
                 )),
+                self.tcx.features().custom_code_classes_in_docs,
             );
         }
 

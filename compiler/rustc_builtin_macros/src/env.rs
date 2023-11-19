@@ -4,7 +4,7 @@
 //
 
 use rustc_ast::tokenstream::TokenStream;
-use rustc_ast::{self as ast, GenericArg};
+use rustc_ast::{self as ast, AstDeref, GenericArg};
 use rustc_expand::base::{self, *};
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::Span;
@@ -63,7 +63,8 @@ pub fn expand_env<'cx>(
         Some(exprs) => exprs.into_iter(),
     };
 
-    let Some((var, _style)) = expr_to_string(cx, exprs.next().unwrap(), "expected string literal") else {
+    let var_expr = exprs.next().unwrap();
+    let Some((var, _)) = expr_to_string(cx, var_expr.clone(), "expected string literal") else {
         return DummyResult::any(sp);
     };
 
@@ -71,35 +72,50 @@ pub fn expand_env<'cx>(
         None => None,
         Some(second) => match expr_to_string(cx, second, "expected string literal") {
             None => return DummyResult::any(sp),
-            Some((s, _style)) => Some(s),
+            Some((s, _)) => Some(s),
         },
     };
 
-    let sp = cx.with_def_site_ctxt(sp);
+    let span = cx.with_def_site_ctxt(sp);
     let value = env::var(var.as_str()).ok().as_deref().map(Symbol::intern);
     cx.sess.parse_sess.env_depinfo.borrow_mut().insert((var, value));
     let e = match value {
         None => {
-            cx.emit_err(errors::EnvNotDefined {
-                span: sp,
-                msg: custom_msg,
-                var,
-                help: custom_msg.is_none().then(|| help_for_missing_env_var(var.as_str())),
-            });
+            let ast::ExprKind::Lit(ast::token::Lit {
+                kind: ast::token::LitKind::Str | ast::token::LitKind::StrRaw(..),
+                symbol,
+                ..
+            }) = &var_expr.kind
+            else {
+                unreachable!("`expr_to_string` ensures this is a string lit")
+            };
+
+            if let Some(msg_from_user) = custom_msg {
+                cx.emit_err(errors::EnvNotDefinedWithUserMessage { span, msg_from_user });
+            } else if is_cargo_env_var(var.as_str()) {
+                cx.emit_err(errors::EnvNotDefined::CargoEnvVar {
+                    span,
+                    var: *symbol,
+                    var_expr: var_expr.ast_deref(),
+                });
+            } else {
+                cx.emit_err(errors::EnvNotDefined::CustomEnvVar {
+                    span,
+                    var: *symbol,
+                    var_expr: var_expr.ast_deref(),
+                });
+            }
+
             return DummyResult::any(sp);
         }
-        Some(value) => cx.expr_str(sp, value),
+        Some(value) => cx.expr_str(span, value),
     };
     MacEager::expr(e)
 }
 
-fn help_for_missing_env_var(var: &str) -> errors::EnvNotDefinedHelp {
-    if var.starts_with("CARGO_")
+/// Returns `true` if an environment variable from `env!` is one used by Cargo.
+fn is_cargo_env_var(var: &str) -> bool {
+    var.starts_with("CARGO_")
         || var.starts_with("DEP_")
         || matches!(var, "OUT_DIR" | "OPT_LEVEL" | "PROFILE" | "HOST" | "TARGET")
-    {
-        errors::EnvNotDefinedHelp::CargoVar
-    } else {
-        errors::EnvNotDefinedHelp::Other
-    }
 }

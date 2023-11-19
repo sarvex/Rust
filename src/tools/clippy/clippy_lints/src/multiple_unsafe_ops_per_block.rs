@@ -1,19 +1,15 @@
-use clippy_utils::{
-    diagnostics::span_lint_and_then,
-    visitors::{for_each_expr_with_closures, Descend, Visitable},
-};
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::visitors::{for_each_expr_with_closures, Descend, Visitable};
 use core::ops::ControlFlow::Continue;
-use hir::{
-    def::{DefKind, Res},
-    BlockCheckMode, ExprKind, QPath, UnOp, Unsafety,
-};
+use hir::def::{DefKind, Res};
+use hir::{BlockCheckMode, ExprKind, QPath, UnOp, Unsafety};
 use rustc_ast::Mutability;
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty;
 use rustc_session::{declare_lint_pass, declare_tool_lint};
-use rustc_span::Span;
+use rustc_span::{DesugaringKind, Span};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -26,7 +22,7 @@ declare_clippy_lint! {
     /// elimination of unnecessary unsafe blocks through refactoring.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// /// Reads a `char` from the given pointer.
     /// ///
     /// /// # Safety
@@ -40,7 +36,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// /// Reads a `char` from the given pointer.
     /// ///
     /// /// # Safety
@@ -68,7 +64,10 @@ declare_lint_pass!(MultipleUnsafeOpsPerBlock => [MULTIPLE_UNSAFE_OPS_PER_BLOCK])
 
 impl<'tcx> LateLintPass<'tcx> for MultipleUnsafeOpsPerBlock {
     fn check_block(&mut self, cx: &LateContext<'tcx>, block: &'tcx hir::Block<'_>) {
-        if !matches!(block.rules, BlockCheckMode::UnsafeBlock(_)) || in_external_macro(cx.tcx.sess, block.span) {
+        if !matches!(block.rules, BlockCheckMode::UnsafeBlock(_))
+            || in_external_macro(cx.tcx.sess, block.span)
+            || block.span.is_desugaring(DesugaringKind::Await)
+        {
             return;
         }
         let mut unsafe_ops = vec![];
@@ -138,7 +137,7 @@ fn collect_unsafe_exprs<'tcx>(
                     .type_dependent_def_id(expr.hir_id)
                     .map(|def_id| cx.tcx.fn_sig(def_id))
                 {
-                    if sig.0.unsafety() == Unsafety::Unsafe {
+                    if sig.skip_binder().unsafety() == Unsafety::Unsafe {
                         unsafe_ops.push(("unsafe method call occurs here", expr.span));
                     }
                 }

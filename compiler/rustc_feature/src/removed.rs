@@ -1,40 +1,28 @@
 //! List of the removed feature gates.
 
-use super::{to_nonzero, Feature, State};
+use super::{to_nonzero, Feature};
 use rustc_span::symbol::sym;
+
+pub struct RemovedFeature {
+    pub feature: Feature,
+    pub reason: Option<&'static str>,
+}
 
 macro_rules! declare_features {
     ($(
         $(#[doc = $doc:tt])* (removed, $feature:ident, $ver:expr, $issue:expr, None, $reason:expr),
     )+) => {
-        /// Represents unstable features which have since been removed (it was once Active)
-        pub const REMOVED_FEATURES: &[Feature] = &[
-            $(
-                Feature {
-                    state: State::Removed { reason: $reason },
+        /// Formerly unstable features that have now been removed.
+        pub const REMOVED_FEATURES: &[RemovedFeature] = &[
+            $(RemovedFeature {
+                feature: Feature {
                     name: sym::$feature,
                     since: $ver,
                     issue: to_nonzero($issue),
                     edition: None,
-                }
-            ),+
-        ];
-    };
-
-    ($(
-        $(#[doc = $doc:tt])* (stable_removed, $feature:ident, $ver:expr, $issue:expr, None),
-    )+) => {
-        /// Represents stable features which have since been removed (it was once Accepted)
-        pub const STABLE_REMOVED_FEATURES: &[Feature] = &[
-            $(
-                Feature {
-                    state: State::Stabilized { reason: None },
-                    name: sym::$feature,
-                    since: $ver,
-                    issue: to_nonzero($issue),
-                    edition: None,
-                }
-            ),+
+                },
+                reason: $reason
+            }),+
         ];
     };
 }
@@ -54,13 +42,15 @@ declare_features! (
      Some("subsumed by `.await` syntax")),
     /// Allows using the `box $expr` syntax.
     (removed, box_syntax, "1.70.0", Some(49733), None, Some("replaced with `#[rustc_box]`")),
-    /// Allows capturing disjoint fields in a closure/generator (RFC 2229).
+    /// Allows capturing disjoint fields in a closure/coroutine (RFC 2229).
     (removed, capture_disjoint_fields, "1.49.0", Some(53488), None, Some("stabilized in Rust 2021")),
     /// Allows comparing raw pointers during const eval.
     (removed, const_compare_raw_pointers, "1.46.0", Some(53020), None,
      Some("cannot be allowed in const eval in any meaningful way")),
+    /// Allows limiting the evaluation steps of const expressions
+    (removed, const_eval_limit, "1.43.0", Some(67217), None, Some("removed the limit entirely")),
     /// Allows non-trivial generic constants which have to be manually propagated upwards.
-     (removed, const_evaluatable_checked, "1.48.0", Some(76560), None, Some("renamed to `generic_const_exprs`")),
+    (removed, const_evaluatable_checked, "1.48.0", Some(76560), None, Some("renamed to `generic_const_exprs`")),
     /// Allows the definition of `const` functions with some advanced features.
     (removed, const_fn, "1.54.0", Some(57563), None,
      Some("split into finer-grained feature gates")),
@@ -106,6 +96,10 @@ declare_features! (
     /// Allows `#[doc(include = "some-file")]`.
     (removed, external_doc, "1.54.0", Some(44732), None,
      Some("use #[doc = include_str!(\"filename\")] instead, which handles macro invocations")),
+    /// Allows generators to be cloned.
+    (removed, generator_clone, "1.65.0", Some(95360), None, Some("renamed to `coroutine_clone`")),
+    /// Allows defining generators.
+    (removed, generators, "1.21.0", Some(43122), None, Some("renamed to `coroutines`")),
     /// Allows `impl Trait` in bindings (`let`, `const`, `static`).
     (removed, impl_trait_in_bindings, "1.55.0", Some(63065), None,
      Some("the implementation was not maintainable, the feature may get reintroduced once the current refactorings are done")),
@@ -134,8 +128,16 @@ declare_features! (
      Some("subsumed by `#![feature(allocator_internals)]`")),
     /// Allows use of unary negate on unsigned integers, e.g., -e for e: u8
     (removed, negate_unsigned, "1.0.0", Some(29645), None, None),
+    /// Allows `#[no_coverage]` on functions.
+    /// The feature was renamed to `coverage_attribute` and the attribute to `#[coverage(on|off)]`
+    (removed, no_coverage, "1.74.0", Some(84605), None, Some("renamed to `coverage_attribute`")),
     /// Allows `#[no_debug]`.
     (removed, no_debug, "1.43.0", Some(29721), None, Some("removed due to lack of demand")),
+    /// Note: this feature was previously recorded in a separate
+    /// `STABLE_REMOVED` list because it, uniquely, was once stable but was
+    /// then removed. But there was no utility storing it separately, so now
+    /// it's in this list.
+    (removed, no_stack_check, "1.0.0", None, None, None),
     /// Allows using `#[on_unimplemented(..)]` on traits.
     /// (Moved to `rustc_attrs`.)
     (removed, on_unimplemented, "1.40.0", None, None, None),
@@ -150,9 +152,12 @@ declare_features! (
      Some("removed in favor of `#![feature(marker_trait_attr)]`")),
     (removed, panic_implementation, "1.28.0", Some(44489), None,
      Some("subsumed by `#[panic_handler]`")),
+    /// Allows using `#![plugin(myplugin)]`.
+    (removed, plugin, "1.75.0", Some(29597), None,
+     Some("plugins are no longer supported")),
     /// Allows using `#[plugin_registrar]` on functions.
     (removed, plugin_registrar, "1.54.0", Some(29597), None,
-     Some("a __rustc_plugin_registrar symbol must now be defined instead")),
+     Some("plugins are no longer supported")),
     (removed, proc_macro_expr, "1.27.0", Some(54727), None,
      Some("subsumed by `#![feature(proc_macro_hygiene)]`")),
     (removed, proc_macro_gen, "1.27.0", Some(54727), None,
@@ -202,9 +207,4 @@ declare_features! (
     // -------------------------------------------------------------------------
     // feature-group-end: removed features
     // -------------------------------------------------------------------------
-);
-
-#[rustfmt::skip]
-declare_features! (
-    (stable_removed, no_stack_check, "1.0.0", None, None),
 );

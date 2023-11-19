@@ -4,7 +4,7 @@
     thread_local
 )]
 #![no_core]
-#![allow(dead_code)]
+#![allow(dead_code, internal_features)]
 
 #[no_mangle]
 unsafe extern "C" fn _Unwind_Resume() {
@@ -429,6 +429,15 @@ fn panic_cannot_unwind() -> ! {
     }
 }
 
+#[lang = "panic_in_cleanup"]
+#[rustc_nounwind]
+fn panic_in_cleanup() -> ! {
+    unsafe {
+        libc::printf("panic in a destructor during cleanup\n\0" as *const str as *const i8);
+        intrinsics::abort();
+    }
+}
+
 #[lang = "panic_bounds_check"]
 #[track_caller]
 fn panic_bounds_check(index: usize, len: usize) -> ! {
@@ -450,6 +459,9 @@ pub unsafe fn drop_in_place<T: ?Sized>(to_drop: *mut T) {
     // real drop glue by the compiler.
     drop_in_place(to_drop);
 }
+
+#[lang = "unpin"]
+pub auto trait Unpin {}
 
 #[lang = "deref"]
 pub trait Deref {
@@ -488,9 +500,23 @@ pub struct Box<T: ?Sized, A: Allocator = Global>(Unique<T>, A);
 
 impl<T: ?Sized + Unsize<U>, U: ?Sized, A: Allocator> CoerceUnsized<Box<U, A>> for Box<T, A> {}
 
+impl<T> Box<T> {
+    pub fn new(val: T) -> Box<T> {
+        unsafe {
+            let size = intrinsics::size_of::<T>();
+            let ptr = libc::malloc(size);
+            intrinsics::copy(&val as *const T as *const u8, ptr, size);
+            Box(Unique { pointer: NonNull(ptr as *const T), _marker: PhantomData }, Global)
+        }
+    }
+}
+
 impl<T: ?Sized, A: Allocator> Drop for Box<T, A> {
     fn drop(&mut self) {
-        // drop is currently performed by compiler.
+        // inner value is dropped by compiler.
+        unsafe {
+            libc::free(self.0.pointer.0 as *mut u8);
+        }
     }
 }
 
@@ -505,11 +531,6 @@ impl<T: ?Sized, A: Allocator> Deref for Box<T, A> {
 #[lang = "exchange_malloc"]
 unsafe fn allocate(size: usize, _align: usize) -> *mut u8 {
     libc::malloc(size)
-}
-
-#[lang = "box_free"]
-unsafe fn box_free<T: ?Sized>(ptr: Unique<T>, _alloc: ()) {
-    libc::free(ptr.pointer.0 as *mut u8);
 }
 
 #[lang = "drop"]

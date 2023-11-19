@@ -24,6 +24,7 @@ static HOSTS: &[&str] = &[
     "i686-pc-windows-gnu",
     "i686-pc-windows-msvc",
     "i686-unknown-linux-gnu",
+    "loongarch64-unknown-linux-gnu",
     "mips-unknown-linux-gnu",
     "mips64-unknown-linux-gnuabi64",
     "mips64el-unknown-linux-gnuabi64",
@@ -68,7 +69,6 @@ static TARGETS: &[&str] = &[
     "arm-unknown-linux-musleabihf",
     "armv5te-unknown-linux-gnueabi",
     "armv5te-unknown-linux-musleabi",
-    "armv7-apple-ios",
     "armv7-linux-androideabi",
     "thumbv7neon-linux-androideabi",
     "armv7-unknown-linux-gnueabi",
@@ -82,7 +82,6 @@ static TARGETS: &[&str] = &[
     "armv7r-none-eabi",
     "armv7r-none-eabihf",
     "armv7s-apple-ios",
-    "asmjs-unknown-emscripten",
     "bpfeb-unknown-none",
     "bpfel-unknown-none",
     "i386-apple-ios",
@@ -97,7 +96,12 @@ static TARGETS: &[&str] = &[
     "i686-unknown-linux-gnu",
     "i686-unknown-linux-musl",
     "i686-unknown-uefi",
+    "loongarch64-unknown-linux-gnu",
+    "loongarch64-unknown-none",
+    "loongarch64-unknown-none-softfloat",
     "m68k-unknown-linux-gnu",
+    "csky-unknown-linux-gnuabiv2",
+    "csky-unknown-linux-gnuabiv2hf",
     "mips-unknown-linux-gnu",
     "mips-unknown-linux-musl",
     "mips64-unknown-linux-gnuabi64",
@@ -120,11 +124,13 @@ static TARGETS: &[&str] = &[
     "riscv32imac-unknown-none-elf",
     "riscv32gc-unknown-linux-gnu",
     "riscv64imac-unknown-none-elf",
+    "riscv64gc-unknown-hermit",
     "riscv64gc-unknown-none-elf",
     "riscv64gc-unknown-linux-gnu",
     "s390x-unknown-linux-gnu",
     "sparc64-unknown-linux-gnu",
     "sparcv9-sun-solaris",
+    "sparc-unknown-none-elf",
     "thumbv6m-none-eabi",
     "thumbv7em-none-eabi",
     "thumbv7em-none-eabihf",
@@ -135,6 +141,7 @@ static TARGETS: &[&str] = &[
     "wasm32-unknown-emscripten",
     "wasm32-unknown-unknown",
     "wasm32-wasi",
+    "wasm32-wasi-preview1-threads",
     "x86_64-apple-darwin",
     "x86_64-apple-ios",
     "x86_64-fortanix-unknown-sgx",
@@ -144,6 +151,7 @@ static TARGETS: &[&str] = &[
     "x86_64-pc-windows-msvc",
     "x86_64-sun-solaris",
     "x86_64-pc-solaris",
+    "x86_64-unikraft-linux-musl",
     "x86_64-unknown-freebsd",
     "x86_64-unknown-illumos",
     "x86_64-unknown-linux-gnu",
@@ -183,7 +191,8 @@ static PKG_INSTALLERS: &[&str] = &["x86_64-apple-darwin", "aarch64-apple-darwin"
 
 static MINGW: &[&str] = &["i686-pc-windows-gnu", "x86_64-pc-windows-gnu"];
 
-static NIGHTLY_ONLY_COMPONENTS: &[PkgType] = &[PkgType::Miri, PkgType::JsonDocs];
+static NIGHTLY_ONLY_COMPONENTS: &[PkgType] =
+    &[PkgType::Miri, PkgType::JsonDocs, PkgType::RustcCodegenCranelift];
 
 macro_rules! t {
     ($e:expr) => {
@@ -256,6 +265,29 @@ impl Builder {
             // channel-rust-1.XX.toml
             let major_minor = rust_version.split('.').take(2).collect::<Vec<_>>().join(".");
             self.write_channel_files(&major_minor, &manifest);
+        } else if channel == "beta" {
+            // channel-rust-1.XX.YY-beta.Z.toml
+            let rust_version = self
+                .versions
+                .version(&PkgType::Rust)
+                .expect("missing Rust tarball")
+                .version
+                .expect("missing Rust version")
+                .split(' ')
+                .next()
+                .unwrap()
+                .to_string();
+            self.write_channel_files(&rust_version, &manifest);
+
+            // channel-rust-1.XX.YY-beta.toml
+            let major_minor_patch_beta =
+                rust_version.split('.').take(3).collect::<Vec<_>>().join(".");
+            self.write_channel_files(&major_minor_patch_beta, &manifest);
+
+            // channel-rust-1.XX-beta.toml
+            let major_minor_beta =
+                format!("{}-beta", rust_version.split('.').take(2).collect::<Vec<_>>().join("."));
+            self.write_channel_files(&major_minor_beta, &manifest);
         }
 
         if let Some(path) = std::env::var_os("BUILD_MANIFEST_SHIPPED_FILES_PATH") {
@@ -327,7 +359,15 @@ impl Builder {
 
         // NOTE: this profile is effectively deprecated; do not add new components to it.
         let mut complete = default;
-        complete.extend([Rls, RustAnalyzer, RustSrc, LlvmTools, RustAnalysis, Miri]);
+        complete.extend([
+            Rls,
+            RustAnalyzer,
+            RustSrc,
+            LlvmTools,
+            RustAnalysis,
+            Miri,
+            RustcCodegenCranelift,
+        ]);
         profile("complete", &complete);
 
         // The compiler libraries are not stable for end users, and they're also huge, so we only
@@ -414,7 +454,8 @@ impl Builder {
                 | PkgType::Rustfmt
                 | PkgType::LlvmTools
                 | PkgType::RustAnalysis
-                | PkgType::JsonDocs => {
+                | PkgType::JsonDocs
+                | PkgType::RustcCodegenCranelift => {
                     extensions.push(host_component(pkg));
                 }
                 PkgType::RustcDev | PkgType::RustcDocs => {

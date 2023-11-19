@@ -1,6 +1,6 @@
 use crate::{
     fluent_generated as fluent,
-    thir::pattern::{deconstruct_pat::DeconstructedPat, MatchCheckCtxt},
+    thir::pattern::{deconstruct_pat::WitnessPat, MatchCheckCtxt},
 };
 use rustc_errors::{
     error_code, AddToDiagnostic, Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed,
@@ -29,6 +29,8 @@ pub struct UnsafeOpInUnsafeFnCallToUnsafeFunctionRequiresUnsafe<'a> {
     #[label]
     pub span: Span,
     pub function: &'a str,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -37,6 +39,8 @@ pub struct UnsafeOpInUnsafeFnCallToUnsafeFunctionRequiresUnsafe<'a> {
 pub struct UnsafeOpInUnsafeFnCallToUnsafeFunctionRequiresUnsafeNameless {
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -45,6 +49,8 @@ pub struct UnsafeOpInUnsafeFnCallToUnsafeFunctionRequiresUnsafeNameless {
 pub struct UnsafeOpInUnsafeFnUseOfInlineAssemblyRequiresUnsafe {
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -53,6 +59,8 @@ pub struct UnsafeOpInUnsafeFnUseOfInlineAssemblyRequiresUnsafe {
 pub struct UnsafeOpInUnsafeFnInitializingTypeWithRequiresUnsafe {
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -61,6 +69,8 @@ pub struct UnsafeOpInUnsafeFnInitializingTypeWithRequiresUnsafe {
 pub struct UnsafeOpInUnsafeFnUseOfMutableStaticRequiresUnsafe {
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -69,6 +79,8 @@ pub struct UnsafeOpInUnsafeFnUseOfMutableStaticRequiresUnsafe {
 pub struct UnsafeOpInUnsafeFnUseOfExternStaticRequiresUnsafe {
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -77,6 +89,8 @@ pub struct UnsafeOpInUnsafeFnUseOfExternStaticRequiresUnsafe {
 pub struct UnsafeOpInUnsafeFnDerefOfRawPointerRequiresUnsafe {
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -85,6 +99,8 @@ pub struct UnsafeOpInUnsafeFnDerefOfRawPointerRequiresUnsafe {
 pub struct UnsafeOpInUnsafeFnAccessToUnionFieldRequiresUnsafe {
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -93,6 +109,8 @@ pub struct UnsafeOpInUnsafeFnAccessToUnionFieldRequiresUnsafe {
 pub struct UnsafeOpInUnsafeFnMutationOfLayoutConstrainedFieldRequiresUnsafe {
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -100,6 +118,8 @@ pub struct UnsafeOpInUnsafeFnMutationOfLayoutConstrainedFieldRequiresUnsafe {
 pub struct UnsafeOpInUnsafeFnBorrowOfLayoutConstrainedFieldRequiresUnsafe {
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(LintDiagnostic)]
@@ -109,6 +129,8 @@ pub struct UnsafeOpInUnsafeFnCallToFunctionWithRequiresUnsafe<'a> {
     #[label]
     pub span: Span,
     pub function: &'a str,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedLintNote>,
 }
 
 #[derive(Diagnostic)]
@@ -119,6 +141,8 @@ pub struct CallToUnsafeFunctionRequiresUnsafe<'a> {
     #[label]
     pub span: Span,
     pub function: &'a str,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -128,6 +152,8 @@ pub struct CallToUnsafeFunctionRequiresUnsafeNameless {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -138,6 +164,8 @@ pub struct CallToUnsafeFunctionRequiresUnsafeUnsafeOpInUnsafeFnAllowed<'a> {
     #[label]
     pub span: Span,
     pub function: &'a str,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -150,6 +178,8 @@ pub struct CallToUnsafeFunctionRequiresUnsafeNamelessUnsafeOpInUnsafeFnAllowed {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -159,6 +189,8 @@ pub struct UseOfInlineAssemblyRequiresUnsafe {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -168,6 +200,8 @@ pub struct UseOfInlineAssemblyRequiresUnsafeUnsafeOpInUnsafeFnAllowed {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -177,6 +211,8 @@ pub struct InitializingTypeWithRequiresUnsafe {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -189,6 +225,8 @@ pub struct InitializingTypeWithRequiresUnsafeUnsafeOpInUnsafeFnAllowed {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -198,6 +236,8 @@ pub struct UseOfMutableStaticRequiresUnsafe {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -207,6 +247,8 @@ pub struct UseOfMutableStaticRequiresUnsafeUnsafeOpInUnsafeFnAllowed {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -216,6 +258,8 @@ pub struct UseOfExternStaticRequiresUnsafe {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -225,6 +269,8 @@ pub struct UseOfExternStaticRequiresUnsafeUnsafeOpInUnsafeFnAllowed {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -234,6 +280,8 @@ pub struct DerefOfRawPointerRequiresUnsafe {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -243,6 +291,8 @@ pub struct DerefOfRawPointerRequiresUnsafeUnsafeOpInUnsafeFnAllowed {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -252,6 +302,8 @@ pub struct AccessToUnionFieldRequiresUnsafe {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -261,6 +313,8 @@ pub struct AccessToUnionFieldRequiresUnsafeUnsafeOpInUnsafeFnAllowed {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -270,6 +324,8 @@ pub struct MutationOfLayoutConstrainedFieldRequiresUnsafe {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -282,6 +338,8 @@ pub struct MutationOfLayoutConstrainedFieldRequiresUnsafeUnsafeOpInUnsafeFnAllow
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -291,6 +349,8 @@ pub struct BorrowOfLayoutConstrainedFieldRequiresUnsafe {
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -303,6 +363,8 @@ pub struct BorrowOfLayoutConstrainedFieldRequiresUnsafeUnsafeOpInUnsafeFnAllowed
     #[primary_span]
     #[label]
     pub span: Span,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -313,6 +375,8 @@ pub struct CallToFunctionWithRequiresUnsafe<'a> {
     #[label]
     pub span: Span,
     pub function: &'a str,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
 }
 
 #[derive(Diagnostic)]
@@ -323,6 +387,36 @@ pub struct CallToFunctionWithRequiresUnsafeUnsafeOpInUnsafeFnAllowed<'a> {
     #[label]
     pub span: Span,
     pub function: &'a str,
+    #[subdiagnostic]
+    pub unsafe_not_inherited_note: Option<UnsafeNotInheritedNote>,
+}
+
+#[derive(Subdiagnostic)]
+#[label(mir_build_unsafe_not_inherited)]
+pub struct UnsafeNotInheritedNote {
+    #[primary_span]
+    pub span: Span,
+}
+
+pub struct UnsafeNotInheritedLintNote {
+    pub signature_span: Span,
+    pub body_span: Span,
+}
+
+impl AddToDiagnostic for UnsafeNotInheritedLintNote {
+    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, _: F)
+    where
+        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
+    {
+        diag.span_note(self.signature_span, fluent::mir_build_unsafe_fn_safe_body);
+        let body_start = self.body_span.shrink_to_lo();
+        let body_end = self.body_span.shrink_to_hi();
+        diag.tool_only_multipart_suggestion(
+            fluent::mir_build_wrap_suggestion,
+            vec![(body_start, "{ unsafe ".into()), (body_end, "}".into())],
+            Applicability::MaybeIncorrect,
+        );
+    }
 }
 
 #[derive(LintDiagnostic)]
@@ -338,11 +432,6 @@ pub struct UnusedUnsafe {
 pub enum UnusedUnsafeEnclosing {
     #[label(mir_build_unused_unsafe_enclosing_block_label)]
     Block {
-        #[primary_span]
-        span: Span,
-    },
-    #[label(mir_build_unused_unsafe_enclosing_fn_label)]
-    Function {
         #[primary_span]
         span: Span,
     },
@@ -403,17 +492,13 @@ impl<'a> IntoDiagnostic<'a> for NonExhaustivePatternsTypeNotEmpty<'_, '_, '_> {
         if self.span.eq_ctxt(self.expr_span) {
             // Get the span for the empty match body `{}`.
             let (indentation, more) = if let Some(snippet) = sm.indentation_before(self.span) {
-                (format!("\n{}", snippet), "    ")
+                (format!("\n{snippet}"), "    ")
             } else {
                 (" ".to_string(), "")
             };
             suggestion = Some((
                 self.span.shrink_to_hi().with_hi(self.expr_span.hi()),
-                format!(
-                    " {{{indentation}{more}_ => todo!(),{indentation}}}",
-                    indentation = indentation,
-                    more = more,
-                ),
+                format!(" {{{indentation}{more}_ => todo!(),{indentation}}}",),
             ));
         }
 
@@ -431,6 +516,10 @@ impl<'a> IntoDiagnostic<'a> for NonExhaustivePatternsTypeNotEmpty<'_, '_, '_> {
         diag
     }
 }
+
+#[derive(Subdiagnostic)]
+#[note(mir_build_non_exhaustive_match_all_arms_guarded)]
+pub struct NonExhaustiveMatchAllArmsGuarded;
 
 #[derive(Diagnostic)]
 #[diag(mir_build_static_in_pattern, code = "E0158")]
@@ -500,6 +589,7 @@ pub struct LiteralOutOfRange<'tcx> {
     #[label]
     pub span: Span,
     pub ty: Ty<'tcx>,
+    pub min: i128,
     pub max: u128,
 }
 
@@ -698,6 +788,12 @@ pub struct NontrivialStructuralMatch<'tcx> {
 }
 
 #[derive(LintDiagnostic)]
+#[diag(mir_build_non_partial_eq_match)]
+pub struct NonPartialEqMatch<'tcx> {
+    pub non_peq_ty: Ty<'tcx>,
+}
+
+#[derive(LintDiagnostic)]
 #[diag(mir_build_overlapping_range_endpoints)]
 #[note]
 pub struct OverlappingRangeEndpoints<'tcx> {
@@ -736,6 +832,18 @@ pub(crate) struct NonExhaustiveOmittedPattern<'tcx> {
     pub uncovered: Uncovered<'tcx>,
 }
 
+#[derive(LintDiagnostic)]
+#[diag(mir_build_non_exhaustive_omitted_pattern_lint_on_arm)]
+#[help]
+pub(crate) struct NonExhaustiveOmittedPatternLintOnArm {
+    #[label]
+    pub lint_span: Span,
+    #[suggestion(code = "#[{lint_level}({lint_name})]\n", applicability = "maybe-incorrect")]
+    pub suggest_lint_on_match: Option<Span>,
+    pub lint_level: &'static str,
+    pub lint_name: &'static str,
+}
+
 #[derive(Subdiagnostic)]
 #[label(mir_build_uncovered)]
 pub(crate) struct Uncovered<'tcx> {
@@ -752,15 +860,21 @@ impl<'tcx> Uncovered<'tcx> {
     pub fn new<'p>(
         span: Span,
         cx: &MatchCheckCtxt<'p, 'tcx>,
-        witnesses: Vec<DeconstructedPat<'p, 'tcx>>,
+        witnesses: Vec<WitnessPat<'tcx>>,
     ) -> Self {
-        let witness_1 = witnesses.get(0).unwrap().to_pat(cx);
+        let witness_1 = witnesses.get(0).unwrap().to_diagnostic_pat(cx);
         Self {
             span,
             count: witnesses.len(),
             // Substitute dummy values if witnesses is smaller than 3. These will never be read.
-            witness_2: witnesses.get(1).map(|w| w.to_pat(cx)).unwrap_or_else(|| witness_1.clone()),
-            witness_3: witnesses.get(2).map(|w| w.to_pat(cx)).unwrap_or_else(|| witness_1.clone()),
+            witness_2: witnesses
+                .get(1)
+                .map(|w| w.to_diagnostic_pat(cx))
+                .unwrap_or_else(|| witness_1.clone()),
+            witness_3: witnesses
+                .get(2)
+                .map(|w| w.to_diagnostic_pat(cx))
+                .unwrap_or_else(|| witness_1.clone()),
             witness_1,
             remainder: witnesses.len().saturating_sub(3),
         }
@@ -781,6 +895,8 @@ pub(crate) struct PatternNotCovered<'s, 'tcx> {
     pub interpreted_as_const: Option<InterpretedAsConst>,
     #[subdiagnostic]
     pub adt_defined_here: Option<AdtDefinedHere<'tcx>>,
+    #[note(mir_build_privately_uninhabited)]
+    pub witness_1_is_privately_uninhabited: Option<()>,
     #[note(mir_build_pattern_ty)]
     pub _p: (),
     pub pattern_ty: Ty<'tcx>,

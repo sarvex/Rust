@@ -181,6 +181,11 @@ pub(super) fn error_name(er: abi::ER) -> Option<&'static str> {
     unsafe { CStr::from_ptr(netc::strerror(er)) }.to_str().ok()
 }
 
+#[inline]
+pub fn is_interrupted(er: abi::ER) -> bool {
+    er == netc::SOLID_NET_ERR_BASE - libc::EINTR
+}
+
 pub(super) fn decode_error_kind(er: abi::ER) -> ErrorKind {
     let errno = netc::SOLID_NET_ERR_BASE - er;
     match errno as libc::c_int {
@@ -228,12 +233,15 @@ impl Socket {
         }
     }
 
+    pub fn connect(&self, addr: &SocketAddr) -> io::Result<()> {
+        let (addr, len) = addr.into_inner();
+        cvt(unsafe { netc::connect(self.0.raw(), addr.as_ptr(), len) })?;
+        Ok(())
+    }
+
     pub fn connect_timeout(&self, addr: &SocketAddr, timeout: Duration) -> io::Result<()> {
         self.set_nonblocking(true)?;
-        let r = unsafe {
-            let (addr, len) = addr.into_inner();
-            cvt(netc::connect(self.0.raw(), addr.as_ptr(), len))
-        };
+        let r = self.connect(addr);
         self.set_nonblocking(false)?;
 
         match r {

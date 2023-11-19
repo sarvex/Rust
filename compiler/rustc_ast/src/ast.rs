@@ -14,7 +14,7 @@
 //! - [`Generics`], [`GenericParam`], [`WhereClause`]: Metadata associated with generic parameters.
 //! - [`EnumDef`] and [`Variant`]: Enum declaration.
 //! - [`MetaItemLit`] and [`LitKind`]: Literal expressions.
-//! - [`MacroDef`], [`MacStmtStyle`], [`MacCall`], [`MacDelimiter`]: Macro definition and invocation.
+//! - [`MacroDef`], [`MacStmtStyle`], [`MacCall`]: Macro definition and invocation.
 //! - [`Attribute`]: Metadata associated with item.
 //! - [`UnOp`], [`BinOp`], and [`BinOpKind`]: Unary and binary operators.
 
@@ -33,7 +33,8 @@ use rustc_macros::HashStable_Generic;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_span::source_map::{respan, Spanned};
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{ErrorGuaranteed, Span, DUMMY_SP};
+pub use rustc_type_ir::{Movability, Mutability};
 use std::fmt;
 use std::mem;
 use thin_vec::{thin_vec, ThinVec};
@@ -119,6 +120,12 @@ impl Path {
 
     pub fn is_global(&self) -> bool {
         !self.segments.is_empty() && self.segments[0].ident.name == kw::PathRoot
+    }
+
+    /// If this path is a single identifier with no arguments, does not ensure
+    /// that the path resolves to a const param, the caller should check this.
+    pub fn is_potential_trivial_const_arg(&self) -> bool {
+        self.segments.len() == 1 && self.segments[0].args.is_none()
     }
 }
 
@@ -305,6 +312,16 @@ pub enum TraitBoundModifier {
     //
     // This parses but will be rejected during AST validation.
     MaybeConstMaybe,
+}
+
+impl TraitBoundModifier {
+    pub fn to_constness(self) -> Const {
+        match self {
+            // FIXME(effects) span
+            Self::MaybeConst => Const::Yes(DUMMY_SP),
+            _ => Const::No,
+        }
+    }
 }
 
 /// The AST represents all type param bounds as types.
@@ -717,6 +734,8 @@ pub enum RangeSyntax {
 }
 
 /// All the different flavors of pattern that Rust recognizes.
+//
+// Adding a new variant? Please update `test_pat` in `tests/ui/macros/stringify.rs`.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum PatKind {
     /// Represents a wildcard pattern (`_`).
@@ -782,57 +801,6 @@ pub enum PatKind {
 
     /// A macro pattern; pre-expansion.
     MacCall(P<MacCall>),
-}
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Copy)]
-#[derive(HashStable_Generic, Encodable, Decodable)]
-pub enum Mutability {
-    // N.B. Order is deliberate, so that Not < Mut
-    Not,
-    Mut,
-}
-
-impl Mutability {
-    pub fn invert(self) -> Self {
-        match self {
-            Mutability::Mut => Mutability::Not,
-            Mutability::Not => Mutability::Mut,
-        }
-    }
-
-    /// Returns `""` (empty string) or `"mut "` depending on the mutability.
-    pub fn prefix_str(self) -> &'static str {
-        match self {
-            Mutability::Mut => "mut ",
-            Mutability::Not => "",
-        }
-    }
-
-    /// Returns `"&"` or `"&mut "` depending on the mutability.
-    pub fn ref_prefix_str(self) -> &'static str {
-        match self {
-            Mutability::Not => "&",
-            Mutability::Mut => "&mut ",
-        }
-    }
-
-    /// Returns `""` (empty string) or `"mutably "` depending on the mutability.
-    pub fn mutably_str(self) -> &'static str {
-        match self {
-            Mutability::Not => "",
-            Mutability::Mut => "mutably ",
-        }
-    }
-
-    /// Return `true` if self is mutable
-    pub fn is_mut(self) -> bool {
-        matches!(self, Self::Mut)
-    }
-
-    /// Return `true` if self is **not** mutable
-    pub fn is_not(self) -> bool {
-        matches!(self, Self::Not)
-    }
 }
 
 /// The kind of borrow in an `AddrOf` expression,
@@ -1001,6 +969,7 @@ impl Stmt {
     }
 }
 
+// Adding a new variant? Please update `test_stmt` in `tests/ui/macros/stringify.rs`.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum StmtKind {
     /// A local (let) binding.
@@ -1154,7 +1123,9 @@ impl Expr {
     ///
     /// If this is not the case, name resolution does not resolve `N` when using
     /// `min_const_generics` as more complex expressions are not supported.
-    pub fn is_potential_trivial_const_param(&self) -> bool {
+    ///
+    /// Does not ensure that the path resolves to a const param, the caller should check this.
+    pub fn is_potential_trivial_const_arg(&self) -> bool {
         let this = if let ExprKind::Block(block, None) = &self.kind
             && block.stmts.len() == 1
             && let StmtKind::Expr(expr) = &block.stmts[0].kind
@@ -1165,8 +1136,7 @@ impl Expr {
         };
 
         if let ExprKind::Path(None, path) = &this.kind
-            && path.segments.len() == 1
-            && path.segments[0].args.is_none()
+            && path.is_potential_trivial_const_arg()
         {
             true
         } else {
@@ -1265,7 +1235,7 @@ impl Expr {
             ExprKind::Closure(..) => ExprPrecedence::Closure,
             ExprKind::Block(..) => ExprPrecedence::Block,
             ExprKind::TryBlock(..) => ExprPrecedence::TryBlock,
-            ExprKind::Async(..) => ExprPrecedence::Async,
+            ExprKind::Gen(..) => ExprPrecedence::Gen,
             ExprKind::Await(..) => ExprPrecedence::Await,
             ExprKind::Assign(..) => ExprPrecedence::Assign,
             ExprKind::AssignOp(..) => ExprPrecedence::AssignOp,
@@ -1288,6 +1258,7 @@ impl Expr {
             ExprKind::Yield(..) => ExprPrecedence::Yield,
             ExprKind::Yeet(..) => ExprPrecedence::Yeet,
             ExprKind::FormatArgs(..) => ExprPrecedence::FormatArgs,
+            ExprKind::Become(..) => ExprPrecedence::Become,
             ExprKind::Err => ExprPrecedence::Err,
         }
     }
@@ -1377,6 +1348,7 @@ pub struct StructExpr {
     pub rest: StructRest,
 }
 
+// Adding a new variant? Please update `test_expr` in `tests/ui/macros/stringify.rs`.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum ExprKind {
     /// An array (`[a, b, c, d]`)
@@ -1408,7 +1380,7 @@ pub enum ExprKind {
     /// of `if` / `while` expressions. (e.g., `if let 0 = x { .. }`).
     ///
     /// `Span` represents the whole `let pat = expr` statement.
-    Let(P<Pat>, P<Expr>, Span),
+    Let(P<Pat>, P<Expr>, Span, Option<ErrorGuaranteed>),
     /// An `if` block, with an optional `else` block.
     ///
     /// `if expr { block } else { expr }`
@@ -1433,11 +1405,9 @@ pub enum ExprKind {
     Closure(Box<Closure>),
     /// A block (`'label: { ... }`).
     Block(P<Block>, Option<Label>),
-    /// An async block (`async move { ... }`).
-    ///
-    /// The async block used to have a `NodeId`, which was removed in favor of
-    /// using the parent `NodeId` of the parent `Expr`.
-    Async(CaptureBy, P<Block>),
+    /// An `async` block (`async move { ... }`),
+    /// or a `gen` block (`gen move { ... }`)
+    Gen(CaptureBy, P<Block>, GenBlockKind),
     /// An await expression (`my_future.await`). Span is of await keyword.
     Await(P<Expr>, Span),
 
@@ -1454,7 +1424,8 @@ pub enum ExprKind {
     /// Access of a named (e.g., `obj.foo`) or unnamed (e.g., `obj.0`) struct field.
     Field(P<Expr>, Ident),
     /// An indexing operation (e.g., `foo[2]`).
-    Index(P<Expr>, P<Expr>),
+    /// The span represents the span of the `[2]`, including brackets.
+    Index(P<Expr>, P<Expr>, Span),
     /// A range (e.g., `1..2`, `1..`, `..2`, `1..=2`, `..=2`; and `..` in destructuring assignment).
     Range(Option<P<Expr>>, Option<P<Expr>>, RangeLimits),
     /// An underscore, used in destructuring assignment to ignore a value.
@@ -1508,6 +1479,11 @@ pub enum ExprKind {
     /// with an optional value to be returned.
     Yeet(Option<P<Expr>>),
 
+    /// A tail call return, with the value to be returned.
+    ///
+    /// While `.0` must be a function call, we check this later, after parsing.
+    Become(P<Expr>),
+
     /// Bytes included via `include_bytes!`
     /// Added for optimization purposes to avoid the need to escape
     /// large binary blobs - should always behave like [`ExprKind::Lit`]
@@ -1519,6 +1495,28 @@ pub enum ExprKind {
 
     /// Placeholder for an expression that wasn't syntactically well formed in some way.
     Err,
+}
+
+/// Used to differentiate between `async {}` blocks and `gen {}` blocks.
+#[derive(Clone, Encodable, Decodable, Debug, PartialEq, Eq)]
+pub enum GenBlockKind {
+    Async,
+    Gen,
+}
+
+impl fmt::Display for GenBlockKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.modifier().fmt(f)
+    }
+}
+
+impl GenBlockKind {
+    pub fn modifier(&self) -> &'static str {
+        match self {
+            GenBlockKind::Async => "async",
+            GenBlockKind::Gen => "gen",
+        }
+    }
 }
 
 /// The explicit `Self` type in a "qualified path". The actual
@@ -1550,20 +1548,12 @@ pub struct QSelf {
 #[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
 pub enum CaptureBy {
     /// `move |x| y + x`.
-    Value,
+    Value {
+        /// The span of the `move` keyword.
+        move_kw: Span,
+    },
     /// `move` keyword was not specified.
     Ref,
-}
-
-/// The movability of a generator / closure literal:
-/// whether a generator contains self-references, causing it to be `!Unpin`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encodable, Decodable, Debug, Copy)]
-#[derive(HashStable_Generic)]
-pub enum Movability {
-    /// May contain self-references, `!Unpin`.
-    Static,
-    /// Must not contain self-references, `Unpin`.
-    Movable,
 }
 
 /// Closure lifetime binder, `for<'a, 'b>` in `for<'a, 'b> |_: &'a (), _: &'b ()|`.
@@ -1680,7 +1670,7 @@ where
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub struct DelimArgs {
     pub dspan: DelimSpan,
-    pub delim: MacDelimiter,
+    pub delim: Delimiter, // Note: `Delimiter::Invisible` never occurs
     pub tokens: TokenStream,
 }
 
@@ -1688,7 +1678,7 @@ impl DelimArgs {
     /// Whether a macro with these arguments needs a semicolon
     /// when used as a standalone item or statement.
     pub fn need_semicolon(&self) -> bool {
-        !matches!(self, DelimArgs { delim: MacDelimiter::Brace, .. })
+        !matches!(self, DelimArgs { delim: Delimiter::Brace, .. })
     }
 }
 
@@ -1701,32 +1691,6 @@ where
         dspan.hash_stable(ctx, hasher);
         delim.hash_stable(ctx, hasher);
         tokens.hash_stable(ctx, hasher);
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Encodable, Decodable, Debug, HashStable_Generic)]
-pub enum MacDelimiter {
-    Parenthesis,
-    Bracket,
-    Brace,
-}
-
-impl MacDelimiter {
-    pub fn to_token(self) -> Delimiter {
-        match self {
-            MacDelimiter::Parenthesis => Delimiter::Parenthesis,
-            MacDelimiter::Bracket => Delimiter::Bracket,
-            MacDelimiter::Brace => Delimiter::Brace,
-        }
-    }
-
-    pub fn from_token(delim: Delimiter) -> Option<MacDelimiter> {
-        match delim {
-            Delimiter::Parenthesis => Some(MacDelimiter::Parenthesis),
-            Delimiter::Bracket => Some(MacDelimiter::Bracket),
-            Delimiter::Brace => Some(MacDelimiter::Brace),
-            Delimiter::Invisible => None,
-        }
     }
 }
 
@@ -2078,6 +2042,8 @@ pub struct BareFnTy {
 }
 
 /// The various kinds of type recognized by the compiler.
+//
+// Adding a new variant? Please update `test_ty` in `tests/ui/macros/stringify.rs`.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum TyKind {
     /// A variable-length slice (`[T]`).
@@ -2094,6 +2060,10 @@ pub enum TyKind {
     Never,
     /// A tuple (`(A, B, C, D,...)`).
     Tup(ThinVec<P<Ty>>),
+    /// An anonymous struct type i.e. `struct { foo: Type }`
+    AnonStruct(ThinVec<FieldDef>),
+    /// An anonymous union type i.e. `union { bar: Type }`
+    AnonUnion(ThinVec<FieldDef>),
     /// A path (`module::module::...::Type`), optionally
     /// "qualified", e.g., `<Vec<T> as SomeTrait>::SomeType`.
     ///
@@ -2340,7 +2310,12 @@ impl Param {
     /// Builds a `Param` object from `ExplicitSelf`.
     pub fn from_self(attrs: AttrVec, eself: ExplicitSelf, eself_ident: Ident) -> Param {
         let span = eself.span.to(eself_ident.span);
-        let infer_ty = P(Ty { id: DUMMY_NODE_ID, kind: TyKind::ImplicitSelf, span, tokens: None });
+        let infer_ty = P(Ty {
+            id: DUMMY_NODE_ID,
+            kind: TyKind::ImplicitSelf,
+            span: eself_ident.span,
+            tokens: None,
+        });
         let (mutbl, ty) = match eself.node {
             SelfKind::Explicit(ty, mutbl) => (mutbl, ty),
             SelfKind::Value(mutbl) => (mutbl, infer_ty),
@@ -2384,10 +2359,10 @@ pub struct FnDecl {
 
 impl FnDecl {
     pub fn has_self(&self) -> bool {
-        self.inputs.get(0).map_or(false, Param::is_self)
+        self.inputs.get(0).is_some_and(Param::is_self)
     }
     pub fn c_variadic(&self) -> bool {
-        self.inputs.last().map_or(false, |arg| matches!(arg.ty.kind, TyKind::CVarArgs))
+        self.inputs.last().is_some_and(|arg| matches!(arg.ty.kind, TyKind::CVarArgs))
     }
 }
 
@@ -2407,6 +2382,12 @@ pub enum Unsafe {
 
 #[derive(Copy, Clone, Encodable, Decodable, Debug)]
 pub enum Async {
+    Yes { span: Span, closure_id: NodeId, return_impl_trait_id: NodeId },
+    No,
+}
+
+#[derive(Copy, Clone, Encodable, Decodable, Debug)]
+pub enum Gen {
     Yes { span: Span, closure_id: NodeId, return_impl_trait_id: NodeId },
     No,
 }
@@ -2637,6 +2618,15 @@ pub enum AttrKind {
 pub struct NormalAttr {
     pub item: AttrItem,
     pub tokens: Option<LazyAttrTokenStream>,
+}
+
+impl NormalAttr {
+    pub fn from_ident(ident: Ident) -> Self {
+        Self {
+            item: AttrItem { path: Path::from_ident(ident), args: AttrArgs::Empty, tokens: None },
+            tokens: None,
+        }
+    }
 }
 
 #[derive(Clone, Encodable, Decodable, Debug, HashStable_Generic)]
@@ -2920,10 +2910,12 @@ pub struct StaticItem {
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub struct ConstItem {
     pub defaultness: Defaultness,
+    pub generics: Generics,
     pub ty: P<Ty>,
     pub expr: Option<P<Expr>>,
 }
 
+// Adding a new variant? Please update `test_item` in `tests/ui/macros/stringify.rs`.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum ItemKind {
     /// An `extern crate` item, with the optional *original* crate name if the crate was renamed.
@@ -3031,6 +3023,7 @@ impl ItemKind {
         match self {
             Self::Fn(box Fn { generics, .. })
             | Self::TyAlias(box TyAlias { generics, .. })
+            | Self::Const(box ConstItem { generics, .. })
             | Self::Enum(_, generics)
             | Self::Struct(_, generics)
             | Self::Union(_, generics)

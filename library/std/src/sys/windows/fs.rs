@@ -16,8 +16,10 @@ use crate::sys::{c, cvt, Align8};
 use crate::sys_common::{AsInner, FromInner, IntoInner};
 use crate::thread;
 
+use core::ffi::c_void;
+
 use super::path::maybe_verbatim;
-use super::to_u16s;
+use super::{api, to_u16s, IoResult};
 
 pub struct File {
     handle: Handle,
@@ -88,6 +90,14 @@ pub struct FilePermissions {
 pub struct FileTimes {
     accessed: Option<c::FILETIME>,
     modified: Option<c::FILETIME>,
+    created: Option<c::FILETIME>,
+}
+
+impl fmt::Debug for c::FILETIME {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let time = ((self.dwHighDateTime as u64) << 32) | self.dwLowDateTime as u64;
+        f.debug_tuple("FILETIME").field(&time).finish()
+    }
 }
 
 #[derive(Debug)]
@@ -113,7 +123,7 @@ impl Iterator for ReadDir {
             let mut wfd = mem::zeroed();
             loop {
                 if c::FindNextFileW(self.handle.0, &mut wfd) == 0 {
-                    if c::GetLastError() == c::ERROR_NO_MORE_FILES {
+                    if api::get_last_error().code == c::ERROR_NO_MORE_FILES {
                         return None;
                     } else {
                         return Some(Err(Error::last_os_error()));
@@ -290,6 +300,7 @@ impl File {
                 ptr::null_mut(),
             )
         };
+        let handle = unsafe { HandleOrInvalid::from_raw_handle(handle) };
         if let Ok(handle) = handle.try_into() {
             Ok(File { handle: Handle::from_inner(handle) })
         } else {
@@ -307,17 +318,8 @@ impl File {
     }
 
     pub fn truncate(&self, size: u64) -> io::Result<()> {
-        let mut info = c::FILE_END_OF_FILE_INFO { EndOfFile: size as c::LARGE_INTEGER };
-        let size = mem::size_of_val(&info);
-        cvt(unsafe {
-            c::SetFileInformationByHandle(
-                self.handle.as_raw_handle(),
-                c::FileEndOfFileInfo,
-                &mut info as *mut _ as *mut _,
-                size as c::DWORD,
-            )
-        })?;
-        Ok(())
+        let info = c::FILE_END_OF_FILE_INFO { EndOfFile: size as i64 };
+        api::set_file_information_by_handle(self.handle.as_raw_handle(), &info).io_result()
     }
 
     #[cfg(not(target_vendor = "uwp"))]
@@ -362,7 +364,7 @@ impl File {
             cvt(c::GetFileInformationByHandleEx(
                 self.handle.as_raw_handle(),
                 c::FileBasicInfo,
-                &mut info as *mut _ as *mut libc::c_void,
+                &mut info as *mut _ as *mut c_void,
                 size as c::DWORD,
             ))?;
             let mut attr = FileAttr {
@@ -390,7 +392,7 @@ impl File {
             cvt(c::GetFileInformationByHandleEx(
                 self.handle.as_raw_handle(),
                 c::FileStandardInfo,
-                &mut info as *mut _ as *mut libc::c_void,
+                &mut info as *mut _ as *mut c_void,
                 size as c::DWORD,
             ))?;
             attr.file_size = info.AllocationSize as u64;
@@ -501,7 +503,8 @@ impl File {
     }
 
     fn readlink(&self) -> io::Result<PathBuf> {
-        let mut space = Align8([MaybeUninit::<u8>::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE]);
+        let mut space =
+            Align8([MaybeUninit::<u8>::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize]);
         let (_bytes, buf) = self.reparse_point(&mut space)?;
         unsafe {
             let (path_buffer, subst_off, subst_len, relative) = match (*buf).ReparseTag {
@@ -553,28 +556,22 @@ impl File {
     }
 
     pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
-        let mut info = c::FILE_BASIC_INFO {
+        let info = c::FILE_BASIC_INFO {
             CreationTime: 0,
             LastAccessTime: 0,
             LastWriteTime: 0,
             ChangeTime: 0,
             FileAttributes: perm.attrs,
         };
-        let size = mem::size_of_val(&info);
-        cvt(unsafe {
-            c::SetFileInformationByHandle(
-                self.handle.as_raw_handle(),
-                c::FileBasicInfo,
-                &mut info as *mut _ as *mut _,
-                size as c::DWORD,
-            )
-        })?;
-        Ok(())
+        api::set_file_information_by_handle(self.handle.as_raw_handle(), &info).io_result()
     }
 
     pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
         let is_zero = |t: c::FILETIME| t.dwLowDateTime == 0 && t.dwHighDateTime == 0;
-        if times.accessed.map_or(false, is_zero) || times.modified.map_or(false, is_zero) {
+        if times.accessed.map_or(false, is_zero)
+            || times.modified.map_or(false, is_zero)
+            || times.created.map_or(false, is_zero)
+        {
             return Err(io::const_io_error!(
                 io::ErrorKind::InvalidInput,
                 "Cannot set file timestamp to 0",
@@ -582,14 +579,23 @@ impl File {
         }
         let is_max =
             |t: c::FILETIME| t.dwLowDateTime == c::DWORD::MAX && t.dwHighDateTime == c::DWORD::MAX;
-        if times.accessed.map_or(false, is_max) || times.modified.map_or(false, is_max) {
+        if times.accessed.map_or(false, is_max)
+            || times.modified.map_or(false, is_max)
+            || times.created.map_or(false, is_max)
+        {
             return Err(io::const_io_error!(
                 io::ErrorKind::InvalidInput,
                 "Cannot set file timestamp to 0xFFFF_FFFF_FFFF_FFFF",
             ));
         }
         cvt(unsafe {
-            c::SetFileTime(self.as_handle(), None, times.accessed.as_ref(), times.modified.as_ref())
+            let created =
+                times.created.as_ref().map(|a| a as *const c::FILETIME).unwrap_or(ptr::null());
+            let accessed =
+                times.accessed.as_ref().map(|a| a as *const c::FILETIME).unwrap_or(ptr::null());
+            let modified =
+                times.modified.as_ref().map(|a| a as *const c::FILETIME).unwrap_or(ptr::null());
+            c::SetFileTime(self.as_raw_handle(), created, accessed, modified)
         })?;
         Ok(())
     }
@@ -602,7 +608,7 @@ impl File {
             cvt(c::GetFileInformationByHandleEx(
                 self.handle.as_raw_handle(),
                 c::FileBasicInfo,
-                &mut info as *mut _ as *mut libc::c_void,
+                &mut info as *mut _ as *mut c_void,
                 size as c::DWORD,
             ))?;
             Ok(info)
@@ -617,38 +623,20 @@ impl File {
     /// If the operation is not supported for this filesystem or OS version
     /// then errors will be `ERROR_NOT_SUPPORTED` or `ERROR_INVALID_PARAMETER`.
     fn posix_delete(&self) -> io::Result<()> {
-        let mut info = c::FILE_DISPOSITION_INFO_EX {
-            Flags: c::FILE_DISPOSITION_DELETE
-                | c::FILE_DISPOSITION_POSIX_SEMANTICS
-                | c::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
+        let info = c::FILE_DISPOSITION_INFO_EX {
+            Flags: c::FILE_DISPOSITION_FLAG_DELETE
+                | c::FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                | c::FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
         };
-        let size = mem::size_of_val(&info);
-        cvt(unsafe {
-            c::SetFileInformationByHandle(
-                self.handle.as_raw_handle(),
-                c::FileDispositionInfoEx,
-                &mut info as *mut _ as *mut _,
-                size as c::DWORD,
-            )
-        })?;
-        Ok(())
+        api::set_file_information_by_handle(self.handle.as_raw_handle(), &info).io_result()
     }
 
     /// Delete a file using win32 semantics. The file won't actually be deleted
     /// until all file handles are closed. However, marking a file for deletion
     /// will prevent anyone from opening a new handle to the file.
     fn win32_delete(&self) -> io::Result<()> {
-        let mut info = c::FILE_DISPOSITION_INFO { DeleteFile: c::TRUE as _ };
-        let size = mem::size_of_val(&info);
-        cvt(unsafe {
-            c::SetFileInformationByHandle(
-                self.handle.as_raw_handle(),
-                c::FileDispositionInfo,
-                &mut info as *mut _ as *mut _,
-                size as c::DWORD,
-            )
-        })?;
-        Ok(())
+        let info = c::FILE_DISPOSITION_INFO { DeleteFile: c::TRUE as _ };
+        api::set_file_information_by_handle(self.handle.as_raw_handle(), &info).io_result()
     }
 
     /// Fill the given buffer with as many directory entries as will fit.
@@ -791,15 +779,15 @@ fn open_link_no_reparse(parent: &File, name: &[u16], access: u32) -> io::Result<
     // See https://docs.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntcreatefile
     unsafe {
         let mut handle = ptr::null_mut();
-        let mut io_status = c::IO_STATUS_BLOCK::default();
-        let name_str = c::UNICODE_STRING::from_ref(name);
+        let mut io_status = c::IO_STATUS_BLOCK::PENDING;
+        let mut name_str = c::UNICODE_STRING::from_ref(name);
         use crate::sync::atomic::{AtomicU32, Ordering};
         // The `OBJ_DONT_REPARSE` attribute ensures that we haven't been
         // tricked into following a symlink. However, it may not be available in
         // earlier versions of Windows.
         static ATTRIBUTES: AtomicU32 = AtomicU32::new(c::OBJ_DONT_REPARSE);
-        let object = c::OBJECT_ATTRIBUTES {
-            ObjectName: &name_str,
+        let mut object = c::OBJECT_ATTRIBUTES {
+            ObjectName: &mut name_str,
             RootDirectory: parent.as_raw_handle(),
             Attributes: ATTRIBUTES.load(Ordering::Relaxed),
             ..c::OBJECT_ATTRIBUTES::default()
@@ -807,7 +795,7 @@ fn open_link_no_reparse(parent: &File, name: &[u16], access: u32) -> io::Result<
         let status = c::NtCreateFile(
             &mut handle,
             access,
-            &object,
+            &mut object,
             &mut io_status,
             crate::ptr::null_mut(),
             0,
@@ -993,6 +981,10 @@ impl FileTimes {
     pub fn set_modified(&mut self, t: SystemTime) {
         self.modified = Some(t.into_inner());
     }
+
+    pub fn set_created(&mut self, t: SystemTime) {
+        self.created = Some(t.into_inner());
+    }
 }
 
 impl FileType {
@@ -1038,6 +1030,14 @@ impl DirBuilder {
 }
 
 pub fn readdir(p: &Path) -> io::Result<ReadDir> {
+    // We push a `*` to the end of the path which cause the empty path to be
+    // treated as the current directory. So, for consistency with other platforms,
+    // we explicitly error on the empty path.
+    if p.as_os_str().is_empty() {
+        // Return an error code consistent with other ways of opening files.
+        // E.g. fs::metadata or File::open.
+        return Err(io::Error::from_raw_os_error(c::ERROR_PATH_NOT_FOUND as i32));
+    }
     let root = p.to_path_buf();
     let star = p.join("*");
     let path = maybe_verbatim(&star)?;
@@ -1368,7 +1368,7 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
         _dwCallbackReason: c::DWORD,
         _hSourceFile: c::HANDLE,
         _hDestinationFile: c::HANDLE,
-        lpData: c::LPVOID,
+        lpData: c::LPCVOID,
     ) -> c::DWORD {
         if dwStreamNumber == 1 {
             *(lpData as *mut i64) = StreamBytesTransferred;
@@ -1415,9 +1415,10 @@ fn symlink_junction_inner(original: &Path, junction: &Path) -> io::Result<()> {
     let f = File::open(junction, &opts)?;
     let h = f.as_inner().as_raw_handle();
     unsafe {
-        let mut data = Align8([MaybeUninit::<u8>::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE]);
+        let mut data =
+            Align8([MaybeUninit::<u8>::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize]);
         let data_ptr = data.0.as_mut_ptr();
-        let data_end = data_ptr.add(c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+        let data_end = data_ptr.add(c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize);
         let db = data_ptr.cast::<c::REPARSE_MOUNTPOINT_DATA_BUFFER>();
         // Zero the header to ensure it's fully initialized, including reserved parameters.
         *db = mem::zeroed();
@@ -1485,6 +1486,13 @@ pub fn try_exists(path: &Path) -> io::Result<bool> {
             // another process. This is often temporary so we simply report it
             // as the file existing.
             _ if e.raw_os_error() == Some(c::ERROR_SHARING_VIOLATION as i32) => Ok(true),
+
+            // `ERROR_CANT_ACCESS_FILE` means that a file exists but that the
+            // reparse point could not be handled by `CreateFile`.
+            // This can happen for special files such as:
+            // * Unix domain sockets which you need to `connect` to
+            // * App exec links which require using `CreateProcess`
+            _ if e.raw_os_error() == Some(c::ERROR_CANT_ACCESS_FILE as i32) => Ok(true),
 
             // Other errors such as `ERROR_ACCESS_DENIED` may indicate that the
             // file exists. However, these types of errors are usually more

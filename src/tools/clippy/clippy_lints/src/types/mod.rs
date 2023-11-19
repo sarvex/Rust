@@ -18,7 +18,7 @@ use rustc_hir::{
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::def_id::LocalDefId;
-use rustc_span::source_map::Span;
+use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -64,7 +64,7 @@ declare_clippy_lint! {
     /// 1st comment).
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// struct X {
     ///     values: Vec<Box<i32>>,
     /// }
@@ -72,7 +72,7 @@ declare_clippy_lint! {
     ///
     /// Better:
     ///
-    /// ```rust
+    /// ```no_run
     /// struct X {
     ///     values: Vec<i32>,
     /// }
@@ -97,7 +97,7 @@ declare_clippy_lint! {
     /// consider a custom `enum` instead, with clear names for each case.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn get_data() -> Option<Option<u32>> {
     ///     None
     /// }
@@ -105,7 +105,7 @@ declare_clippy_lint! {
     ///
     /// Better:
     ///
-    /// ```rust
+    /// ```no_run
     /// pub enum Contents {
     ///     Data(Vec<u8>), // Was Some(Some(Vec<u8>))
     ///     NotYetFetched, // Was Some(None)
@@ -152,7 +152,7 @@ declare_clippy_lint! {
     /// `LinkedList` makes sense are few and far between, but they can still happen.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # use std::collections::LinkedList;
     /// let x: LinkedList<usize> = LinkedList::new();
     /// ```
@@ -197,14 +197,14 @@ declare_clippy_lint! {
     /// `Arc<Arc<T>>`, `Arc<Box<T>>`, `Box<&T>`, `Box<Rc<T>>`, `Box<Arc<T>>`, `Box<Box<T>>`, add an unnecessary level of indirection.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # use std::rc::Rc;
     /// fn foo(bar: Rc<&usize>) {}
     /// ```
     ///
     /// Better:
     ///
-    /// ```rust
+    /// ```no_run
     /// fn foo(bar: &usize) {}
     /// ```
     #[clippy::version = "1.44.0"]
@@ -258,7 +258,7 @@ declare_clippy_lint! {
     /// using a `type` definition to simplify them.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # use std::rc::Rc;
     /// struct Foo {
     ///     inner: Rc<Vec<Vec<Box<(u32, u32, u32, u32)>>>>,
@@ -315,7 +315,7 @@ impl<'tcx> LateLintPass<'tcx> for Types {
     fn check_fn(
         &mut self,
         cx: &LateContext<'_>,
-        _: FnKind<'_>,
+        fn_kind: FnKind<'_>,
         decl: &FnDecl<'_>,
         _: &Body<'_>,
         _: Span,
@@ -340,6 +340,7 @@ impl<'tcx> LateLintPass<'tcx> for Types {
             CheckTyContext {
                 is_in_trait_impl,
                 is_exported,
+                in_body: matches!(fn_kind, FnKind::Closure),
                 ..CheckTyContext::default()
             },
         );
@@ -349,7 +350,7 @@ impl<'tcx> LateLintPass<'tcx> for Types {
         let is_exported = cx.effective_visibilities.is_exported(item.owner_id.def_id);
 
         match item.kind {
-            ItemKind::Static(ty, _, _) | ItemKind::Const(ty, _) => self.check_ty(
+            ItemKind::Static(ty, _, _) | ItemKind::Const(ty, _, _) => self.check_ty(
                 cx,
                 ty,
                 CheckTyContext {
@@ -427,7 +428,7 @@ impl<'tcx> LateLintPass<'tcx> for Types {
                 cx,
                 ty,
                 CheckTyContext {
-                    is_local: true,
+                    in_body: true,
                     ..CheckTyContext::default()
                 },
             );
@@ -481,7 +482,7 @@ impl Types {
         }
 
         match hir_ty.kind {
-            TyKind::Path(ref qpath) if !context.is_local => {
+            TyKind::Path(ref qpath) if !context.in_body => {
                 let hir_id = hir_ty.hir_id;
                 let res = cx.qpath_res(qpath, hir_id);
                 if let Some(def_id) = res.opt_def_id() {
@@ -489,7 +490,7 @@ impl Types {
                         // All lints that are being checked in this block are guarded by
                         // the `avoid_breaking_exported_api` configuration. When adding a
                         // new lint, please also add the name to the configuration documentation
-                        // in `clippy_lints::utils::conf.rs`
+                        // in `clippy_config::conf`
 
                         let mut triggered = false;
                         triggered |= box_collection::check(cx, hir_ty, qpath, def_id);
@@ -577,12 +578,12 @@ impl Types {
     }
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[allow(clippy::struct_excessive_bools, clippy::struct_field_names)]
 #[derive(Clone, Copy, Default)]
 struct CheckTyContext {
     is_in_trait_impl: bool,
-    /// `true` for types on local variables.
-    is_local: bool,
+    /// `true` for types on local variables and in closure signatures.
+    in_body: bool,
     /// `true` for types that are part of the public API.
     is_exported: bool,
     is_nested_call: bool,

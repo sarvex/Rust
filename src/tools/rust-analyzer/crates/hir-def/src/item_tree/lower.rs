@@ -1,6 +1,6 @@
 //! AST -> `ItemTree` lowering code.
 
-use std::{collections::hash_map::Entry, sync::Arc};
+use std::collections::hash_map::Entry;
 
 use hir_expand::{ast_id_map::AstIdMap, hygiene::Hygiene, HirFileId};
 use syntax::ast::{self, HasModuleItem, HasTypeBounds};
@@ -20,7 +20,7 @@ pub(super) struct Ctx<'a> {
     db: &'a dyn DefDatabase,
     tree: ItemTree,
     source_ast_id_map: Arc<AstIdMap>,
-    body_ctx: crate::body::LowerCtx<'a>,
+    body_ctx: crate::lower::LowerCtx<'a>,
 }
 
 impl<'a> Ctx<'a> {
@@ -29,7 +29,7 @@ impl<'a> Ctx<'a> {
             db,
             tree: ItemTree::default(),
             source_ast_id_map: db.ast_id_map(file),
-            body_ctx: crate::body::LowerCtx::new(db, file),
+            body_ctx: crate::lower::LowerCtx::with_file_id(db, file),
         }
     }
 
@@ -77,6 +77,9 @@ impl<'a> Ctx<'a> {
     }
 
     pub(super) fn lower_block(mut self, block: &ast::BlockExpr) -> ItemTree {
+        self.tree
+            .attrs
+            .insert(AttrOwner::TopLevel, RawAttrs::new(self.db.upcast(), block, self.hygiene()));
         self.tree.top_level = block
             .statements()
             .filter_map(|stmt| match stmt {
@@ -292,8 +295,12 @@ impl<'a> Ctx<'a> {
                         }
                     }
                 };
-                let ty = Interned::new(self_type);
-                let idx = self.data().params.alloc(Param::Normal(None, ty));
+                let type_ref = Interned::new(self_type);
+                let ast_id = self.source_ast_id_map.ast_id(&self_param);
+                let idx = self.data().params.alloc(Param {
+                    type_ref: Some(type_ref),
+                    ast_id: ParamAstId::SelfParam(ast_id),
+                });
                 self.add_attrs(
                     idx.into(),
                     RawAttrs::new(self.db.upcast(), &self_param, self.hygiene()),
@@ -302,23 +309,19 @@ impl<'a> Ctx<'a> {
             }
             for param in param_list.params() {
                 let idx = match param.dotdotdot_token() {
-                    Some(_) => self.data().params.alloc(Param::Varargs),
+                    Some(_) => {
+                        let ast_id = self.source_ast_id_map.ast_id(&param);
+                        self.data()
+                            .params
+                            .alloc(Param { type_ref: None, ast_id: ParamAstId::Param(ast_id) })
+                    }
                     None => {
                         let type_ref = TypeRef::from_ast_opt(&self.body_ctx, param.ty());
                         let ty = Interned::new(type_ref);
-                        let mut pat = param.pat();
-                        // FIXME: This really shouldn't be here, in fact FunctionData/ItemTree's function shouldn't know about
-                        // pattern names at all
-                        let name = 'name: loop {
-                            match pat {
-                                Some(ast::Pat::RefPat(ref_pat)) => pat = ref_pat.pat(),
-                                Some(ast::Pat::IdentPat(ident)) => {
-                                    break 'name ident.name().map(|it| it.as_name())
-                                }
-                                _ => break 'name None,
-                            }
-                        };
-                        self.data().params.alloc(Param::Normal(name, ty))
+                        let ast_id = self.source_ast_id_map.ast_id(&param);
+                        self.data()
+                            .params
+                            .alloc(Param { type_ref: Some(ty), ast_id: ParamAstId::Param(ast_id) })
                     }
                 };
                 self.add_attrs(idx.into(), RawAttrs::new(self.db.upcast(), &param, self.hygiene()));
@@ -336,13 +339,12 @@ impl<'a> Ctx<'a> {
             None => TypeRef::unit(),
         };
 
-        let (ret_type, async_ret_type) = if func.async_token().is_some() {
-            let async_ret_type = ret_type.clone();
+        let ret_type = if func.async_token().is_some() {
             let future_impl = desugar_future_path(ret_type);
             let ty_bound = Interned::new(TypeBound::Path(future_impl, TraitBoundModifier::None));
-            (TypeRef::ImplTrait(vec![ty_bound]), Some(async_ret_type))
+            TypeRef::ImplTrait(vec![ty_bound])
         } else {
-            (ret_type, None)
+            ret_type
         };
 
         let abi = func.abi().map(lower_abi);
@@ -376,7 +378,6 @@ impl<'a> Ctx<'a> {
             abi,
             params,
             ret_type: Interned::new(ret_type),
-            async_ret_type: async_ret_type.map(Interned::new),
             ast_id,
             flags,
         };
@@ -395,14 +396,7 @@ impl<'a> Ctx<'a> {
         let bounds = self.lower_type_bounds(type_alias);
         let generic_params = self.lower_generic_params(HasImplicitSelf::No, type_alias);
         let ast_id = self.source_ast_id_map.ast_id(type_alias);
-        let res = TypeAlias {
-            name,
-            visibility,
-            bounds: bounds.into_boxed_slice(),
-            generic_params,
-            type_ref,
-            ast_id,
-        };
+        let res = TypeAlias { name, visibility, bounds, generic_params, type_ref, ast_id };
         Some(id(self.data().type_aliases.alloc(res)))
     }
 
@@ -498,6 +492,7 @@ impl<'a> Ctx<'a> {
         let target_trait = impl_def.trait_().and_then(|tr| self.lower_trait_ref(&tr));
         let self_ty = self.lower_type_ref(&impl_def.self_ty()?);
         let is_negative = impl_def.excl_token().is_some();
+        let is_unsafe = impl_def.unsafe_token().is_some();
 
         // We cannot use `assoc_items()` here as that does not include macro calls.
         let items = impl_def
@@ -512,17 +507,18 @@ impl<'a> Ctx<'a> {
             })
             .collect();
         let ast_id = self.source_ast_id_map.ast_id(impl_def);
-        let res = Impl { generic_params, target_trait, self_ty, is_negative, items, ast_id };
+        let res =
+            Impl { generic_params, target_trait, self_ty, is_negative, is_unsafe, items, ast_id };
         Some(id(self.data().impls.alloc(res)))
     }
 
-    fn lower_use(&mut self, use_item: &ast::Use) -> Option<FileItemTreeId<Import>> {
+    fn lower_use(&mut self, use_item: &ast::Use) -> Option<FileItemTreeId<Use>> {
         let visibility = self.lower_visibility(use_item);
         let ast_id = self.source_ast_id_map.ast_id(use_item);
         let (use_tree, _) = lower_use_tree(self.db, self.hygiene(), use_item.use_tree()?)?;
 
-        let res = Import { visibility, ast_id, use_tree };
-        Some(id(self.data().imports.alloc(res)))
+        let res = Use { visibility, ast_id, use_tree };
+        Some(id(self.data().uses.alloc(res)))
     }
 
     fn lower_extern_crate(
@@ -616,19 +612,33 @@ impl<'a> Ctx<'a> {
             generics.fill_bounds(&self.body_ctx, bounds, Either::Left(self_param));
         }
 
-        generics.fill(&self.body_ctx, node);
+        let add_param_attrs = |item, param| {
+            let attrs = RawAttrs::new(self.db.upcast(), &param, self.body_ctx.hygiene());
+            // This is identical to the body of `Ctx::add_attrs()` but we can't call that here
+            // because it requires `&mut self` and the call to `generics.fill()` below also
+            // references `self`.
+            match self.tree.attrs.entry(item) {
+                Entry::Occupied(mut entry) => {
+                    *entry.get_mut() = entry.get().merge(attrs);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(attrs);
+                }
+            }
+        };
+        generics.fill(&self.body_ctx, node, add_param_attrs);
 
         generics.shrink_to_fit();
         Interned::new(generics)
     }
 
-    fn lower_type_bounds(&mut self, node: &dyn ast::HasTypeBounds) -> Vec<Interned<TypeBound>> {
+    fn lower_type_bounds(&mut self, node: &dyn ast::HasTypeBounds) -> Box<[Interned<TypeBound>]> {
         match node.type_bound_list() {
             Some(bound_list) => bound_list
                 .bounds()
                 .map(|it| Interned::new(TypeBound::from_ast(&self.body_ctx, it)))
                 .collect(),
-            None => Vec::new(),
+            None => Box::default(),
         }
     }
 
@@ -777,7 +787,7 @@ impl UseTreeLowering<'_> {
     }
 }
 
-pub(super) fn lower_use_tree(
+pub(crate) fn lower_use_tree(
     db: &dyn DefDatabase,
     hygiene: &Hygiene,
     tree: ast::UseTree,

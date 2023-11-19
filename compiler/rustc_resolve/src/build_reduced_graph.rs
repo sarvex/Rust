@@ -6,15 +6,12 @@
 //! Imports are also considered items and placed into modules here, but not resolved yet.
 
 use crate::def_collector::collect_definitions;
-use crate::imports::{Import, ImportKind};
+use crate::imports::{ImportData, ImportKind};
 use crate::macros::{MacroRulesBinding, MacroRulesScope, MacroRulesScopeRef};
 use crate::Namespace::{self, MacroNS, TypeNS, ValueNS};
-use crate::{
-    errors, Determinacy, ExternPreludeEntry, Finalize, Module, ModuleKind, ModuleOrUniformRoot,
-};
-use crate::{
-    MacroData, NameBinding, NameBindingKind, ParentScope, PathResult, PerNS, ResolutionError,
-};
+use crate::{errors, BindingKey, MacroData, NameBindingData};
+use crate::{Determinacy, ExternPreludeEntry, Finalize, Module, ModuleKind, ModuleOrUniformRoot};
+use crate::{NameBinding, NameBindingKind, ParentScope, PathResult, PerNS, ResolutionError};
 use crate::{Resolver, ResolverArenas, Segment, ToNameBinding, VisResolutionError};
 
 use rustc_ast::visit::{self, AssocCtxt, Visitor};
@@ -34,17 +31,17 @@ use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::Span;
 
 use std::cell::Cell;
-use std::ptr;
 
 type Res = def::Res<NodeId>;
 
 impl<'a, Id: Into<DefId>> ToNameBinding<'a>
     for (Module<'a>, ty::Visibility<Id>, Span, LocalExpnId)
 {
-    fn to_name_binding(self, arenas: &'a ResolverArenas<'a>) -> &'a NameBinding<'a> {
-        arenas.alloc_name_binding(NameBinding {
+    fn to_name_binding(self, arenas: &'a ResolverArenas<'a>) -> NameBinding<'a> {
+        arenas.alloc_name_binding(NameBindingData {
             kind: NameBindingKind::Module(self.0),
             ambiguity: None,
+            warn_ambiguity: false,
             vis: self.1.to_def_id(),
             span: self.2,
             expansion: self.3,
@@ -53,10 +50,11 @@ impl<'a, Id: Into<DefId>> ToNameBinding<'a>
 }
 
 impl<'a, Id: Into<DefId>> ToNameBinding<'a> for (Res, ty::Visibility<Id>, Span, LocalExpnId) {
-    fn to_name_binding(self, arenas: &'a ResolverArenas<'a>) -> &'a NameBinding<'a> {
-        arenas.alloc_name_binding(NameBinding {
+    fn to_name_binding(self, arenas: &'a ResolverArenas<'a>) -> NameBinding<'a> {
+        arenas.alloc_name_binding(NameBindingData {
             kind: NameBindingKind::Res(self.0),
             ambiguity: None,
+            warn_ambiguity: false,
             vis: self.1.to_def_id(),
             span: self.2,
             expansion: self.3,
@@ -72,9 +70,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         T: ToNameBinding<'a>,
     {
         let binding = def.to_name_binding(self.arenas);
-        let key = self.new_key(ident, ns);
-        if let Err(old_binding) = self.try_define(parent, key, binding) {
-            self.report_conflict(parent, ident, ns, old_binding, &binding);
+        let key = self.new_disambiguated_key(ident, ns);
+        if let Err(old_binding) = self.try_define(parent, key, binding, false) {
+            self.report_conflict(parent, ident, ns, old_binding, binding);
         }
     }
 
@@ -132,7 +130,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                     expn_id,
                     self.def_span(def_id),
                     // FIXME: Account for `#[no_implicit_prelude]` attributes.
-                    parent.map_or(false, |module| module.no_implicit_prelude),
+                    parent.is_some_and(|module| module.no_implicit_prelude),
                 ));
             }
         }
@@ -145,8 +143,8 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             Some(def_id) => self.macro_def_scope(def_id),
             None => expn_id
                 .as_local()
-                .and_then(|expn_id| self.ast_transform_scopes.get(&expn_id))
-                .unwrap_or(&self.graph_root),
+                .and_then(|expn_id| self.ast_transform_scopes.get(&expn_id).copied())
+                .unwrap_or(self.graph_root),
         }
     }
 
@@ -173,7 +171,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             return macro_data.clone();
         }
 
-        let load_macro_untracked = self.cstore().load_macro_untracked(def_id, &self.tcx.sess);
+        let load_macro_untracked = self.cstore().load_macro_untracked(def_id, self.tcx);
         let (ext, macro_rules) = match load_macro_untracked {
             LoadedMacro::MacroDef(item, edition) => (
                 Lrc::new(self.compile_macro(&item, edition).0),
@@ -249,8 +247,6 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
                 })
             }
             ast::VisibilityKind::Restricted { ref path, id, .. } => {
-                // Make `PRIVATE_IN_PUBLIC` lint a hard error.
-                self.r.has_pub_restricted = true;
                 // For visibilities we are not ready to provide correct implementation of "uniform
                 // paths" right now, so on 2018 edition we only allow module-relative paths for now.
                 // On 2015 edition visibilities are resolved as crate-relative by default,
@@ -280,7 +276,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
                 };
                 match self.r.resolve_path(
                     &segments,
-                    Some(TypeNS),
+                    None,
                     parent_scope,
                     finalize.then(|| Finalize::new(id, path.span)),
                     None,
@@ -357,7 +353,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
         vis: ty::Visibility,
     ) {
         let current_module = self.parent_scope.module;
-        let import = self.r.arenas.alloc_import(Import {
+        let import = self.r.arenas.alloc_import(ImportData {
             kind,
             parent_scope: self.parent_scope,
             module_path,
@@ -379,9 +375,9 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
             ImportKind::Single { target, type_ns_only, .. } => {
                 self.r.per_ns(|this, ns| {
                     if !type_ns_only || ns == TypeNS {
-                        let key = this.new_key(target, ns);
+                        let key = BindingKey::new(target, ns);
                         let mut resolution = this.resolution(current_module, key).borrow_mut();
-                        resolution.add_single_import(import);
+                        resolution.single_imports.insert(import);
                     }
                 });
             }
@@ -851,7 +847,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
             (used, Some(ModuleOrUniformRoot::Module(module)), binding)
         })
         .unwrap_or((true, None, self.r.dummy_binding));
-        let import = self.r.arenas.alloc_import(Import {
+        let import = self.r.arenas.alloc_import(ImportData {
             kind: ImportKind::ExternCrate { source: orig_name, target: ident, id: item.id },
             root_id: item.id,
             parent_scope: self.parent_scope,
@@ -867,21 +863,27 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
         });
         self.r.potentially_unused_imports.push(import);
         let imported_binding = self.r.import(binding, import);
-        if ptr::eq(parent, self.r.graph_root) {
+        if parent == self.r.graph_root {
             if let Some(entry) = self.r.extern_prelude.get(&ident.normalize_to_macros_2_0()) {
-                if expansion != LocalExpnId::ROOT
-                    && orig_name.is_some()
-                    && entry.extern_crate_item.is_none()
-                {
+                if expansion != LocalExpnId::ROOT && orig_name.is_some() && !entry.is_import() {
                     let msg = "macro-expanded `extern crate` items cannot \
                                        shadow names passed with `--extern`";
                     self.r.tcx.sess.span_err(item.span, msg);
+                    // `return` is intended to discard this binding because it's an
+                    // unregistered ambiguity error which would result in a panic
+                    // caused by inconsistency `path_res`
+                    // more details: https://github.com/rust-lang/rust/pull/111761
+                    return;
                 }
             }
-            let entry = self.r.extern_prelude.entry(ident.normalize_to_macros_2_0()).or_insert(
-                ExternPreludeEntry { extern_crate_item: None, introduced_by_item: true },
-            );
-            entry.extern_crate_item = Some(imported_binding);
+            let entry = self
+                .r
+                .extern_prelude
+                .entry(ident.normalize_to_macros_2_0())
+                .or_insert(ExternPreludeEntry { binding: None, introduced_by_item: true });
+            // Binding from `extern crate` item in source code can replace
+            // a binding from `--extern` on command line here.
+            entry.binding = Some(imported_binding);
             if orig_name.is_some() {
                 entry.introduced_by_item = true;
             }
@@ -948,7 +950,6 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
                 | DefKind::TyAlias
                 | DefKind::ForeignTy
                 | DefKind::OpaqueTy
-                | DefKind::ImplTraitPlaceholder
                 | DefKind::TraitAlias
                 | DefKind::AssocTy,
                 _,
@@ -980,7 +981,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
                 | DefKind::GlobalAsm
                 | DefKind::Closure
                 | DefKind::Impl { .. }
-                | DefKind::Generator,
+                | DefKind::Coroutine,
                 _,
             )
             | Res::Local(..)
@@ -994,12 +995,12 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
     fn add_macro_use_binding(
         &mut self,
         name: Symbol,
-        binding: &'a NameBinding<'a>,
+        binding: NameBinding<'a>,
         span: Span,
         allow_shadowing: bool,
     ) {
         if self.r.macro_use_prelude.insert(name, binding).is_some() && !allow_shadowing {
-            let msg = format!("`{}` is already in scope", name);
+            let msg = format!("`{name}` is already in scope");
             let note =
                 "macro-expanded `#[macro_use]`s may not shadow existing macros (see RFC 1560)";
             self.r.tcx.sess.struct_span_err(span, msg).note(note).emit();
@@ -1056,7 +1057,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
         }
 
         let macro_use_import = |this: &Self, span| {
-            this.r.arenas.alloc_import(Import {
+            this.r.arenas.alloc_import(ImportData {
                 kind: ImportKind::MacroUse,
                 root_id: item.id,
                 parent_scope: this.parent_scope,
@@ -1226,7 +1227,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
             self.r.set_binding_parent_module(binding, parent_scope.module);
             self.r.all_macro_rules.insert(ident.name, res);
             if is_macro_export {
-                let import = self.r.arenas.alloc_import(Import {
+                let import = self.r.arenas.alloc_import(ImportData {
                     kind: ImportKind::MacroExport,
                     root_id: item.id,
                     parent_scope: self.parent_scope,
@@ -1235,7 +1236,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
                     use_span_with_attributes: span,
                     use_span: span,
                     root_span: span,
-                    span: span,
+                    span,
                     module_path: Vec::new(),
                     vis: Cell::new(Some(vis)),
                     used: Cell::new(true),

@@ -1,15 +1,14 @@
 // check-pass
-// [next] compile-flags: -Zlower-impl-trait-in-trait-to-assoc-ty
-// revisions: current next
 
-#![feature(return_position_impl_trait_in_trait)]
+#![feature(lint_reasons)]
 #![allow(incomplete_features)]
 
-trait Foo {
+pub trait Foo {
     fn f() -> Box<impl Sized>;
 }
 
 impl Foo for () {
+    #[expect(refining_impl_trait)]
     fn f() -> Box<String> {
         Box::new(String::new())
     }

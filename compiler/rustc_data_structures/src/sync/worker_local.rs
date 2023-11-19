@@ -1,4 +1,4 @@
-use crate::sync::Lock;
+use parking_lot::Mutex;
 use std::cell::Cell;
 use std::cell::OnceCell;
 use std::ops::Deref;
@@ -6,7 +6,7 @@ use std::ptr;
 use std::sync::Arc;
 
 #[cfg(parallel_compiler)]
-use {crate::cold_path, crate::sync::CacheAligned};
+use {crate::outline, crate::sync::CacheAligned};
 
 /// A pointer to the `RegistryData` which uniquely identifies a registry.
 /// This identifier can be reused if the registry gets freed.
@@ -25,17 +25,13 @@ impl RegistryId {
     fn verify(self) -> usize {
         let (id, index) = THREAD_DATA.with(|data| (data.registry_id.get(), data.index.get()));
 
-        if id == self {
-            index
-        } else {
-            cold_path(|| panic!("Unable to verify registry association"))
-        }
+        if id == self { index } else { outline(|| panic!("Unable to verify registry association")) }
     }
 }
 
 struct RegistryData {
     thread_limit: usize,
-    threads: Lock<usize>,
+    threads: Mutex<usize>,
 }
 
 /// Represents a list of threads which can access worker locals.
@@ -65,7 +61,7 @@ thread_local! {
 impl Registry {
     /// Creates a registry which can hold up to `thread_limit` threads.
     pub fn new(thread_limit: usize) -> Self {
-        Registry(Arc::new(RegistryData { thread_limit, threads: Lock::new(0) }))
+        Registry(Arc::new(RegistryData { thread_limit, threads: Mutex::new(0) }))
     }
 
     /// Gets the registry associated with the current thread. Panics if there's no such registry.
@@ -116,7 +112,7 @@ pub struct WorkerLocal<T> {
 
 // This is safe because the `deref` call will return a reference to a `T` unique to each thread
 // or it will panic for threads without an associated local. So there isn't a need for `T` to do
-// it's own synchronization. The `verify` method on `RegistryId` has an issue where the the id
+// it's own synchronization. The `verify` method on `RegistryId` has an issue where the id
 // can be reused, but `WorkerLocal` has a reference to `Registry` which will prevent any reuse.
 #[cfg(parallel_compiler)]
 unsafe impl<T: Send> Sync for WorkerLocal<T> {}
@@ -154,13 +150,6 @@ impl<T> WorkerLocal<T> {
     }
 }
 
-impl<T> WorkerLocal<Vec<T>> {
-    /// Joins the elements of all the worker locals into one Vec
-    pub fn join(self) -> Vec<T> {
-        self.into_inner().into_iter().flat_map(|v| v).collect()
-    }
-}
-
 impl<T> Deref for WorkerLocal<T> {
     type Target = T;
 
@@ -176,5 +165,11 @@ impl<T> Deref for WorkerLocal<T> {
         // This is safe because `verify` will only return values less than
         // `self.registry.thread_limit` which is the size of the `self.locals` array.
         unsafe { &self.locals.get_unchecked(self.registry.id().verify()).0 }
+    }
+}
+
+impl<T: Default> Default for WorkerLocal<T> {
+    fn default() -> Self {
+        WorkerLocal::new(|_| T::default())
     }
 }

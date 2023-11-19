@@ -13,9 +13,11 @@ use crate::infer::region_constraints::VerifyIfEq;
 
 /// Given a "verify-if-eq" type test like:
 ///
-///     exists<'a...> {
-///         verify_if_eq(some_type, bound_region)
-///     }
+/// ```rust,ignore (pseudo-Rust)
+/// exists<'a...> {
+///     verify_if_eq(some_type, bound_region)
+/// }
+/// ```
 ///
 /// and the type `test_ty` that the type test is being tested against,
 /// returns:
@@ -42,11 +44,11 @@ pub fn extract_verify_if_eq<'tcx>(
     test_ty: Ty<'tcx>,
 ) -> Option<ty::Region<'tcx>> {
     assert!(!verify_if_eq_b.has_escaping_bound_vars());
-    let mut m = Match::new(tcx, param_env);
+    let mut m = MatchAgainstHigherRankedOutlives::new(tcx, param_env);
     let verify_if_eq = verify_if_eq_b.skip_binder();
     m.relate(verify_if_eq.ty, test_ty).ok()?;
 
-    if let ty::RegionKind::ReLateBound(depth, br) = verify_if_eq.bound.kind() {
+    if let ty::RegionKind::ReBound(depth, br) = verify_if_eq.bound.kind() {
         assert!(depth == ty::INNERMOST);
         match m.map.get(&br) {
             Some(&r) => Some(r),
@@ -85,24 +87,32 @@ pub(super) fn can_match_erased_ty<'tcx>(
         // pointless micro-optimization
         true
     } else {
-        Match::new(tcx, param_env).relate(outlives_ty, erased_ty).is_ok()
+        MatchAgainstHigherRankedOutlives::new(tcx, param_env).relate(outlives_ty, erased_ty).is_ok()
     }
 }
 
-struct Match<'tcx> {
+struct MatchAgainstHigherRankedOutlives<'tcx> {
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     pattern_depth: ty::DebruijnIndex,
     map: FxHashMap<ty::BoundRegion, ty::Region<'tcx>>,
 }
 
-impl<'tcx> Match<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, param_env: ty::ParamEnv<'tcx>) -> Match<'tcx> {
-        Match { tcx, param_env, pattern_depth: ty::INNERMOST, map: FxHashMap::default() }
+impl<'tcx> MatchAgainstHigherRankedOutlives<'tcx> {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+    ) -> MatchAgainstHigherRankedOutlives<'tcx> {
+        MatchAgainstHigherRankedOutlives {
+            tcx,
+            param_env,
+            pattern_depth: ty::INNERMOST,
+            map: FxHashMap::default(),
+        }
     }
 }
 
-impl<'tcx> Match<'tcx> {
+impl<'tcx> MatchAgainstHigherRankedOutlives<'tcx> {
     /// Creates the "Error" variant that signals "no match".
     fn no_match<T>(&self) -> RelateResult<'tcx, T> {
         Err(TypeError::Mismatch)
@@ -132,7 +142,7 @@ impl<'tcx> Match<'tcx> {
     }
 }
 
-impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
+impl<'tcx> TypeRelation<'tcx> for MatchAgainstHigherRankedOutlives<'tcx> {
     fn tag(&self) -> &'static str {
         "Match"
     }
@@ -155,7 +165,7 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
         a: T,
         b: T,
     ) -> RelateResult<'tcx, T> {
-        // Opaque types substs have lifetime parameters.
+        // Opaque types args have lifetime parameters.
         // We must not check them to be equal, as we never insert anything to make them so.
         if variance != ty::Bivariant { self.relate(a, b) } else { Ok(a) }
     }
@@ -167,7 +177,9 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
         value: ty::Region<'tcx>,
     ) -> RelateResult<'tcx, ty::Region<'tcx>> {
         debug!("self.pattern_depth = {:?}", self.pattern_depth);
-        if let ty::RegionKind::ReLateBound(depth, br) = pattern.kind() && depth == self.pattern_depth {
+        if let ty::RegionKind::ReBound(depth, br) = pattern.kind()
+            && depth == self.pattern_depth
+        {
             self.bind(br, value)
         } else if pattern == value {
             Ok(pattern)
@@ -185,7 +197,7 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
         } else if pattern == value {
             Ok(pattern)
         } else {
-            relate::super_relate_tys(self, pattern, value)
+            relate::structurally_relate_tys(self, pattern, value)
         }
     }
 
@@ -199,7 +211,7 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
         if pattern == value {
             Ok(pattern)
         } else {
-            relate::super_relate_consts(self, pattern, value)
+            relate::structurally_relate_consts(self, pattern, value)
         }
     }
 

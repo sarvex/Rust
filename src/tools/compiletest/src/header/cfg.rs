@@ -112,7 +112,7 @@ pub(super) fn parse_cfg_name_directive<'a>(
             (config.target == "wasm32-unknown-unknown").then_some("emscripten"),
         ],
         allowed_names: &target_cfgs.all_oses,
-        message: "when the operative system is {name}"
+        message: "when the operating system is {name}"
     }
     condition! {
         name: &target_cfg.env,
@@ -122,7 +122,7 @@ pub(super) fn parse_cfg_name_directive<'a>(
     condition! {
         name: &target_cfg.os_and_env(),
         allowed_names: &target_cfgs.all_oses_and_envs,
-        message: "when the operative system and target environment are {name}"
+        message: "when the operating system and target environment are {name}"
     }
     condition! {
         name: &target_cfg.abi,
@@ -146,19 +146,13 @@ pub(super) fn parse_cfg_name_directive<'a>(
     }
 
     // `wasm32-bare` is an alias to refer to just wasm32-unknown-unknown
-    // (in contrast to `wasm32` which also matches non-bare targets like
-    // asmjs-unknown-emscripten).
+    // (in contrast to `wasm32` which also matches non-bare targets)
     condition! {
         name: "wasm32-bare",
         condition: config.target == "wasm32-unknown-unknown",
         message: "when the target is WASM"
     }
 
-    condition! {
-        name: "asmjs",
-        condition: config.target.starts_with("asmjs"),
-        message: "when the architecture is asm.js",
-    }
     condition! {
         name: "thumb",
         condition: config.target.starts_with("thumb"),

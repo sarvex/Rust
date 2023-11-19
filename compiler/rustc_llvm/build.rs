@@ -12,6 +12,7 @@ const OPTIONAL_COMPONENTS: &[&str] = &[
     "avr",
     "loongarch",
     "m68k",
+    "csky",
     "mips",
     "powerpc",
     "systemz",
@@ -241,6 +242,12 @@ fn main() {
         cmd.arg("--system-libs");
     }
 
+    // We need libkstat for getHostCPUName on SPARC builds.
+    // See also: https://github.com/llvm/llvm-project/issues/64186
+    if target.starts_with("sparcv9") && target.contains("solaris") {
+        println!("cargo:rustc-link-lib=kstat");
+    }
+
     if (target.starts_with("arm") && !target.contains("freebsd"))
         || target.starts_with("mips-")
         || target.starts_with("mipsel-")
@@ -251,8 +258,20 @@ fn main() {
     } else if target.contains("windows-gnu") {
         println!("cargo:rustc-link-lib=shell32");
         println!("cargo:rustc-link-lib=uuid");
-    } else if target.contains("netbsd") || target.contains("haiku") || target.contains("darwin") {
+    } else if target.contains("haiku")
+        || target.contains("darwin")
+        || (is_crossed && (target.contains("dragonfly") || target.contains("solaris")))
+    {
         println!("cargo:rustc-link-lib=z");
+    } else if target.contains("netbsd") {
+        // On NetBSD/i386, gcc and g++ is built for i486 (to maximize backward compat)
+        // However, LLVM insists on using 64-bit atomics.
+        // This gives rise to a need to link rust itself with -latomic for these targets
+        if target.starts_with("i586") || target.starts_with("i686") {
+            println!("cargo:rustc-link-lib=atomic");
+        }
+        println!("cargo:rustc-link-lib=z");
+        println!("cargo:rustc-link-lib=execinfo");
     }
     cmd.args(&components);
 

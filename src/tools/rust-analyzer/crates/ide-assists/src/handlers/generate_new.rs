@@ -67,6 +67,7 @@ pub(crate) fn generate_new(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
                     ctx.sema.db,
                     item_for_path_search(ctx.sema.db, item_in_ns)?,
                     ctx.config.prefer_no_std,
+                    ctx.config.prefer_prelude,
                 )?;
 
                 let expr = use_trivial_constructor(
@@ -98,9 +99,9 @@ pub(crate) fn generate_new(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
             .fields()
             .enumerate()
             .filter_map(|(i, f)| {
-                let contructor = trivial_constructors[i].clone();
-                if contructor.is_some() {
-                    contructor
+                let constructor = trivial_constructors[i].clone();
+                if constructor.is_some() {
+                    constructor
                 } else {
                     Some(f.name()?.to_string())
                 }

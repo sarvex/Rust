@@ -14,8 +14,8 @@
 //!
 //! ```rust
 //! #![feature(core_intrinsics, custom_mir)]
+//! #![allow(internal_features)]
 //!
-//! extern crate core;
 //! use core::intrinsics::mir::*;
 //!
 //! #[custom_mir(dialect = "built")]
@@ -64,8 +64,8 @@
 //!
 //! ```rust
 //! #![feature(core_intrinsics, custom_mir)]
+//! #![allow(internal_features)]
 //!
-//! extern crate core;
 //! use core::intrinsics::mir::*;
 //!
 //! #[custom_mir(dialect = "built")]
@@ -106,19 +106,19 @@
 //! #[custom_mir(dialect = "runtime", phase = "optimized")]
 //! fn push_and_pop<T>(v: &mut Vec<T>, value: T) {
 //!     mir!(
-//!         let unused;
+//!         let _unused;
 //!         let popped;
 //!
 //!         {
-//!             Call(unused, pop, Vec::push(v, value))
+//!             Call(_unused = Vec::push(v, value), pop, UnwindContinue())
 //!         }
 //!
 //!         pop = {
-//!             Call(popped, drop, Vec::pop(v))
+//!             Call(popped = Vec::pop(v), drop, UnwindContinue())
 //!         }
 //!
 //!         drop = {
-//!             Drop(popped, ret)
+//!             Drop(popped, ret, UnwindContinue())
 //!         }
 //!
 //!         ret = {
@@ -230,17 +230,13 @@
 //!
 //!  - Operands implicitly convert to `Use` rvalues.
 //!  - `&`, `&mut`, `addr_of!`, and `addr_of_mut!` all work to create their associated rvalue.
-//!  - [`Discriminant`] and [`Len`] have associated functions.
+//!  - [`Discriminant`], [`Len`], and [`CopyForDeref`] have associated functions.
 //!  - Unary and binary operations use their normal Rust syntax - `a * b`, `!c`, etc.
 //!  - The binary operation `Offset` can be created via [`Offset`].
 //!  - Checked binary operations are represented by wrapping the associated binop in [`Checked`].
 //!  - Array repetition syntax (`[foo; 10]`) creates the associated rvalue.
 //!
 //! #### Terminators
-//!
-//! Custom MIR does not currently support cleanup blocks or non-trivial unwind paths. As such, there
-//! are no resume and abort terminators, and terminators that might unwind do not have any way to
-//! indicate the unwind block.
 //!
 //!  - [`Goto`], [`Return`], [`Unreachable`] and [`Drop`](Drop()) have associated functions.
 //!  - `match some_int_operand` becomes a `SwitchInt`. Each arm should be `literal => basic_block`
@@ -260,26 +256,77 @@
 /// Type representing basic blocks.
 ///
 /// All terminators will have this type as a return type. It helps achieve some type safety.
-pub struct BasicBlock;
+#[rustc_diagnostic_item = "mir_basic_block"]
+pub enum BasicBlock {
+    /// A non-cleanup basic block.
+    Normal,
+    /// A basic block that lies on an unwind path.
+    Cleanup,
+}
+
+/// The reason we are terminating the process during unwinding.
+#[rustc_diagnostic_item = "mir_unwind_terminate_reason"]
+pub enum UnwindTerminateReason {
+    /// Unwinding is just not possible given the ABI of this function.
+    Abi,
+    /// We were already cleaning up for an ongoing unwind, and a *second*, *nested* unwind was
+    /// triggered by the drop glue.
+    InCleanup,
+}
+
+pub use UnwindTerminateReason::Abi as ReasonAbi;
+pub use UnwindTerminateReason::InCleanup as ReasonInCleanup;
 
 macro_rules! define {
     ($name:literal, $( #[ $meta:meta ] )* fn $($sig:tt)*) => {
         #[rustc_diagnostic_item = $name]
+        #[inline]
         $( #[ $meta ] )*
         pub fn $($sig)* { panic!() }
     }
 }
 
+// Unwind actions
+define!(
+    "mir_unwind_continue",
+    /// An unwind action that continues unwinding.
+    fn UnwindContinue()
+);
+define!(
+    "mir_unwind_unreachable",
+    /// An unwind action that triggers undefined behaviour.
+    fn UnwindUnreachable() -> BasicBlock
+);
+define!(
+    "mir_unwind_terminate",
+    /// An unwind action that terminates the execution.
+    ///
+    /// `UnwindTerminate` can also be used as a terminator.
+    fn UnwindTerminate(reason: UnwindTerminateReason)
+);
+define!(
+    "mir_unwind_cleanup",
+    /// An unwind action that continues execution in a given basic blok.
+    fn UnwindCleanup(goto: BasicBlock)
+);
+
+// Terminators
 define!("mir_return", fn Return() -> BasicBlock);
 define!("mir_goto", fn Goto(destination: BasicBlock) -> BasicBlock);
 define!("mir_unreachable", fn Unreachable() -> BasicBlock);
-define!("mir_drop", fn Drop<T>(place: T, goto: BasicBlock));
-define!("mir_call", fn Call<T>(place: T, goto: BasicBlock, call: T));
+define!("mir_drop", fn Drop<T, U>(place: T, goto: BasicBlock, unwind_action: U));
+define!("mir_call", fn Call<U>(call: (), goto: BasicBlock, unwind_action: U));
+define!("mir_unwind_resume",
+    /// A terminator that resumes the unwinding.
+    fn UnwindResume()
+);
+
 define!("mir_storage_live", fn StorageLive<T>(local: T));
 define!("mir_storage_dead", fn StorageDead<T>(local: T));
 define!("mir_deinit", fn Deinit<T>(place: T));
 define!("mir_checked", fn Checked<T>(binop: T) -> (T, bool));
 define!("mir_len", fn Len<T>(place: T) -> usize);
+define!("mir_copy_for_deref", fn CopyForDeref<T>(place: T) -> T);
 define!("mir_retag", fn Retag<T>(place: T));
 define!("mir_move", fn Move<T>(place: T) -> T);
 define!("mir_static", fn Static<T>(s: T) -> &'static T);
@@ -315,9 +362,9 @@ define!(
     /// # Examples
     ///
     /// ```rust
+    /// #![allow(internal_features)]
     /// #![feature(custom_mir, core_intrinsics)]
     ///
-    /// extern crate core;
     /// use core::intrinsics::mir::*;
     ///
     /// #[custom_mir(dialect = "built")]
@@ -358,6 +405,11 @@ define!(
     #[doc(hidden)]
     fn __internal_make_place<T>(place: T) -> *mut T
 );
+define!(
+    "mir_debuginfo",
+    #[doc(hidden)]
+    fn __debuginfo<T>(name: &'static str, s: T)
+);
 
 /// Macro for generating custom MIR.
 ///
@@ -368,22 +420,22 @@ pub macro mir {
     (
         $(type RET = $ret_ty:ty ;)?
         $(let $local_decl:ident $(: $local_decl_ty:ty)? ;)*
+        $(debug $dbg_name:ident => $dbg_data:expr ;)*
 
         {
             $($entry:tt)*
         }
 
         $(
-            $block_name:ident = {
+            $block_name:ident $(($block_cleanup:ident))? = {
                 $($block:tt)*
             }
         )*
     ) => {{
         // First, we declare all basic blocks.
-        $(
-            let $block_name: ::core::intrinsics::mir::BasicBlock;
-        )*
-
+        __internal_declare_basic_blocks!($(
+            $block_name $(($block_cleanup))?
+        )*);
         {
             // Now all locals
             #[allow(non_snake_case)]
@@ -391,26 +443,32 @@ pub macro mir {
             $(
                 let $local_decl $(: $local_decl_ty)? ;
             )*
-
             ::core::intrinsics::mir::__internal_extract_let!($($entry)*);
             $(
                 ::core::intrinsics::mir::__internal_extract_let!($($block)*);
             )*
 
             {
-                // Finally, the contents of the basic blocks
-                ::core::intrinsics::mir::__internal_remove_let!({
-                    {}
-                    { $($entry)* }
-                });
+                // Now debuginfo
                 $(
-                    ::core::intrinsics::mir::__internal_remove_let!({
-                        {}
-                        { $($block)* }
-                    });
+                    __debuginfo(stringify!($dbg_name), $dbg_data);
                 )*
 
-                RET
+                {
+                    // Finally, the contents of the basic blocks
+                    ::core::intrinsics::mir::__internal_remove_let!({
+                        {}
+                        { $($entry)* }
+                    });
+                    $(
+                        ::core::intrinsics::mir::__internal_remove_let!({
+                            {}
+                            { $($block)* }
+                        });
+                    )*
+
+                    RET
+                }
             }
         }
     }}
@@ -569,5 +627,19 @@ pub macro __internal_remove_let {
             $($already_parsed)*
             $expr
         }
+    },
+}
+
+/// Helper macro that declares the basic blocks.
+#[doc(hidden)]
+pub macro __internal_declare_basic_blocks {
+    () => {},
+    ($name:ident (cleanup) $($rest:tt)*) => {
+        let $name = ::core::intrinsics::mir::BasicBlock::Cleanup;
+        __internal_declare_basic_blocks!($($rest)*)
+    },
+    ($name:ident $($rest:tt)*) => {
+        let $name = ::core::intrinsics::mir::BasicBlock::Normal;
+        __internal_declare_basic_blocks!($($rest)*)
     },
 }

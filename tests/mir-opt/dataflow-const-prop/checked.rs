@@ -1,6 +1,7 @@
-// ignore-wasm32 compiled with panic=abort by default
+// skip-filecheck
 // unit-test: DataflowConstProp
 // compile-flags: -Coverflow-checks=on
+// EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 
 // EMIT_MIR checked.main.DataflowConstProp.diff
 #[allow(arithmetic_overflow)]

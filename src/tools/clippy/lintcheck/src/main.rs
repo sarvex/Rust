@@ -15,16 +15,14 @@ use crate::config::LintcheckConfig;
 use crate::recursive::LintcheckServer;
 
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::env::consts::EXE_SUFFIX;
 use std::fmt::{self, Write as _};
-use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
 use std::time::Duration;
+use std::{env, fs, thread};
 
 use cargo_metadata::diagnostic::{Diagnostic, DiagnosticLevel};
 use cargo_metadata::Message;
@@ -474,7 +472,7 @@ fn read_crates(toml_path: &Path) -> (Vec<CrateSource>, RecursiveOptions) {
             });
         } else if let Some(ref versions) = tk.versions {
             // if we have multiple versions, save each one
-            for ver in versions.iter() {
+            for ver in versions {
                 crate_sources.push(CrateSource::CratesIo {
                     name: tk.name.clone(),
                     version: ver.to_string(),
@@ -525,7 +523,7 @@ fn gather_stats(clippy_warnings: &[ClippyWarning]) -> (String, HashMap<&String, 
         .for_each(|wrn| *counter.entry(&wrn.lint_type).or_insert(0) += 1);
 
     // collect into a tupled list for sorting
-    let mut stats: Vec<(&&String, &usize)> = counter.iter().map(|(lint, count)| (lint, count)).collect();
+    let mut stats: Vec<(&&String, &usize)> = counter.iter().collect();
     // sort by "000{count} {clippy::lintname}"
     // to not have a lint with 200 and 2 warnings take the same spot
     stats.sort_by_key(|(lint, count)| format!("{count:0>4}, {lint}"));

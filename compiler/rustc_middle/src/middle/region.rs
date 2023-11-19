@@ -10,7 +10,7 @@ use crate::ty::TyCtxt;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir as hir;
-use rustc_hir::Node;
+use rustc_hir::{HirIdMap, Node};
 use rustc_macros::HashStable;
 use rustc_query_system::ich::StableHashingContext;
 use rustc_span::{Span, DUMMY_SP};
@@ -77,7 +77,7 @@ use std::ops::Deref;
 /// picture, but rather the ending point.
 //
 // FIXME(pnkfelix): this currently derives `PartialOrd` and `Ord` to
-// placate the same deriving in `ty::FreeRegion`, but we may want to
+// placate the same deriving in `ty::LateParamRegion`, but we may want to
 // actually attach a more meaningful ordering to scopes than the one
 // generated via deriving here.
 #[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Copy, TyEncodable, TyDecodable)]
@@ -228,7 +228,7 @@ pub struct ScopeTree {
     /// and not the enclosing *statement*. Expressions that are not present in this
     /// table are not rvalue candidates. The set of rvalue candidates is computed
     /// during type check based on a traversal of the AST.
-    pub rvalue_candidates: FxHashMap<hir::HirId, RvalueCandidateType>,
+    pub rvalue_candidates: HirIdMap<RvalueCandidateType>,
 
     /// If there are any `yield` nested within a scope, this map
     /// stores the `Span` of the last one and its index in the
@@ -308,7 +308,7 @@ pub struct ScopeTree {
 
     /// The number of visit_expr and visit_pat calls done in the body.
     /// Used to sanity check visit_expr/visit_pat call count when
-    /// calculating generator interiors.
+    /// calculating coroutine interiors.
     pub body_expr_count: FxHashMap<hir::BodyId, usize>,
 }
 
@@ -413,7 +413,7 @@ impl ScopeTree {
 
     /// Gives the number of expressions visited in a body.
     /// Used to sanity check visit_expr call count when
-    /// calculating generator interiors.
+    /// calculating coroutine interiors.
     pub fn body_expr_count(&self, body_id: hir::BodyId) -> Option<usize> {
         self.body_expr_count.get(&body_id).copied()
     }

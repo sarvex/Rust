@@ -1,4 +1,3 @@
-//@run-rustfix
 //@aux-build:proc_macros.rs
 #![feature(let_chains)]
 #![allow(unused)]
@@ -8,7 +7,8 @@
     clippy::let_and_return,
     clippy::let_unit_value,
     clippy::nonminimal_bool,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    clippy::useless_vec
 )]
 
 extern crate proc_macros;
@@ -230,7 +230,9 @@ fn does_not_lint() {
     }
 
     let x;
-    if true && let Some(n) = Some("let chains too") {
+    if true
+        && let Some(n) = Some("let chains too")
+    {
         x = 1;
     } else {
         x = 2;

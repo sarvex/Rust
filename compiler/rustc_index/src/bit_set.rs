@@ -237,21 +237,10 @@ impl<T: Idx> BitSet<T> {
         new_word != word
     }
 
-    /// Gets a slice of the underlying words.
-    pub fn words(&self) -> &[Word] {
-        &self.words
-    }
-
     /// Iterates over the indices of set bits in a sorted order.
     #[inline]
     pub fn iter(&self) -> BitIter<'_, T> {
         BitIter::new(&self.words)
-    }
-
-    /// Duplicates the set as a hybrid set.
-    pub fn to_hybrid(&self) -> HybridBitSet<T> {
-        // Note: we currently don't bother trying to make a Sparse set.
-        HybridBitSet::Dense(self.to_owned())
     }
 
     /// Set `self = self | other`. In contrast to `union` returns `true` if the set contains at
@@ -365,7 +354,7 @@ impl<T: Idx> From<GrowableBitSet<T>> for BitSet<T> {
 /// All operations that involve an element will panic if the element is equal
 /// to or greater than the domain size. All operations that involve two bitsets
 /// will panic if the bitsets have differing domain sizes.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct ChunkedBitSet<T> {
     domain_size: usize,
 
@@ -804,9 +793,7 @@ impl<'a, T: Idx> Iterator for ChunkedBitIter<'a, T> {
         // advance the iterator to the start of the next chunk, before proceeding in chunk sized
         // steps.
         while self.index % CHUNK_BITS != 0 {
-            let Some(item) = self.next() else {
-                return init
-            };
+            let Some(item) = self.next() else { return init };
             init = f(init, item);
         }
         let start_chunk = self.index / CHUNK_BITS;
@@ -1071,6 +1058,12 @@ impl<T> Clone for BitSet<T> {
 }
 
 impl<T: Idx> fmt::Debug for BitSet<T> {
+    fn fmt(&self, w: &mut fmt::Formatter<'_>) -> fmt::Result {
+        w.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: Idx> fmt::Debug for ChunkedBitSet<T> {
     fn fmt(&self, w: &mut fmt::Formatter<'_>) -> fmt::Result {
         w.debug_list().entries(self.iter()).finish()
     }
@@ -1544,7 +1537,7 @@ impl<T: Idx> GrowableBitSet<T> {
     #[inline]
     pub fn contains(&self, elem: T) -> bool {
         let (word_index, mask) = word_index_and_mask(elem);
-        self.bit_set.words.get(word_index).map_or(false, |word| (word & mask) != 0)
+        self.bit_set.words.get(word_index).is_some_and(|word| (word & mask) != 0)
     }
 
     #[inline]
@@ -1597,11 +1590,11 @@ impl<R: Idx, C: Idx> BitMatrix<R, C> {
     pub fn from_row_n(row: &BitSet<C>, num_rows: usize) -> BitMatrix<R, C> {
         let num_columns = row.domain_size();
         let words_per_row = num_words(num_columns);
-        assert_eq!(words_per_row, row.words().len());
+        assert_eq!(words_per_row, row.words.len());
         BitMatrix {
             num_rows,
             num_columns,
-            words: iter::repeat(row.words()).take(num_rows).flatten().cloned().collect(),
+            words: iter::repeat(&row.words).take(num_rows).flatten().cloned().collect(),
             marker: PhantomData,
         }
     }
@@ -1696,9 +1689,9 @@ impl<R: Idx, C: Idx> BitMatrix<R, C> {
         assert_eq!(with.domain_size(), self.num_columns);
         let (write_start, write_end) = self.range(write);
         let mut changed = false;
-        for (read_index, write_index) in iter::zip(0..with.words().len(), write_start..write_end) {
+        for (read_index, write_index) in iter::zip(0..with.words.len(), write_start..write_end) {
             let word = self.words[write_index];
-            let new_word = word | with.words()[read_index];
+            let new_word = word | with.words[read_index];
             self.words[write_index] = new_word;
             changed |= word != new_word;
         }
@@ -1818,7 +1811,7 @@ impl<R: Idx, C: Idx> SparseBitMatrix<R, C> {
     /// if the matrix represents (transitive) reachability, can
     /// `row` reach `column`?
     pub fn contains(&self, row: R, column: C) -> bool {
-        self.row(row).map_or(false, |r| r.contains(column))
+        self.row(row).is_some_and(|r| r.contains(column))
     }
 
     /// Adds the bits from row `read` to the bits from row `write`, and
@@ -1995,54 +1988,6 @@ impl FiniteBitSetTy for u32 {
 impl std::fmt::Debug for FiniteBitSet<u32> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:032b}", self.0)
-    }
-}
-
-impl FiniteBitSetTy for u64 {
-    const DOMAIN_SIZE: u32 = 64;
-
-    const FILLED: Self = Self::MAX;
-    const EMPTY: Self = Self::MIN;
-
-    const ONE: Self = 1u64;
-    const ZERO: Self = 0u64;
-
-    fn checked_shl(self, rhs: u32) -> Option<Self> {
-        self.checked_shl(rhs)
-    }
-
-    fn checked_shr(self, rhs: u32) -> Option<Self> {
-        self.checked_shr(rhs)
-    }
-}
-
-impl std::fmt::Debug for FiniteBitSet<u64> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:064b}", self.0)
-    }
-}
-
-impl FiniteBitSetTy for u128 {
-    const DOMAIN_SIZE: u32 = 128;
-
-    const FILLED: Self = Self::MAX;
-    const EMPTY: Self = Self::MIN;
-
-    const ONE: Self = 1u128;
-    const ZERO: Self = 0u128;
-
-    fn checked_shl(self, rhs: u32) -> Option<Self> {
-        self.checked_shl(rhs)
-    }
-
-    fn checked_shr(self, rhs: u32) -> Option<Self> {
-        self.checked_shr(rhs)
-    }
-}
-
-impl std::fmt::Debug for FiniteBitSet<u128> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:0128b}", self.0)
     }
 }
 

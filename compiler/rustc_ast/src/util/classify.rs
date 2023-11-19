@@ -36,7 +36,7 @@ pub fn expr_trailing_brace(mut expr: &ast::Expr) -> Option<&ast::Expr> {
             | AssignOp(_, _, e)
             | Binary(_, _, e)
             | Break(_, Some(e))
-            | Let(_, e, _)
+            | Let(_, e, _, _)
             | Range(_, Some(e), _)
             | Ret(Some(e))
             | Unary(_, e)
@@ -46,7 +46,7 @@ pub fn expr_trailing_brace(mut expr: &ast::Expr) -> Option<&ast::Expr> {
             Closure(closure) => {
                 expr = &closure.body;
             }
-            Async(..) | Block(..) | ForLoop(..) | If(..) | Loop(..) | Match(..) | Struct(..)
+            Gen(..) | Block(..) | ForLoop(..) | If(..) | Loop(..) | Match(..) | Struct(..)
             | TryBlock(..) | While(..) => break Some(expr),
             _ => break None,
         }

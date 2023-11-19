@@ -43,13 +43,32 @@ use crate::slice::{self, SliceIndex};
 /// it is your responsibility to ensure that `as_mut` is never called, and `as_ptr`
 /// is never used for mutation.
 ///
+/// # Representation
+///
+/// Thanks to the [null pointer optimization],
+/// `NonNull<T>` and `Option<NonNull<T>>`
+/// are guaranteed to have the same size and alignment:
+///
+/// ```
+/// # use std::mem::{size_of, align_of};
+/// use std::ptr::NonNull;
+///
+/// assert_eq!(size_of::<NonNull<i16>>(), size_of::<Option<NonNull<i16>>>());
+/// assert_eq!(align_of::<NonNull<i16>>(), align_of::<Option<NonNull<i16>>>());
+///
+/// assert_eq!(size_of::<NonNull<str>>(), size_of::<Option<NonNull<str>>>());
+/// assert_eq!(align_of::<NonNull<str>>(), align_of::<Option<NonNull<str>>>());
+/// ```
+///
 /// [covariant]: https://doc.rust-lang.org/reference/subtyping.html
 /// [`PhantomData`]: crate::marker::PhantomData
 /// [`UnsafeCell<T>`]: crate::cell::UnsafeCell
+/// [null pointer optimization]: crate::option#representation
 #[stable(feature = "nonnull", since = "1.25.0")]
 #[repr(transparent)]
 #[rustc_layout_scalar_valid_range_start(1)]
 #[rustc_nonnull_optimization_guaranteed]
+#[rustc_diagnostic_item = "NonNull"]
 pub struct NonNull<T: ?Sized> {
     pointer: *const T,
 }
@@ -320,6 +339,7 @@ impl<T: ?Sized> NonNull<T> {
     /// ```
     #[stable(feature = "nonnull", since = "1.25.0")]
     #[rustc_const_stable(feature = "const_nonnull_as_ptr", since = "1.32.0")]
+    #[rustc_never_returns_null_ptr]
     #[must_use]
     #[inline(always)]
     pub const fn as_ptr(self) -> *mut T {
@@ -367,13 +387,14 @@ impl<T: ?Sized> NonNull<T> {
     ///
     /// [the module documentation]: crate::ptr#safety
     #[stable(feature = "nonnull", since = "1.25.0")]
-    #[rustc_const_unstable(feature = "const_ptr_as_ref", issue = "91822")]
+    #[rustc_const_stable(feature = "const_nonnull_as_ref", since = "1.73.0")]
     #[must_use]
     #[inline(always)]
     pub const unsafe fn as_ref<'a>(&self) -> &'a T {
         // SAFETY: the caller must guarantee that `self` meets all the
         // requirements for a reference.
-        unsafe { &*self.as_ptr() }
+        // `cast_const` avoids a mutable raw pointer deref.
+        unsafe { &*self.as_ptr().cast_const() }
     }
 
     /// Returns a unique reference to the value. If the value may be uninitialized, [`as_uninit_mut`]
@@ -448,6 +469,43 @@ impl<T: ?Sized> NonNull<T> {
     pub const fn cast<U>(self) -> NonNull<U> {
         // SAFETY: `self` is a `NonNull` pointer which is necessarily non-null
         unsafe { NonNull::new_unchecked(self.as_ptr() as *mut U) }
+    }
+
+    /// See [`pointer::add`] for semantics and safety requirements.
+    #[inline]
+    pub(crate) const unsafe fn add(self, delta: usize) -> Self
+    where
+        T: Sized,
+    {
+        // SAFETY: We require that the delta stays in-bounds of the object, and
+        // thus it cannot become null, as that would require wrapping the
+        // address space, which no legal objects are allowed to do.
+        // And the caller promised the `delta` is sound to add.
+        unsafe { NonNull { pointer: self.pointer.add(delta) } }
+    }
+
+    /// See [`pointer::sub`] for semantics and safety requirements.
+    #[inline]
+    pub(crate) const unsafe fn sub(self, delta: usize) -> Self
+    where
+        T: Sized,
+    {
+        // SAFETY: We require that the delta stays in-bounds of the object, and
+        // thus it cannot become null, as no legal objects can be allocated
+        // in such as way that the null address is part of them.
+        // And the caller promised the `delta` is sound to subtract.
+        unsafe { NonNull { pointer: self.pointer.sub(delta) } }
+    }
+
+    /// See [`pointer::sub_ptr`] for semantics and safety requirements.
+    #[inline]
+    pub(crate) const unsafe fn sub_ptr(self, subtrahend: Self) -> usize
+    where
+        T: Sized,
+    {
+        // SAFETY: The caller promised that this is safe to do, and
+        // the non-nullness is irrelevant to the operation.
+        unsafe { self.pointer.sub_ptr(subtrahend.pointer) }
     }
 }
 
@@ -541,6 +599,7 @@ impl<T> NonNull<[T]> {
     #[must_use]
     #[unstable(feature = "slice_ptr_get", issue = "74265")]
     #[rustc_const_unstable(feature = "slice_ptr_get", issue = "74265")]
+    #[rustc_never_returns_null_ptr]
     pub const fn as_mut_ptr(self) -> *mut T {
         self.as_non_null_ptr().as_ptr()
     }

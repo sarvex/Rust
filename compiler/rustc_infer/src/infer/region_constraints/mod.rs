@@ -16,7 +16,7 @@ use rustc_index::IndexVec;
 use rustc_middle::infer::unify_key::{RegionVidKey, UnifiedRegion};
 use rustc_middle::ty::ReStatic;
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_middle::ty::{ReLateBound, ReVar};
+use rustc_middle::ty::{ReBound, ReVar};
 use rustc_middle::ty::{Region, RegionVid};
 use rustc_span::Span;
 
@@ -217,7 +217,7 @@ pub enum VerifyBound<'tcx> {
 /// and supplies a bound if it ended up being relevant. It's used in situations
 /// like this:
 ///
-/// ```rust
+/// ```rust,ignore (pseudo-Rust)
 /// fn foo<'a, 'b, T: SomeTrait<'a>>
 /// where
 ///    <T as SomeTrait<'a>>::Item: 'b
@@ -232,7 +232,7 @@ pub enum VerifyBound<'tcx> {
 /// In the [`VerifyBound`], this struct is enclosed in `Binder` to account
 /// for cases like
 ///
-/// ```rust
+/// ```rust,ignore (pseudo-Rust)
 /// where for<'a> <T as SomeTrait<'a>::Item: 'a
 /// ```
 ///
@@ -400,7 +400,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         data
     }
 
-    pub(super) fn data(&self) -> &RegionConstraintData<'tcx> {
+    pub fn data(&self) -> &RegionConstraintData<'tcx> {
         &self.data
     }
 
@@ -457,7 +457,9 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         debug!("RegionConstraintCollector: add_verify({:?})", verify);
 
         // skip no-op cases known to be satisfied
-        if let VerifyBound::AllBounds(ref bs) = verify.bound && bs.is_empty() {
+        if let VerifyBound::AllBounds(ref bs) = verify.bound
+            && bs.is_empty()
+        {
             return;
         }
 
@@ -529,7 +531,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         debug!("origin = {:#?}", origin);
 
         match (*sub, *sup) {
-            (ReLateBound(..), _) | (_, ReLateBound(..)) => {
+            (ReBound(..), _) | (_, ReBound(..)) => {
                 span_bug!(origin.span(), "cannot relate bound region: {:?} <= {:?}", sub, sup);
             }
             (_, ReStatic) => {
@@ -610,13 +612,13 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         let resolved = ut
             .probe_value(root_vid)
             .get_value_ignoring_universes()
-            .unwrap_or_else(|| tcx.mk_re_var(root_vid));
+            .unwrap_or_else(|| ty::Region::new_var(tcx, root_vid));
 
         // Don't resolve a variable to a region that it cannot name.
         if self.var_universe(vid).can_name(self.universe(resolved)) {
             resolved
         } else {
-            tcx.mk_re_var(vid)
+            ty::Region::new_var(tcx, vid)
         }
     }
 
@@ -637,7 +639,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
     ) -> Region<'tcx> {
         let vars = TwoRegions { a, b };
         if let Some(&c) = self.combine_map(t).get(&vars) {
-            return tcx.mk_re_var(c);
+            return ty::Region::new_var(tcx, c);
         }
         let a_universe = self.universe(a);
         let b_universe = self.universe(b);
@@ -645,7 +647,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         let c = self.new_region_var(c_universe, MiscVariable(origin.span()));
         self.combine_map(t).insert(vars, c);
         self.undo_log.push(AddCombination(t, vars));
-        let new_r = tcx.mk_re_var(c);
+        let new_r = ty::Region::new_var(tcx, c);
         for old_r in [a, b] {
             match t {
                 Glb => self.make_subregion(origin.clone(), new_r, old_r),
@@ -660,12 +662,12 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         match *region {
             ty::ReStatic
             | ty::ReErased
-            | ty::ReFree(..)
-            | ty::ReEarlyBound(..)
+            | ty::ReLateParam(..)
+            | ty::ReEarlyParam(..)
             | ty::ReError(_) => ty::UniverseIndex::ROOT,
             ty::RePlaceholder(placeholder) => placeholder.universe,
             ty::ReVar(vid) => self.var_universe(vid),
-            ty::ReLateBound(..) => bug!("universe(): encountered bound region {:?}", region),
+            ty::ReBound(..) => bug!("universe(): encountered bound region {:?}", region),
         }
     }
 
@@ -683,15 +685,10 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
     }
 
     /// See `InferCtxt::region_constraints_added_in_snapshot`.
-    pub fn region_constraints_added_in_snapshot(&self, mark: &Snapshot<'tcx>) -> Option<bool> {
+    pub fn region_constraints_added_in_snapshot(&self, mark: &Snapshot<'tcx>) -> bool {
         self.undo_log
             .region_constraints_in_snapshot(mark)
-            .map(|&elt| match elt {
-                AddConstraint(constraint) => Some(constraint.involves_placeholders()),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(None)
+            .any(|&elt| matches!(elt, AddConstraint(_)))
     }
 
     #[inline]
@@ -709,8 +706,8 @@ impl fmt::Debug for RegionSnapshot {
 impl<'tcx> fmt::Debug for GenericKind<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            GenericKind::Param(ref p) => write!(f, "{:?}", p),
-            GenericKind::Alias(ref p) => write!(f, "{:?}", p),
+            GenericKind::Param(ref p) => write!(f, "{p:?}"),
+            GenericKind::Alias(ref p) => write!(f, "{p:?}"),
         }
     }
 }
@@ -718,8 +715,8 @@ impl<'tcx> fmt::Debug for GenericKind<'tcx> {
 impl<'tcx> fmt::Display for GenericKind<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            GenericKind::Param(ref p) => write!(f, "{}", p),
-            GenericKind::Alias(ref p) => write!(f, "{}", p),
+            GenericKind::Param(ref p) => write!(f, "{p}"),
+            GenericKind::Alias(ref p) => write!(f, "{p}"),
         }
     }
 }

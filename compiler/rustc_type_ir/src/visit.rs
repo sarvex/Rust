@@ -8,7 +8,7 @@
 //! visitation. These are the ones containing the most important type-related
 //! information, such as `Ty`, `Predicate`, `Region`, and `Const`.
 //!
-//! There are three groups of traits involved in each traversal.
+//! There are three traits involved in each traversal.
 //! - `TypeVisitable`. This is implemented once for many types, including:
 //!   - Types of interest, for which the methods delegate to the visitor.
 //!   - All other types, including generic containers like `Vec` and `Option`.
@@ -17,7 +17,6 @@
 //!   interest, and defines the visiting "skeleton" for these types. (This
 //!   excludes `Region` because it is non-recursive, i.e. it never contains
 //!   other types of interest.)
-//!
 //! - `TypeVisitor`. This is implemented for each visitor. This defines how
 //!   types of interest are visited.
 //!
@@ -41,10 +40,13 @@
 //!     - ty.super_visit_with(visitor)
 //! - u.visit_with(visitor)
 //! ```
-use crate::Interner;
 
+use rustc_data_structures::sync::Lrc;
+use rustc_index::{Idx, IndexVec};
 use std::fmt;
 use std::ops::ControlFlow;
+
+use crate::Interner;
 
 /// This trait is implemented for every type that can be visited,
 /// providing the skeleton of the traversal.
@@ -60,7 +62,7 @@ pub trait TypeVisitable<I: Interner>: fmt::Debug + Clone {
     ///
     /// For types of interest (such as `Ty`), the implementation of this method
     /// that calls a visitor method specifically for that type (such as
-    /// `V::visit_ty`). This is where control transfers from `TypeFoldable` to
+    /// `V::visit_ty`). This is where control transfers from `TypeVisitable` to
     /// `TypeVisitor`.
     fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy>;
 }
@@ -115,5 +117,82 @@ pub trait TypeVisitor<I: Interner>: Sized {
         I::Predicate: TypeSuperVisitable<I>,
     {
         p.super_visit_with(self)
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Traversal implementations.
+
+impl<I: Interner, T: TypeVisitable<I>, U: TypeVisitable<I>> TypeVisitable<I> for (T, U) {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.0.visit_with(visitor)?;
+        self.1.visit_with(visitor)
+    }
+}
+
+impl<I: Interner, A: TypeVisitable<I>, B: TypeVisitable<I>, C: TypeVisitable<I>> TypeVisitable<I>
+    for (A, B, C)
+{
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.0.visit_with(visitor)?;
+        self.1.visit_with(visitor)?;
+        self.2.visit_with(visitor)
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Option<T> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        match self {
+            Some(v) => v.visit_with(visitor),
+            None => ControlFlow::Continue(()),
+        }
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>, E: TypeVisitable<I>> TypeVisitable<I> for Result<T, E> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        match self {
+            Ok(v) => v.visit_with(visitor),
+            Err(e) => e.visit_with(visitor),
+        }
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Lrc<T> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        (**self).visit_with(visitor)
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Box<T> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        (**self).visit_with(visitor)
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Vec<T> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.iter().try_for_each(|t| t.visit_with(visitor))
+    }
+}
+
+// `TypeFoldable` isn't impl'd for `&[T]`. It doesn't make sense in the general
+// case, because we can't return a new slice. But note that there are a couple
+// of trivial impls of `TypeFoldable` for specific slice types elsewhere.
+impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for &[T] {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.iter().try_for_each(|t| t.visit_with(visitor))
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Box<[T]> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.iter().try_for_each(|t| t.visit_with(visitor))
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>, Ix: Idx> TypeVisitable<I> for IndexVec<Ix, T> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.iter().try_for_each(|t| t.visit_with(visitor))
     }
 }

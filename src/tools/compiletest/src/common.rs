@@ -8,6 +8,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use crate::util::{add_dylib_path, PathBufExt};
+use build_helper::git::GitConfig;
 use lazycell::AtomicLazyCell;
 use serde::de::{Deserialize, Deserializer, Error as _};
 use std::collections::{HashMap, HashSet};
@@ -66,15 +67,32 @@ string_enum! {
         JsDocTest => "js-doc-test",
         MirOpt => "mir-opt",
         Assembly => "assembly",
+        CoverageMap => "coverage-map",
+        CoverageRun => "coverage-run",
+    }
+}
+
+impl Default for Mode {
+    fn default() -> Self {
+        Mode::Ui
     }
 }
 
 impl Mode {
-    pub fn disambiguator(self) -> &'static str {
+    pub fn aux_dir_disambiguator(self) -> &'static str {
         // Pretty-printing tests could run concurrently, and if they do,
         // they need to keep their output segregated.
         match self {
             Pretty => ".pretty",
+            _ => "",
+        }
+    }
+
+    pub fn output_dir_disambiguator(self) -> &'static str {
+        // Coverage tests use the same test files for multiple test modes,
+        // so each mode should have a separate output directory.
+        match self {
+            CoverageMap | CoverageRun => self.to_str(),
             _ => "",
         }
     }
@@ -100,8 +118,8 @@ string_enum! {
     #[derive(Clone, Debug, PartialEq)]
     pub enum CompareMode {
         Polonius => "polonius",
-        Chalk => "chalk",
         NextSolver => "next-solver",
+        NextSolverCoherence => "next-solver-coherence",
         SplitDwarf => "split-dwarf",
         SplitDwarfSingle => "split-dwarf-single",
     }
@@ -124,8 +142,33 @@ pub enum PanicStrategy {
     Abort,
 }
 
+impl PanicStrategy {
+    pub(crate) fn for_miropt_test_tools(&self) -> miropt_test_tools::PanicStrategy {
+        match self {
+            PanicStrategy::Unwind => miropt_test_tools::PanicStrategy::Unwind,
+            PanicStrategy::Abort => miropt_test_tools::PanicStrategy::Abort,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Sanitizer {
+    Address,
+    Cfi,
+    Kcfi,
+    KernelAddress,
+    Leak,
+    Memory,
+    Memtag,
+    Safestack,
+    ShadowCallStack,
+    Thread,
+    Hwaddress,
+}
+
 /// Configuration for compiletest
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Config {
     /// `true` to overwrite stderr/stdout files instead of complaining about changes in output.
     pub bless: bool,
@@ -144,6 +187,9 @@ pub struct Config {
 
     /// The rust-demangler executable.
     pub rust_demangler_path: Option<PathBuf>,
+
+    /// The coverage-dump executable.
+    pub coverage_dump_path: Option<PathBuf>,
 
     /// The Python executable to use for LLDB and htmldocck.
     pub python: String,
@@ -334,6 +380,10 @@ pub struct Config {
     pub target_cfgs: AtomicLazyCell<TargetCfgs>,
 
     pub nocapture: bool,
+
+    // Needed both to construct build_helper::git::GitConfig
+    pub git_repository: String,
+    pub nightly_branch: String,
 }
 
 impl Config {
@@ -360,9 +410,6 @@ impl Config {
 
     pub fn matches_arch(&self, arch: &str) -> bool {
         self.target_cfg().arch == arch ||
-        // Shorthand for convenience. The arch for
-        // asmjs-unknown-emscripten is actually wasm32.
-        (arch == "asmjs" && self.target.starts_with("asmjs")) ||
         // Matching all the thumb variants as one can be convenient.
         // (thumbv6m, thumbv7em, thumbv7m, etc.)
         (arch == "thumb" && self.target.starts_with("thumb"))
@@ -405,6 +452,10 @@ impl Config {
         ];
         ASM_SUPPORTED_ARCHS.contains(&self.target_cfg().arch.as_str())
     }
+
+    pub fn git_config(&self) -> GitConfig<'_> {
+        GitConfig { git_repository: &self.git_repository, nightly_branch: &self.nightly_branch }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -422,13 +473,12 @@ pub struct TargetCfgs {
 
 impl TargetCfgs {
     fn new(config: &Config) -> TargetCfgs {
-        let targets: HashMap<String, TargetCfg> = serde_json::from_str(&rustc_output(
+        let mut targets: HashMap<String, TargetCfg> = serde_json::from_str(&rustc_output(
             config,
             &["--print=all-target-specs-json", "-Zunstable-options"],
         ))
         .unwrap();
 
-        let mut current = None;
         let mut all_targets = HashSet::new();
         let mut all_archs = HashSet::new();
         let mut all_oses = HashSet::new();
@@ -438,7 +488,19 @@ impl TargetCfgs {
         let mut all_families = HashSet::new();
         let mut all_pointer_widths = HashSet::new();
 
-        for (target, cfg) in targets.into_iter() {
+        // Handle custom target specs, which are not included in `--print=all-target-specs-json`.
+        if config.target.ends_with(".json") {
+            targets.insert(
+                config.target.clone(),
+                serde_json::from_str(&rustc_output(
+                    config,
+                    &["--print=target-spec-json", "-Zunstable-options", "--target", &config.target],
+                ))
+                .unwrap(),
+            );
+        }
+
+        for (target, cfg) in targets.iter() {
             all_archs.insert(cfg.arch.clone());
             all_oses.insert(cfg.os.clone());
             all_oses_and_envs.insert(cfg.os_and_env());
@@ -449,14 +511,11 @@ impl TargetCfgs {
             }
             all_pointer_widths.insert(format!("{}bit", cfg.pointer_width));
 
-            if target == config.target {
-                current = Some(cfg);
-            }
-            all_targets.insert(target.into());
+            all_targets.insert(target.clone());
         }
 
         Self {
-            current: current.expect("current target not found"),
+            current: Self::get_current_target_config(config, &targets),
             all_targets,
             all_archs,
             all_oses,
@@ -466,6 +525,49 @@ impl TargetCfgs {
             all_families,
             all_pointer_widths,
         }
+    }
+
+    fn get_current_target_config(
+        config: &Config,
+        targets: &HashMap<String, TargetCfg>,
+    ) -> TargetCfg {
+        let mut cfg = targets[&config.target].clone();
+
+        // To get the target information for the current target, we take the target spec obtained
+        // from `--print=all-target-specs-json`, and then we enrich it with the information
+        // gathered from `--print=cfg --target=$target`.
+        //
+        // This is done because some parts of the target spec can be overridden with `-C` flags,
+        // which are respected for `--print=cfg` but not for `--print=all-target-specs-json`. The
+        // code below extracts them from `--print=cfg`: make sure to only override fields that can
+        // actually be changed with `-C` flags.
+        for config in
+            rustc_output(config, &["--print=cfg", "--target", &config.target]).trim().lines()
+        {
+            let (name, value) = config
+                .split_once("=\"")
+                .map(|(name, value)| {
+                    (
+                        name,
+                        Some(
+                            value
+                                .strip_suffix("\"")
+                                .expect("key-value pair should be properly quoted"),
+                        ),
+                    )
+                })
+                .unwrap_or_else(|| (config, None));
+
+            match (name, value) {
+                // Can be overridden with `-C panic=$strategy`.
+                ("panic", Some("abort")) => cfg.panic = PanicStrategy::Abort,
+                ("panic", Some("unwind")) => cfg.panic = PanicStrategy::Unwind,
+                ("panic", other) => panic!("unexpected value for panic cfg: {other:?}"),
+                _ => {}
+            }
+        }
+
+        cfg
     }
 }
 
@@ -486,7 +588,15 @@ pub struct TargetCfg {
     #[serde(rename = "target-endian", default)]
     endian: Endian,
     #[serde(rename = "panic-strategy", default)]
-    panic: PanicStrategy,
+    pub(crate) panic: PanicStrategy,
+    #[serde(default)]
+    pub(crate) dynamic_linking: bool,
+    #[serde(rename = "supported-sanitizers", default)]
+    pub(crate) sanitizers: Vec<Sanitizer>,
+    #[serde(rename = "supports-xray", default)]
+    pub(crate) xray: bool,
+    #[serde(default = "default_reloc_model")]
+    pub(crate) relocation_model: String,
 }
 
 impl TargetCfg {
@@ -497,6 +607,10 @@ impl TargetCfg {
 
 fn default_os() -> String {
     "none".into()
+}
+
+fn default_reloc_model() -> String {
+    "pic".into()
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, Default, serde::Deserialize)]
@@ -569,6 +683,8 @@ pub const UI_EXTENSIONS: &[&str] = &[
     UI_STDERR_64,
     UI_STDERR_32,
     UI_STDERR_16,
+    UI_COVERAGE,
+    UI_COVERAGE_MAP,
 ];
 pub const UI_STDERR: &str = "stderr";
 pub const UI_STDOUT: &str = "stdout";
@@ -578,6 +694,8 @@ pub const UI_RUN_STDOUT: &str = "run.stdout";
 pub const UI_STDERR_64: &str = "64bit.stderr";
 pub const UI_STDERR_32: &str = "32bit.stderr";
 pub const UI_STDERR_16: &str = "16bit.stderr";
+pub const UI_COVERAGE: &str = "coverage";
+pub const UI_COVERAGE_MAP: &str = "cov-map";
 
 /// Absolute path to the directory where all output for all tests in the given
 /// `relative_dir` group should reside. Example:
@@ -596,6 +714,7 @@ pub fn output_testname_unique(
     let mode = config.compare_mode.as_ref().map_or("", |m| m.to_str());
     let debugger = config.debugger.as_ref().map_or("", |m| m.to_str());
     PathBuf::from(&testpaths.file.file_stem().unwrap())
+        .with_extra_extension(config.mode.output_dir_disambiguator())
         .with_extra_extension(revision.unwrap_or(""))
         .with_extra_extension(mode)
         .with_extra_extension(debugger)

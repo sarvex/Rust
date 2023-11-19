@@ -27,7 +27,7 @@ use rustc_hir::def_id::{DefId, DefIdMap};
 use rustc_index::IndexVec;
 use rustc_middle::mir;
 use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::ty::subst::SubstsRef;
+use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, Instance, ParamEnv, Ty, TypeVisitableExt};
 use rustc_session::config::{self, DebugInfo};
 use rustc_session::Session;
@@ -50,7 +50,6 @@ mod utils;
 
 pub use self::create_scope_map::compute_mir_scopes;
 pub use self::metadata::build_global_var_di_node;
-pub use self::metadata::extend_scope_to_file;
 
 #[allow(non_upper_case_globals)]
 const DW_TAG_auto_variable: c_uint = 0x100;
@@ -263,11 +262,11 @@ impl CodegenCx<'_, '_> {
     pub fn lookup_debug_loc(&self, pos: BytePos) -> DebugLoc {
         let (file, line, col) = match self.sess().source_map().lookup_line(pos) {
             Ok(SourceFileAndLine { sf: file, line }) => {
-                let line_pos = file.line_begin_pos(pos);
+                let line_pos = file.lines()[line];
 
                 // Use 1-based indexing.
                 let line = (line + 1) as u32;
-                let col = (pos - line_pos).to_u32() + 1;
+                let col = (file.relative_position(pos) - line_pos).to_u32() + 1;
 
                 (file, line, col)
             }
@@ -292,7 +291,7 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         llfn: &'ll Value,
         mir: &mir::Body<'tcx>,
-    ) -> Option<FunctionDebugContext<&'ll DIScope, &'ll DILocation>> {
+    ) -> Option<FunctionDebugContext<'tcx, &'ll DIScope, &'ll DILocation>> {
         if self.sess().opts.debuginfo == DebugInfo::None {
             return None;
         }
@@ -304,8 +303,10 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
             file_start_pos: BytePos(0),
             file_end_pos: BytePos(0),
         };
-        let mut fn_debug_context =
-            FunctionDebugContext { scopes: IndexVec::from_elem(empty_scope, &mir.source_scopes) };
+        let mut fn_debug_context = FunctionDebugContext {
+            scopes: IndexVec::from_elem(empty_scope, &mir.source_scopes),
+            inlined_function_scopes: Default::default(),
+        };
 
         // Fill in all the scopes, with the information from the MIR body.
         compute_mir_scopes(self, instance, mir, &mut fn_debug_context);
@@ -332,25 +333,26 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
             llvm::LLVMRustDIBuilderCreateSubroutineType(DIB(self), fn_signature)
         };
 
-        let mut name = String::new();
+        let mut name = String::with_capacity(64);
         type_names::push_item_name(tcx, def_id, false, &mut name);
 
         // Find the enclosing function, in case this is a closure.
         let enclosing_fn_def_id = tcx.typeck_root_def_id(def_id);
 
-        // We look up the generics of the enclosing function and truncate the substs
+        // We look up the generics of the enclosing function and truncate the args
         // to their length in order to cut off extra stuff that might be in there for
-        // closures or generators.
+        // closures or coroutines.
         let generics = tcx.generics_of(enclosing_fn_def_id);
-        let substs = instance.substs.truncate_to(tcx, generics);
+        let args = instance.args.truncate_to(tcx, generics);
 
         type_names::push_generic_params(
             tcx,
-            tcx.normalize_erasing_regions(ty::ParamEnv::reveal_all(), substs),
+            tcx.normalize_erasing_regions(ty::ParamEnv::reveal_all(), args),
+            enclosing_fn_def_id,
             &mut name,
         );
 
-        let template_parameters = get_template_parameters(self, generics, substs);
+        let template_parameters = get_template_parameters(self, generics, args);
 
         let linkage_name = &mangled_name_of_instance(self, instance).name;
         // Omit the linkage_name if it is the same as subprogram name.
@@ -454,7 +456,7 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
                         ty::Array(ct, _)
                             if (*ct == cx.tcx.types.u8) || cx.layout_of(*ct).is_zst() =>
                         {
-                            cx.tcx.mk_imm_ptr(*ct)
+                            Ty::new_imm_ptr(cx.tcx, *ct)
                         }
                         _ => t,
                     };
@@ -471,16 +473,16 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         fn get_template_parameters<'ll, 'tcx>(
             cx: &CodegenCx<'ll, 'tcx>,
             generics: &ty::Generics,
-            substs: SubstsRef<'tcx>,
+            args: GenericArgsRef<'tcx>,
         ) -> &'ll DIArray {
-            if substs.types().next().is_none() {
+            if args.types().next().is_none() {
                 return create_DIArray(DIB(cx), &[]);
             }
 
             // Again, only create type information if full debuginfo is enabled
             let template_params: Vec<_> = if cx.sess().opts.debuginfo == DebugInfo::Full {
                 let names = get_parameter_names(cx, generics);
-                iter::zip(substs, names)
+                iter::zip(args, names)
                     .filter_map(|(kind, name)| {
                         kind.as_type().map(|ty| {
                             let actual_type =
@@ -526,15 +528,17 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
             if let Some(impl_def_id) = cx.tcx.impl_of_method(instance.def_id()) {
                 // If the method does *not* belong to a trait, proceed
                 if cx.tcx.trait_id_of_impl(impl_def_id).is_none() {
-                    let impl_self_ty = cx.tcx.subst_and_normalize_erasing_regions(
-                        instance.substs,
+                    let impl_self_ty = cx.tcx.instantiate_and_normalize_erasing_regions(
+                        instance.args,
                         ty::ParamEnv::reveal_all(),
-                        cx.tcx.type_of(impl_def_id).skip_binder(),
+                        cx.tcx.type_of(impl_def_id),
                     );
 
                     // Only "class" methods are generally understood by LLVM,
                     // so avoid methods on other types (e.g., `<*mut T>::null`).
-                    if let ty::Adt(def, ..) = impl_self_ty.kind() && !def.is_box() {
+                    if let ty::Adt(def, ..) = impl_self_ty.kind()
+                        && !def.is_box()
+                    {
                         // Again, only create type information if full debuginfo is enabled
                         if cx.sess().opts.debuginfo == DebugInfo::Full && !impl_self_ty.has_param()
                         {

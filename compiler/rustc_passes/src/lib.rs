@@ -6,6 +6,9 @@
 
 #![allow(rustc::potential_query_instability)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![allow(internal_features)]
 #![feature(iter_intersperse)]
 #![feature(let_chains)]
 #![feature(map_try_insert)]
@@ -22,8 +25,9 @@ extern crate tracing;
 
 use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
 use rustc_fluent_macro::fluent_messages;
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 
+pub mod abi_test;
 mod check_attr;
 mod check_const;
 pub mod dead;

@@ -34,8 +34,8 @@ pub fn futex<'tcx>(
 
     let thread = this.get_active_thread();
     // This is a vararg function so we have to bring our own type for this pointer.
-    let addr = MPlaceTy::from_aligned_ptr(addr, this.machine.layouts.i32);
-    let addr_usize = addr.ptr.addr().bytes();
+    let addr = this.ptr_to_mplace(addr, this.machine.layouts.i32);
+    let addr_usize = addr.ptr().addr().bytes();
 
     let futex_private = this.eval_libc_i32("FUTEX_PRIVATE_FLAG");
     let futex_wait = this.eval_libc_i32("FUTEX_WAIT");
@@ -85,9 +85,8 @@ pub fn futex<'tcx>(
                 return Ok(());
             }
 
-            // `deref_operand` but not actually dereferencing the ptr yet (it might be NULL!).
-            let timeout = this.ref_to_mplace(&this.read_immediate(&args[3])?)?;
-            let timeout_time = if this.ptr_is_null(timeout.ptr)? {
+            let timeout = this.deref_pointer_as(&args[3], this.libc_ty_layout("timespec"))?;
+            let timeout_time = if this.ptr_is_null(timeout.ptr())? {
                 None
             } else {
                 let realtime = op & futex_realtime == futex_realtime;
@@ -247,7 +246,7 @@ pub fn futex<'tcx>(
             // before doing the syscall.
             this.atomic_fence(AtomicFenceOrd::SeqCst)?;
             let mut n = 0;
-            #[allow(clippy::integer_arithmetic)]
+            #[allow(clippy::arithmetic_side_effects)]
             for _ in 0..val {
                 if let Some(thread) = this.futex_wake(addr_usize, bitset) {
                     this.unblock_thread(thread);

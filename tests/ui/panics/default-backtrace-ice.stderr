@@ -5,7 +5,10 @@ LL | fn main() { missing_ident; }
    |             ^^^^^^^^^^^^^ not found in this scope
 
 
+aborting due to `-Z treat-err-as-bug=1`
 stack backtrace:
+(end_short_backtrace)
+(begin_short_backtrace)
 (end_short_backtrace)
 (begin_short_backtrace)
 

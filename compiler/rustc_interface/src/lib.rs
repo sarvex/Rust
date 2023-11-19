@@ -3,6 +3,7 @@
 #![feature(internal_output_capture)]
 #![feature(thread_spawn_unchecked)]
 #![feature(lazy_cell)]
+#![feature(let_chains)]
 #![feature(try_blocks)]
 #![recursion_limit = "256"]
 #![allow(rustc::potential_query_instability)]
@@ -25,7 +26,7 @@ pub mod util;
 
 pub use callbacks::setup_callbacks;
 pub use interface::{run_compiler, Config};
-pub use passes::{DEFAULT_EXTERN_QUERY_PROVIDERS, DEFAULT_QUERY_PROVIDERS};
+pub use passes::DEFAULT_QUERY_PROVIDERS;
 pub use queries::Queries;
 
 #[cfg(test)]

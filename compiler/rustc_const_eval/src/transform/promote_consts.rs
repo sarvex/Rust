@@ -14,11 +14,10 @@
 
 use rustc_hir as hir;
 use rustc_middle::mir;
-use rustc_middle::mir::traversal::ReversePostorderIter;
 use rustc_middle::mir::visit::{MutVisitor, MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
-use rustc_middle::ty::subst::InternalSubsts;
-use rustc_middle::ty::{self, List, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::GenericArgs;
+use rustc_middle::ty::{self, List, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::Span;
 
 use rustc_index::{Idx, IndexSlice, IndexVec};
@@ -53,9 +52,8 @@ impl<'tcx> MirPass<'tcx> for PromoteTemps<'tcx> {
             return;
         }
 
-        let mut rpo = traversal::reverse_postorder(body);
         let ccx = ConstCx::new(tcx, body);
-        let (mut temps, all_candidates) = collect_temps_and_candidates(&ccx, &mut rpo);
+        let (mut temps, all_candidates) = collect_temps_and_candidates(&ccx);
 
         let promotable_candidates = validate_candidates(&ccx, &mut temps, &all_candidates);
 
@@ -166,14 +164,13 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
 
 pub fn collect_temps_and_candidates<'tcx>(
     ccx: &ConstCx<'_, 'tcx>,
-    rpo: &mut ReversePostorderIter<'_, 'tcx>,
 ) -> (IndexVec<Local, TempState>, Vec<Candidate>) {
     let mut collector = Collector {
         temps: IndexVec::from_elem(TempState::Undefined, &ccx.body.local_decls),
         candidates: vec![],
         ccx,
     };
-    for (bb, data) in rpo {
+    for (bb, data) in traversal::reverse_postorder(ccx.body) {
         collector.visit_basic_block_data(bb, data);
     }
     (collector.temps, collector.candidates)
@@ -360,7 +357,9 @@ impl<'tcx> Validator<'_, 'tcx> {
                         return Err(Unpromotable);
                     }
 
-                    ProjectionElem::ConstantIndex { .. } | ProjectionElem::Subslice { .. } => {}
+                    ProjectionElem::ConstantIndex { .. }
+                    | ProjectionElem::Subtype(_)
+                    | ProjectionElem::Subslice { .. } => {}
 
                     ProjectionElem::Index(local) => {
                         let mut promotable = false;
@@ -375,7 +374,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                                     StatementKind::Assign(box (
                                         _,
                                         Rvalue::Use(Operand::Constant(c)),
-                                    )) => c.literal.try_eval_target_usize(self.tcx, self.param_env),
+                                    )) => c.const_.try_eval_target_usize(self.tcx, self.param_env),
                                     _ => None,
                                 }
                             } else {
@@ -457,7 +456,9 @@ impl<'tcx> Validator<'_, 'tcx> {
         match kind {
             // Reject these borrow types just to be safe.
             // FIXME(RalfJung): could we allow them? Should we? No point in it until we have a usecase.
-            BorrowKind::Shallow | BorrowKind::Unique => return Err(Unpromotable),
+            BorrowKind::Fake | BorrowKind::Mut { kind: MutBorrowKind::ClosureCapture } => {
+                return Err(Unpromotable);
+            }
 
             BorrowKind::Shared => {
                 let has_mut_interior = self.qualif_local::<qualifs::HasMutInterior>(place.local);
@@ -466,7 +467,9 @@ impl<'tcx> Validator<'_, 'tcx> {
                 }
             }
 
-            BorrowKind::Mut { .. } => {
+            // FIXME: consider changing this to only promote &mut [] for default borrows,
+            // also forbidding two phase borrows
+            BorrowKind::Mut { kind: MutBorrowKind::Default | MutBorrowKind::TwoPhaseBorrow } => {
                 let ty = place.ty(self.body, self.tcx).ty;
 
                 // In theory, any zero-sized value could be borrowed
@@ -553,7 +556,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                             // Integer division: the RHS must be a non-zero const.
                             let const_val = match rhs {
                                 Operand::Constant(c) => {
-                                    c.literal.try_eval_bits(self.tcx, self.param_env, lhs_ty)
+                                    c.const_.try_eval_bits(self.tcx, self.param_env)
                                 }
                                 _ => None,
                             };
@@ -572,13 +575,18 @@ impl<'tcx> Validator<'_, 'tcx> {
                     | BinOp::Gt
                     | BinOp::Offset
                     | BinOp::Add
+                    | BinOp::AddUnchecked
                     | BinOp::Sub
+                    | BinOp::SubUnchecked
                     | BinOp::Mul
+                    | BinOp::MulUnchecked
                     | BinOp::BitXor
                     | BinOp::BitAnd
                     | BinOp::BitOr
                     | BinOp::Shl
-                    | BinOp::Shr => {}
+                    | BinOp::ShlUnchecked
+                    | BinOp::Shr
+                    | BinOp::ShrUnchecked => {}
                 }
 
                 self.validate_operand(lhs)?;
@@ -638,7 +646,7 @@ impl<'tcx> Validator<'_, 'tcx> {
         // Everywhere else, we require `#[rustc_promotable]` on the callee.
         let promote_all_const_fn = matches!(
             self.const_kind,
-            Some(hir::ConstContext::Static(_) | hir::ConstContext::Const)
+            Some(hir::ConstContext::Static(_) | hir::ConstContext::Const { inline: false })
         );
         if !promote_all_const_fn {
             if let ty::FnDef(def_id, _) = *fn_ty.kind() {
@@ -753,21 +761,17 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
             let (mut rvalue, source_info) = {
                 let statement = &mut self.source[loc.block].statements[loc.statement_index];
                 let StatementKind::Assign(box (_, rhs)) = &mut statement.kind else {
-                    span_bug!(
-                        statement.source_info.span,
-                        "{:?} is not an assignment",
-                        statement
-                    );
+                    span_bug!(statement.source_info.span, "{:?} is not an assignment", statement);
                 };
 
                 (
                     if self.keep_original {
                         rhs.clone()
                     } else {
-                        let unit = Rvalue::Use(Operand::Constant(Box::new(Constant {
+                        let unit = Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
                             span: statement.source_info.span,
                             user_ty: None,
-                            literal: ConstantKind::zero_sized(self.tcx.types.unit),
+                            const_: Const::zero_sized(self.tcx.types.unit),
                         })));
                         mem::replace(rhs, unit)
                     },
@@ -795,7 +799,9 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
             };
 
             match terminator.kind {
-                TerminatorKind::Call { mut func, mut args, from_hir_call, fn_span, .. } => {
+                TerminatorKind::Call {
+                    mut func, mut args, call_source: desugar, fn_span, ..
+                } => {
                     self.visit_operand(&mut func, loc);
                     for arg in &mut args {
                         self.visit_operand(arg, loc);
@@ -811,7 +817,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
                             unwind: UnwindAction::Continue,
                             destination: Place::from(new_temp),
                             target: Some(new_target),
-                            from_hir_call,
+                            call_source: desugar,
                             fn_span,
                         },
                         source_info: SourceInfo::outermost(terminator.source_info.span),
@@ -837,13 +843,13 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
             let mut promoted_operand = |ty, span| {
                 promoted.span = span;
                 promoted.local_decls[RETURN_PLACE] = LocalDecl::new(ty, span);
-                let substs = tcx.erase_regions(InternalSubsts::identity_for_item(tcx, def));
-                let uneval = mir::UnevaluatedConst { def, substs, promoted: Some(promoted_id) };
+                let args = tcx.erase_regions(GenericArgs::identity_for_item(tcx, def));
+                let uneval = mir::UnevaluatedConst { def, args, promoted: Some(promoted_id) };
 
-                Operand::Constant(Box::new(Constant {
+                Operand::Constant(Box::new(ConstOperand {
                     span,
                     user_ty: None,
-                    literal: ConstantKind::Unevaluated(uneval, ty),
+                    const_: Const::Unevaluated(uneval, ty),
                 }))
             };
 
@@ -851,20 +857,22 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
             let local_decls = &mut self.source.local_decls;
             let loc = candidate.location;
             let statement = &mut blocks[loc.block].statements[loc.statement_index];
-            let StatementKind::Assign(box (_, Rvalue::Ref(region, borrow_kind, place))) = &mut statement.kind else {
+            let StatementKind::Assign(box (_, Rvalue::Ref(region, borrow_kind, place))) =
+                &mut statement.kind
+            else {
                 bug!()
             };
 
             // Use the underlying local for this (necessarily interior) borrow.
+            debug_assert!(region.is_erased());
             let ty = local_decls[place.local].ty;
             let span = statement.source_info.span;
 
-            let ref_ty = tcx.mk_ref(
+            let ref_ty = Ty::new_ref(
+                tcx,
                 tcx.lifetimes.re_erased,
                 ty::TypeAndMut { ty, mutbl: borrow_kind.to_mutbl_lossy() },
             );
-
-            *region = tcx.lifetimes.re_erased;
 
             let mut projection = vec![PlaceElem::Deref];
             projection.extend(place.projection);
@@ -961,7 +969,7 @@ pub fn promote_candidates<'tcx>(
             0,
             vec![],
             body.span,
-            body.generator_kind(),
+            body.coroutine_kind(),
             body.tainted_by_errors,
         );
         promoted.phase = MirPhase::Analysis(AnalysisPhase::Initial);
@@ -1034,8 +1042,8 @@ pub fn is_const_fn_in_array_repeat_expression<'tcx>(
         if let Some(Terminator { kind: TerminatorKind::Call { func, destination, .. }, .. }) =
             &block.terminator
         {
-            if let Operand::Constant(box Constant { literal, .. }) = func {
-                if let ty::FnDef(def_id, _) = *literal.ty().kind() {
+            if let Operand::Constant(box ConstOperand { const_, .. }) = func {
+                if let ty::FnDef(def_id, _) = *const_.ty().kind() {
                     if destination == place {
                         if ccx.tcx.is_const_fn(def_id) {
                             return true;

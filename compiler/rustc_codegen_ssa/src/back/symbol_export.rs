@@ -2,7 +2,7 @@ use crate::base::allocator_kind_for_codegen;
 
 use std::collections::hash_map::Entry::*;
 
-use rustc_ast::expand::allocator::ALLOCATOR_METHODS;
+use rustc_ast::expand::allocator::{ALLOCATOR_METHODS, NO_ALLOC_SHIM_IS_UNSTABLE};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LocalDefId, LOCAL_CRATE};
@@ -11,15 +11,15 @@ use rustc_middle::middle::exported_symbols::{
     metadata_symbol_name, ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
 };
 use rustc_middle::query::LocalCrate;
-use rustc_middle::ty::query::{ExternProviders, Providers};
-use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
 use rustc_middle::ty::Instance;
 use rustc_middle::ty::{self, SymbolName, TyCtxt};
+use rustc_middle::ty::{GenericArgKind, GenericArgsRef};
+use rustc_middle::util::Providers;
 use rustc_session::config::{CrateType, OomStrategy};
 use rustc_target::spec::SanitizerSet;
 
 pub fn threshold(tcx: TyCtxt<'_>) -> SymbolExportLevel {
-    crates_export_threshold(&tcx.sess.crate_types())
+    crates_export_threshold(tcx.crate_types())
 }
 
 fn crate_export_threshold(crate_type: CrateType) -> SymbolExportLevel {
@@ -233,14 +233,16 @@ fn exported_symbols_provider_local(
             ));
         }
 
+        let exported_symbol =
+            ExportedSymbol::NoDefId(SymbolName::new(tcx, NO_ALLOC_SHIM_IS_UNSTABLE));
         symbols.push((
-            ExportedSymbol::NoDefId(SymbolName::new(tcx, OomStrategy::SYMBOL)),
+            exported_symbol,
             SymbolExportInfo {
                 level: SymbolExportLevel::Rust,
-                kind: SymbolExportKind::Text,
+                kind: SymbolExportKind::Data,
                 used: false,
             },
-        ));
+        ))
     }
 
     if tcx.sess.instrument_coverage() || tcx.sess.opts.cg.profile_generate.enabled() {
@@ -288,8 +290,8 @@ fn exported_symbols_provider_local(
         }));
     }
 
-    if tcx.sess.crate_types().contains(&CrateType::Dylib)
-        || tcx.sess.crate_types().contains(&CrateType::ProcMacro)
+    if tcx.crate_types().contains(&CrateType::Dylib)
+        || tcx.crate_types().contains(&CrateType::ProcMacro)
     {
         let symbol_name = metadata_symbol_name(tcx);
         let exported_symbol = ExportedSymbol::NoDefId(SymbolName::new(tcx, &symbol_name));
@@ -317,23 +319,23 @@ fn exported_symbols_provider_local(
 
         let (_, cgus) = tcx.collect_and_partition_mono_items(());
 
-        for (mono_item, &(linkage, visibility)) in cgus.iter().flat_map(|cgu| cgu.items().iter()) {
-            if linkage != Linkage::External {
+        for (mono_item, data) in cgus.iter().flat_map(|cgu| cgu.items().iter()) {
+            if data.linkage != Linkage::External {
                 // We can only re-use things with external linkage, otherwise
                 // we'll get a linker error
                 continue;
             }
 
-            if need_visibility && visibility == Visibility::Hidden {
+            if need_visibility && data.visibility == Visibility::Hidden {
                 // If we potentially share things from Rust dylibs, they must
                 // not be hidden
                 continue;
             }
 
             match *mono_item {
-                MonoItem::Fn(Instance { def: InstanceDef::Item(def), substs }) => {
-                    if substs.non_erasable_generics().next().is_some() {
-                        let symbol = ExportedSymbol::Generic(def, substs);
+                MonoItem::Fn(Instance { def: InstanceDef::Item(def), args }) => {
+                    if args.non_erasable_generics(tcx, def).next().is_some() {
+                        let symbol = ExportedSymbol::Generic(def, args);
                         symbols.push((
                             symbol,
                             SymbolExportInfo {
@@ -344,10 +346,10 @@ fn exported_symbols_provider_local(
                         ));
                     }
                 }
-                MonoItem::Fn(Instance { def: InstanceDef::DropGlue(_, Some(ty)), substs }) => {
+                MonoItem::Fn(Instance { def: InstanceDef::DropGlue(def_id, Some(ty)), args }) => {
                     // A little sanity-check
                     debug_assert_eq!(
-                        substs.non_erasable_generics().next(),
+                        args.non_erasable_generics(tcx, def_id).next(),
                         Some(GenericArgKind::Type(ty))
                     );
                     symbols.push((
@@ -375,7 +377,7 @@ fn exported_symbols_provider_local(
 fn upstream_monomorphizations_provider(
     tcx: TyCtxt<'_>,
     (): (),
-) -> DefIdMap<FxHashMap<SubstsRef<'_>, CrateNum>> {
+) -> DefIdMap<FxHashMap<GenericArgsRef<'_>, CrateNum>> {
     let cnums = tcx.crates(());
 
     let mut instances: DefIdMap<FxHashMap<_, _>> = Default::default();
@@ -384,11 +386,11 @@ fn upstream_monomorphizations_provider(
 
     for &cnum in cnums.iter() {
         for (exported_symbol, _) in tcx.exported_symbols(cnum).iter() {
-            let (def_id, substs) = match *exported_symbol {
-                ExportedSymbol::Generic(def_id, substs) => (def_id, substs),
+            let (def_id, args) = match *exported_symbol {
+                ExportedSymbol::Generic(def_id, args) => (def_id, args),
                 ExportedSymbol::DropGlue(ty) => {
                     if let Some(drop_in_place_fn_def_id) = drop_in_place_fn_def_id {
-                        (drop_in_place_fn_def_id, tcx.mk_substs(&[ty.into()]))
+                        (drop_in_place_fn_def_id, tcx.mk_args(&[ty.into()]))
                     } else {
                         // `drop_in_place` in place does not exist, don't try
                         // to use it.
@@ -403,9 +405,9 @@ fn upstream_monomorphizations_provider(
                 }
             };
 
-            let substs_map = instances.entry(def_id).or_default();
+            let args_map = instances.entry(def_id).or_default();
 
-            match substs_map.entry(substs) {
+            match args_map.entry(args) {
                 Occupied(mut e) => {
                     // If there are multiple monomorphizations available,
                     // we select one deterministically.
@@ -427,17 +429,17 @@ fn upstream_monomorphizations_provider(
 fn upstream_monomorphizations_for_provider(
     tcx: TyCtxt<'_>,
     def_id: DefId,
-) -> Option<&FxHashMap<SubstsRef<'_>, CrateNum>> {
+) -> Option<&FxHashMap<GenericArgsRef<'_>, CrateNum>> {
     debug_assert!(!def_id.is_local());
     tcx.upstream_monomorphizations(()).get(&def_id)
 }
 
 fn upstream_drop_glue_for_provider<'tcx>(
     tcx: TyCtxt<'tcx>,
-    substs: SubstsRef<'tcx>,
+    args: GenericArgsRef<'tcx>,
 ) -> Option<CrateNum> {
     if let Some(def_id) = tcx.lang_items().drop_in_place_fn() {
-        tcx.upstream_monomorphizations_for(def_id).and_then(|monos| monos.get(&substs).cloned())
+        tcx.upstream_monomorphizations_for(def_id).and_then(|monos| monos.get(&args).cloned())
     } else {
         None
     }
@@ -455,11 +457,9 @@ pub fn provide(providers: &mut Providers) {
     providers.is_unreachable_local_definition = is_unreachable_local_definition_provider;
     providers.upstream_drop_glue_for = upstream_drop_glue_for_provider;
     providers.wasm_import_module_map = wasm_import_module_map;
-}
-
-pub fn provide_extern(providers: &mut ExternProviders) {
-    providers.is_reachable_non_generic = is_reachable_non_generic_provider_extern;
-    providers.upstream_monomorphizations_for = upstream_monomorphizations_for_provider;
+    providers.extern_queries.is_reachable_non_generic = is_reachable_non_generic_provider_extern;
+    providers.extern_queries.upstream_monomorphizations_for =
+        upstream_monomorphizations_for_provider;
 }
 
 fn symbol_export_level(tcx: TyCtxt<'_>, sym_def_id: DefId) -> SymbolExportLevel {
@@ -510,10 +510,10 @@ pub fn symbol_name_for_instance_in_crate<'tcx>(
                 instantiating_crate,
             )
         }
-        ExportedSymbol::Generic(def_id, substs) => {
+        ExportedSymbol::Generic(def_id, args) => {
             rustc_symbol_mangling::symbol_name_for_instance_in_crate(
                 tcx,
-                Instance::new(def_id, substs),
+                Instance::new(def_id, args),
                 instantiating_crate,
             )
         }
@@ -522,7 +522,7 @@ pub fn symbol_name_for_instance_in_crate<'tcx>(
                 tcx,
                 ty::Instance {
                     def: ty::InstanceDef::ThreadLocalShim(def_id),
-                    substs: ty::InternalSubsts::empty(),
+                    args: ty::GenericArgs::empty(),
                 },
                 instantiating_crate,
             )
@@ -569,7 +569,7 @@ pub fn linking_symbol_name_for_instance_in_crate<'tcx>(
             None
         }
         ExportedSymbol::NonGeneric(def_id) => Some(Instance::mono(tcx, def_id)),
-        ExportedSymbol::Generic(def_id, substs) => Some(Instance::new(def_id, substs)),
+        ExportedSymbol::Generic(def_id, args) => Some(Instance::new(def_id, args)),
         // DropGlue always use the Rust calling convention and thus follow the target's default
         // symbol decoration scheme.
         ExportedSymbol::DropGlue(..) => None,

@@ -1,7 +1,7 @@
 // check-pass
 // aux-build: rpitit.rs
-// [next] compile-flags: -Zlower-impl-trait-in-trait-to-assoc-ty
-// revisions: current next
+
+#![feature(lint_reasons)]
 
 extern crate rpitit;
 
@@ -9,9 +9,24 @@ use rpitit::{Foo, Foreign};
 use std::sync::Arc;
 
 // Implement an RPITIT from another crate.
-struct Local;
+pub struct Local;
 impl Foo for Local {
-    fn bar(self) -> Arc<String> { Arc::new(String::new()) }
+    #[expect(refining_impl_trait)]
+    fn bar(self) -> Arc<String> {
+        Arc::new(String::new())
+    }
+}
+
+struct LocalIgnoreRefining;
+impl Foo for LocalIgnoreRefining {
+    #[deny(refining_impl_trait)]
+    fn bar(self) -> Arc<String> {
+        Arc::new(String::new())
+    }
+}
+
+fn generic(f: impl Foo) {
+    let x = &*f.bar();
 }
 
 fn main() {
@@ -19,4 +34,5 @@ fn main() {
     let &() = Foreign.bar();
 
     let x: Arc<String> = Local.bar();
+    let x: Arc<String> = LocalIgnoreRefining.bar();
 }

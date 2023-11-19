@@ -46,7 +46,9 @@ pub struct SeparateConstSwitch;
 
 impl<'tcx> MirPass<'tcx> for SeparateConstSwitch {
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 4
+        // This pass participates in some as-of-yet untested unsoundness found
+        // in https://github.com/rust-lang/rust/issues/112460
+        sess.mir_opt_level() >= 2 && sess.opts.unstable_opts.unsound_mir_opts
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -106,17 +108,17 @@ pub fn separate_const_switch(body: &mut Body<'_>) -> usize {
                         }
 
                         // The following terminators are not allowed
-                        TerminatorKind::Resume
+                        TerminatorKind::UnwindResume
                         | TerminatorKind::Drop { .. }
                         | TerminatorKind::Call { .. }
                         | TerminatorKind::Assert { .. }
                         | TerminatorKind::FalseUnwind { .. }
                         | TerminatorKind::Yield { .. }
-                        | TerminatorKind::Terminate
+                        | TerminatorKind::UnwindTerminate(_)
                         | TerminatorKind::Return
                         | TerminatorKind::Unreachable
                         | TerminatorKind::InlineAsm { .. }
-                        | TerminatorKind::GeneratorDrop => {
+                        | TerminatorKind::CoroutineDrop => {
                             continue 'predec_iter;
                         }
                     }
@@ -163,11 +165,11 @@ pub fn separate_const_switch(body: &mut Body<'_>) -> usize {
                 });
             }
 
-            TerminatorKind::Resume
-            | TerminatorKind::Terminate
+            TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
-            | TerminatorKind::GeneratorDrop
+            | TerminatorKind::CoroutineDrop
             | TerminatorKind::Assert { .. }
             | TerminatorKind::FalseUnwind { .. }
             | TerminatorKind::Drop { .. }

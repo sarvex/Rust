@@ -479,7 +479,7 @@ macro_rules! uint_impl {
         )]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
+        #[rustc_const_unstable(feature = "unchecked_math", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_add(self, rhs: Self) -> Self {
@@ -548,7 +548,7 @@ macro_rules! uint_impl {
         )]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
+        #[rustc_const_unstable(feature = "unchecked_math", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_sub(self, rhs: Self) -> Self {
@@ -595,7 +595,7 @@ macro_rules! uint_impl {
         )]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
+        #[rustc_const_unstable(feature = "unchecked_math", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_mul(self, rhs: Self) -> Self {
@@ -926,13 +926,13 @@ macro_rules! uint_impl {
         ///
         #[doc = concat!("[`checked_shl`]: ", stringify!($SelfT), "::checked_shl")]
         #[unstable(
-            feature = "unchecked_math",
+            feature = "unchecked_shifts",
             reason = "niche optimization path",
             issue = "85122",
         )]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
+        #[rustc_const_unstable(feature = "unchecked_shifts", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_shl(self, rhs: u32) -> Self {
@@ -974,13 +974,13 @@ macro_rules! uint_impl {
         ///
         #[doc = concat!("[`checked_shr`]: ", stringify!($SelfT), "::checked_shr")]
         #[unstable(
-            feature = "unchecked_math",
+            feature = "unchecked_shifts",
             reason = "niche optimization path",
             issue = "85122",
         )]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
+        #[rustc_const_unstable(feature = "unchecked_shifts", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_shr(self, rhs: u32) -> Self {
@@ -1259,6 +1259,10 @@ macro_rules! uint_impl {
         /// This function exists, so that all operations
         /// are accounted for in the wrapping operations.
         ///
+        /// # Panics
+        ///
+        /// This function will panic if `rhs` is 0.
+        ///
         /// # Examples
         ///
         /// Basic usage:
@@ -1284,6 +1288,10 @@ macro_rules! uint_impl {
         /// definitions of division are equal, this
         /// is exactly equal to `self.wrapping_div(rhs)`.
         ///
+        /// # Panics
+        ///
+        /// This function will panic if `rhs` is 0.
+        ///
         /// # Examples
         ///
         /// Basic usage:
@@ -1306,6 +1314,10 @@ macro_rules! uint_impl {
         /// There's no way wrapping could ever happen.
         /// This function exists, so that all operations
         /// are accounted for in the wrapping operations.
+        ///
+        /// # Panics
+        ///
+        /// This function will panic if `rhs` is 0.
         ///
         /// # Examples
         ///
@@ -1332,6 +1344,10 @@ macro_rules! uint_impl {
         /// Since, for the positive integers, all common
         /// definitions of division are equal, this
         /// is exactly equal to `self.wrapping_rem(rhs)`.
+        ///
+        /// # Panics
+        ///
+        /// This function will panic if `rhs` is 0.
         ///
         /// # Examples
         ///
@@ -1402,7 +1418,7 @@ macro_rules! uint_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
-        #[rustc_allow_const_fn_unstable(const_inherent_unchecked_arith)]
+        #[rustc_allow_const_fn_unstable(unchecked_shifts)]
         pub const fn wrapping_shl(self, rhs: u32) -> Self {
             // SAFETY: the masking by the bitsize of the type ensures that we do not shift
             // out of bounds
@@ -1435,7 +1451,7 @@ macro_rules! uint_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
-        #[rustc_allow_const_fn_unstable(const_inherent_unchecked_arith)]
+        #[rustc_allow_const_fn_unstable(unchecked_shifts)]
         pub const fn wrapping_shr(self, rhs: u32) -> Self {
             // SAFETY: the masking by the bitsize of the type ensures that we do not shift
             // out of bounds
@@ -1979,6 +1995,54 @@ macro_rules! uint_impl {
             acc * base
         }
 
+        /// Returns the square root of the number, rounded down.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        /// ```
+        /// #![feature(isqrt)]
+        #[doc = concat!("assert_eq!(10", stringify!($SelfT), ".isqrt(), 3);")]
+        /// ```
+        #[unstable(feature = "isqrt", issue = "116226")]
+        #[rustc_const_unstable(feature = "isqrt", issue = "116226")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        pub const fn isqrt(self) -> Self {
+            if self < 2 {
+                return self;
+            }
+
+            // The algorithm is based on the one presented in
+            // <https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Binary_numeral_system_(base_2)>
+            // which cites as source the following C code:
+            // <https://web.archive.org/web/20120306040058/http://medialab.freaknet.org/martin/src/sqrt/sqrt.c>.
+
+            let mut op = self;
+            let mut res = 0;
+            let mut one = 1 << (self.ilog2() & !1);
+
+            while one != 0 {
+                if op >= res + one {
+                    op -= res + one;
+                    res = (res >> 1) + one;
+                } else {
+                    res >>= 1;
+                }
+                one >>= 2;
+            }
+
+            // SAFETY: the result is positive and fits in an integer with half as many bits.
+            // Inform the optimizer about it.
+            unsafe {
+                intrinsics::assume(0 < res);
+                intrinsics::assume(res < 1 << (Self::BITS / 2));
+            }
+
+            res
+        }
+
         /// Performs Euclidean division.
         ///
         /// Since, for the positive integers, all common
@@ -2024,6 +2088,7 @@ macro_rules! uint_impl {
         /// ```
         #[doc = concat!("assert_eq!(7", stringify!($SelfT), ".rem_euclid(4), 3); // or any other integer type")]
         /// ```
+        #[doc(alias = "modulo", alias = "mod")]
         #[stable(feature = "euclidean_division", since = "1.38.0")]
         #[rustc_const_stable(feature = "const_euclidean_int_methods", since = "1.52.0")]
         #[must_use = "this returns the result of the operation, \
@@ -2074,10 +2139,10 @@ macro_rules! uint_impl {
         /// Basic usage:
         ///
         /// ```
-        /// #![feature(int_roundings)]
         #[doc = concat!("assert_eq!(7_", stringify!($SelfT), ".div_ceil(4), 2);")]
         /// ```
-        #[unstable(feature = "int_roundings", issue = "88581")]
+        #[stable(feature = "int_roundings1", since = "1.73.0")]
+        #[rustc_const_stable(feature = "int_roundings1", since = "1.73.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
@@ -2109,11 +2174,11 @@ macro_rules! uint_impl {
         /// Basic usage:
         ///
         /// ```
-        /// #![feature(int_roundings)]
         #[doc = concat!("assert_eq!(16_", stringify!($SelfT), ".next_multiple_of(8), 16);")]
         #[doc = concat!("assert_eq!(23_", stringify!($SelfT), ".next_multiple_of(8), 24);")]
         /// ```
-        #[unstable(feature = "int_roundings", issue = "88581")]
+        #[stable(feature = "int_roundings1", since = "1.73.0")]
+        #[rustc_const_stable(feature = "int_roundings1", since = "1.73.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
@@ -2134,13 +2199,13 @@ macro_rules! uint_impl {
         /// Basic usage:
         ///
         /// ```
-        /// #![feature(int_roundings)]
         #[doc = concat!("assert_eq!(16_", stringify!($SelfT), ".checked_next_multiple_of(8), Some(16));")]
         #[doc = concat!("assert_eq!(23_", stringify!($SelfT), ".checked_next_multiple_of(8), Some(24));")]
         #[doc = concat!("assert_eq!(1_", stringify!($SelfT), ".checked_next_multiple_of(0), None);")]
         #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.checked_next_multiple_of(2), None);")]
         /// ```
-        #[unstable(feature = "int_roundings", issue = "88581")]
+        #[stable(feature = "int_roundings1", since = "1.73.0")]
+        #[rustc_const_stable(feature = "int_roundings1", since = "1.73.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]

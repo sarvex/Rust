@@ -48,7 +48,7 @@ pub(super) fn build_custom_mir<'tcx>(
         source: MirSource::item(did),
         phase: MirPhase::Built,
         source_scopes: IndexVec::new(),
-        generator: None,
+        coroutine: None,
         local_decls: IndexVec::new(),
         user_type_annotations: IndexVec::new(),
         arg_count: params.len(),
@@ -60,6 +60,7 @@ pub(super) fn build_custom_mir<'tcx>(
         tainted_by_errors: None,
         injection_phase: None,
         pass_count: 0,
+        function_coverage_info: None,
     };
 
     body.local_decls.push(LocalDecl::new(return_ty, return_ty_span));
@@ -118,7 +119,11 @@ fn parse_attribute(attr: &Attribute) -> MirPhase {
                 phase = Some(value);
             }
             other => {
-                panic!("Unexpected key {}", other);
+                span_bug!(
+                    nested.span(),
+                    "Unexpected key while parsing custom_mir attribute: '{}'",
+                    other
+                );
             }
         }
     }
@@ -154,6 +159,19 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
         ParseError {
             span: expr.span,
             item_description: format!("{:?}", expr.kind),
+            expected: expected.to_string(),
+        }
+    }
+
+    fn stmt_error(&self, stmt: StmtId, expected: &'static str) -> ParseError {
+        let stmt = &self.thir[stmt];
+        let span = match stmt.kind {
+            StmtKind::Expr { expr, .. } => self.thir[expr].span,
+            StmtKind::Let { span, .. } => span,
+        };
+        ParseError {
+            span,
+            item_description: format!("{:?}", stmt.kind),
             expected: expected.to_string(),
         }
     }

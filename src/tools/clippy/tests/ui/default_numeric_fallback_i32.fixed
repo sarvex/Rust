@@ -1,4 +1,3 @@
-//@run-rustfix
 //@aux-build:proc_macros.rs
 
 #![feature(lint_reasons)]

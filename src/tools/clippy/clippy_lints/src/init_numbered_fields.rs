@@ -20,7 +20,7 @@ declare_clippy_lint! {
     /// benefit as opposed to tuple initializers
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// struct TupleStruct(u8, u16);
     ///
     /// let _ = TupleStruct {
@@ -71,7 +71,7 @@ impl<'tcx> LateLintPass<'tcx> for NumberedFields {
                     INIT_NUMBERED_FIELDS,
                     e.span,
                     "used a field initializer for a tuple struct",
-                    "try this instead",
+                    "try",
                     snippet,
                     appl,
                 );

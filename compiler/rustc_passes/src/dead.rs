@@ -1,18 +1,20 @@
-// This implements the dead-code warning pass. It follows middle::reachable
-// closely. The idea is that all reachable symbols are live, codes called
-// from live codes are live, and everything else is dead.
+// This implements the dead-code warning pass.
+// All reachable symbols are live, code called from live code is live, code with certain lint
+// expectations such as `#[expect(unused)]` and `#[expect(dead_code)]` is live, and everything else
+// is dead.
 
 use hir::def_id::{LocalDefIdMap, LocalDefIdSet};
 use itertools::Itertools;
+use rustc_data_structures::unord::UnordSet;
 use rustc_errors::MultiSpan;
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Node, PatKind, TyKind};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::privacy::Level;
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::lint;
 use rustc_span::symbol::{sym, Symbol};
@@ -42,8 +44,16 @@ fn should_explore(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     )
 }
 
+/// Determine if a work from the worklist is coming from the a `#[allow]`
+/// or a `#[expect]` of `dead_code`
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+enum ComesFromAllowExpect {
+    Yes,
+    No,
+}
+
 struct MarkSymbolVisitor<'tcx> {
-    worklist: Vec<LocalDefId>,
+    worklist: Vec<(LocalDefId, ComesFromAllowExpect)>,
     tcx: TyCtxt<'tcx>,
     maybe_typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
     live_symbols: LocalDefIdSet,
@@ -72,7 +82,7 @@ impl<'tcx> MarkSymbolVisitor<'tcx> {
     fn check_def_id(&mut self, def_id: DefId) {
         if let Some(def_id) = def_id.as_local() {
             if should_explore(self.tcx, def_id) || self.struct_constructors.contains_key(&def_id) {
-                self.worklist.push(def_id);
+                self.worklist.push((def_id, ComesFromAllowExpect::No));
             }
             self.live_symbols.insert(def_id);
         }
@@ -183,15 +193,15 @@ impl<'tcx> MarkSymbolVisitor<'tcx> {
 
         if let hir::ExprKind::Assign(lhs, rhs, _) = assign.kind
             && check_for_self_assign_helper(self.typeck_results(), lhs, rhs)
-                && !assign.span.from_expansion()
+            && !assign.span.from_expansion()
         {
-                let is_field_assign = matches!(lhs.kind, hir::ExprKind::Field(..));
-                self.tcx.emit_spanned_lint(
-                    lint::builtin::DEAD_CODE,
-                    assign.hir_id,
-                    assign.span,
-                    UselessAssignment { is_field_assign, ty: self.typeck_results().expr_ty(lhs) }
-                )
+            let is_field_assign = matches!(lhs.kind, hir::ExprKind::Field(..));
+            self.tcx.emit_spanned_lint(
+                lint::builtin::DEAD_CODE,
+                assign.hir_id,
+                assign.span,
+                UselessAssignment { is_field_assign, ty: self.typeck_results().expr_ty(lhs) },
+            )
         }
     }
 
@@ -247,10 +257,10 @@ impl<'tcx> MarkSymbolVisitor<'tcx> {
 
         let mut current_ty = container;
 
-        for &index in indices {
+        for &(variant, field) in indices {
             match current_ty.kind() {
                 ty::Adt(def, subst) => {
-                    let field = &def.non_enum_variant().fields[index];
+                    let field = &def.variant(variant).fields[field];
 
                     self.insert_def_id(field.did);
                     let field_ty = field.ty(self.tcx, subst);
@@ -261,7 +271,7 @@ impl<'tcx> MarkSymbolVisitor<'tcx> {
                 // but we may need to mark subfields
                 ty::Tuple(tys) => {
                     current_ty =
-                        self.tcx.normalize_erasing_regions(param_env, tys[index.as_usize()]);
+                        self.tcx.normalize_erasing_regions(param_env, tys[field.as_usize()]);
                 }
                 _ => span_bug!(expr.span, "named field access on non-ADT"),
             }
@@ -269,14 +279,16 @@ impl<'tcx> MarkSymbolVisitor<'tcx> {
     }
 
     fn mark_live_symbols(&mut self) {
-        let mut scanned = LocalDefIdSet::default();
-        while let Some(id) = self.worklist.pop() {
-            if !scanned.insert(id) {
+        let mut scanned = UnordSet::default();
+        while let Some(work) = self.worklist.pop() {
+            if !scanned.insert(work) {
                 continue;
             }
 
+            let (id, comes_from_allow_expect) = work;
+
             // Avoid accessing the HIR for the synthesized associated type generated for RPITITs.
-            if self.tcx.opt_rpitit_info(id.to_def_id()).is_some() {
+            if self.tcx.is_impl_trait_in_trait(id.to_def_id()) {
                 self.live_symbols.insert(id);
                 continue;
             }
@@ -286,7 +298,30 @@ impl<'tcx> MarkSymbolVisitor<'tcx> {
             let id = self.struct_constructors.get(&id).copied().unwrap_or(id);
 
             if let Some(node) = self.tcx.hir().find_by_def_id(id) {
-                self.live_symbols.insert(id);
+                // When using `#[allow]` or `#[expect]` of `dead_code`, we do a QOL improvement
+                // by declaring fn calls, statics, ... within said items as live, as well as
+                // the item itself, although technically this is not the case.
+                //
+                // This means that the lint for said items will never be fired.
+                //
+                // This doesn't make any difference for the item declared with `#[allow]`, as
+                // the lint firing will be a nop, as it will be silenced by the `#[allow]` of
+                // the item.
+                //
+                // However, for `#[expect]`, the presence or absence of the lint is relevant,
+                // so we don't add it to the list of live symbols when it comes from a
+                // `#[expect]`. This means that we will correctly report an item as live or not
+                // for the `#[expect]` case.
+                //
+                // Note that an item can and will be duplicated on the worklist with different
+                // `ComesFromAllowExpect`, particularly if it was added from the
+                // `effective_visibilities` query or from the `#[allow]`/`#[expect]` checks,
+                // this "duplication" is essential as otherwise a function with `#[expect]`
+                // called from a `pub fn` may be falsely reported as not live, falsely
+                // triggering the `unfulfilled_lint_expectations` lint.
+                if comes_from_allow_expect != ComesFromAllowExpect::Yes {
+                    self.live_symbols.insert(id);
+                }
                 self.visit_node(node);
             }
         }
@@ -304,7 +339,7 @@ impl<'tcx> MarkSymbolVisitor<'tcx> {
             if let Some(trait_of) = self.tcx.trait_id_of_impl(impl_of)
                 && self.tcx.has_attr(trait_of, sym::rustc_trivial_field_reads)
             {
-                let trait_ref = self.tcx.impl_trait_ref(impl_of).unwrap().subst_identity();
+                let trait_ref = self.tcx.impl_trait_ref(impl_of).unwrap().instantiate_identity();
                 if let ty::Adt(adt_def, _) = trait_ref.self_ty().kind()
                     && let Some(adt_def_id) = adt_def.did().as_local()
                 {
@@ -353,7 +388,7 @@ impl<'tcx> MarkSymbolVisitor<'tcx> {
                     //// This is done to handle the case where, for example, the static
                     //// method of a private type is used, but the type itself is never
                     //// called directly.
-                    let self_ty = self.tcx.type_of(item).subst_identity();
+                    let self_ty = self.tcx.type_of(item).instantiate_identity();
                     match *self_ty.kind() {
                         ty::Adt(def, _) => self.check_def_id(def.did()),
                         ty::Foreign(did) => self.check_def_id(did),
@@ -500,18 +535,33 @@ impl<'tcx> Visitor<'tcx> for MarkSymbolVisitor<'tcx> {
 
         self.in_pat = in_pat;
     }
+
+    fn visit_inline_const(&mut self, c: &'tcx hir::ConstBlock) {
+        // When inline const blocks are used in pattern position, paths
+        // referenced by it should be considered as used.
+        let in_pat = mem::replace(&mut self.in_pat, false);
+
+        self.live_symbols.insert(c.def_id);
+        intravisit::walk_inline_const(self, c);
+
+        self.in_pat = in_pat;
+    }
 }
 
-fn has_allow_dead_code_or_lang_attr(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+fn has_allow_dead_code_or_lang_attr(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+) -> Option<ComesFromAllowExpect> {
     fn has_lang_attr(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         tcx.has_attr(def_id, sym::lang)
             // Stable attribute for #[lang = "panic_impl"]
             || tcx.has_attr(def_id, sym::panic_handler)
     }
 
-    fn has_allow_dead_code(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+    fn has_allow_expect_dead_code(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
-        tcx.lint_level_at_node(lint::builtin::DEAD_CODE, hir_id).0 == lint::Allow
+        let lint_level = tcx.lint_level_at_node(lint::builtin::DEAD_CODE, hir_id).0;
+        matches!(lint_level, lint::Allow | lint::Expect(_))
     }
 
     fn has_used_like_attr(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
@@ -526,9 +576,13 @@ fn has_allow_dead_code_or_lang_attr(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool
         }
     }
 
-    has_allow_dead_code(tcx, def_id)
-        || has_used_like_attr(tcx, def_id)
-        || has_lang_attr(tcx, def_id)
+    if has_allow_expect_dead_code(tcx, def_id) {
+        Some(ComesFromAllowExpect::Yes)
+    } else if has_used_like_attr(tcx, def_id) || has_lang_attr(tcx, def_id) {
+        Some(ComesFromAllowExpect::No)
+    } else {
+        None
+    }
 }
 
 // These check_* functions seeds items that
@@ -546,21 +600,23 @@ fn has_allow_dead_code_or_lang_attr(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool
 //     * Implementations of traits and trait methods
 fn check_item<'tcx>(
     tcx: TyCtxt<'tcx>,
-    worklist: &mut Vec<LocalDefId>,
+    worklist: &mut Vec<(LocalDefId, ComesFromAllowExpect)>,
     struct_constructors: &mut LocalDefIdMap<LocalDefId>,
     id: hir::ItemId,
 ) {
     let allow_dead_code = has_allow_dead_code_or_lang_attr(tcx, id.owner_id.def_id);
-    if allow_dead_code {
-        worklist.push(id.owner_id.def_id);
+    if let Some(comes_from_allow) = allow_dead_code {
+        worklist.push((id.owner_id.def_id, comes_from_allow));
     }
 
     match tcx.def_kind(id.owner_id) {
         DefKind::Enum => {
             let item = tcx.hir().item(id);
             if let hir::ItemKind::Enum(ref enum_def, _) = item.kind {
-                if allow_dead_code {
-                    worklist.extend(enum_def.variants.iter().map(|variant| variant.def_id));
+                if let Some(comes_from_allow) = allow_dead_code {
+                    worklist.extend(
+                        enum_def.variants.iter().map(|variant| (variant.def_id, comes_from_allow)),
+                    );
                 }
 
                 for variant in enum_def.variants {
@@ -572,7 +628,7 @@ fn check_item<'tcx>(
         }
         DefKind::Impl { of_trait } => {
             if of_trait {
-                worklist.push(id.owner_id.def_id);
+                worklist.push((id.owner_id.def_id, ComesFromAllowExpect::No));
             }
 
             // get DefIds from another query
@@ -583,8 +639,10 @@ fn check_item<'tcx>(
 
             // And we access the Map here to get HirId from LocalDefId
             for id in local_def_ids {
-                if of_trait || has_allow_dead_code_or_lang_attr(tcx, id) {
-                    worklist.push(id);
+                if of_trait {
+                    worklist.push((id, ComesFromAllowExpect::No));
+                } else if let Some(comes_from_allow) = has_allow_dead_code_or_lang_attr(tcx, id) {
+                    worklist.push((id, comes_from_allow));
                 }
             }
         }
@@ -598,43 +656,60 @@ fn check_item<'tcx>(
         }
         DefKind::GlobalAsm => {
             // global_asm! is always live.
-            worklist.push(id.owner_id.def_id);
+            worklist.push((id.owner_id.def_id, ComesFromAllowExpect::No));
         }
         _ => {}
     }
 }
 
-fn check_trait_item(tcx: TyCtxt<'_>, worklist: &mut Vec<LocalDefId>, id: hir::TraitItemId) {
+fn check_trait_item(
+    tcx: TyCtxt<'_>,
+    worklist: &mut Vec<(LocalDefId, ComesFromAllowExpect)>,
+    id: hir::TraitItemId,
+) {
     use hir::TraitItemKind::{Const, Fn};
     if matches!(tcx.def_kind(id.owner_id), DefKind::AssocConst | DefKind::AssocFn) {
         let trait_item = tcx.hir().trait_item(id);
         if matches!(trait_item.kind, Const(_, Some(_)) | Fn(_, hir::TraitFn::Provided(_)))
-            && has_allow_dead_code_or_lang_attr(tcx, trait_item.owner_id.def_id)
+            && let Some(comes_from_allow) =
+                has_allow_dead_code_or_lang_attr(tcx, trait_item.owner_id.def_id)
         {
-            worklist.push(trait_item.owner_id.def_id);
+            worklist.push((trait_item.owner_id.def_id, comes_from_allow));
         }
     }
 }
 
-fn check_foreign_item(tcx: TyCtxt<'_>, worklist: &mut Vec<LocalDefId>, id: hir::ForeignItemId) {
+fn check_foreign_item(
+    tcx: TyCtxt<'_>,
+    worklist: &mut Vec<(LocalDefId, ComesFromAllowExpect)>,
+    id: hir::ForeignItemId,
+) {
     if matches!(tcx.def_kind(id.owner_id), DefKind::Static(_) | DefKind::Fn)
-        && has_allow_dead_code_or_lang_attr(tcx, id.owner_id.def_id)
+        && let Some(comes_from_allow) = has_allow_dead_code_or_lang_attr(tcx, id.owner_id.def_id)
     {
-        worklist.push(id.owner_id.def_id);
+        worklist.push((id.owner_id.def_id, comes_from_allow));
     }
 }
 
-fn create_and_seed_worklist(tcx: TyCtxt<'_>) -> (Vec<LocalDefId>, LocalDefIdMap<LocalDefId>) {
+fn create_and_seed_worklist(
+    tcx: TyCtxt<'_>,
+) -> (Vec<(LocalDefId, ComesFromAllowExpect)>, LocalDefIdMap<LocalDefId>) {
     let effective_visibilities = &tcx.effective_visibilities(());
     // see `MarkSymbolVisitor::struct_constructors`
     let mut struct_constructors = Default::default();
     let mut worklist = effective_visibilities
         .iter()
         .filter_map(|(&id, effective_vis)| {
-            effective_vis.is_public_at_level(Level::Reachable).then_some(id)
+            effective_vis
+                .is_public_at_level(Level::Reachable)
+                .then_some(id)
+                .map(|id| (id, ComesFromAllowExpect::No))
         })
         // Seed entry point
-        .chain(tcx.entry_fn(()).and_then(|(def_id, _)| def_id.as_local()))
+        .chain(
+            tcx.entry_fn(())
+                .and_then(|(def_id, _)| def_id.as_local().map(|id| (id, ComesFromAllowExpect::No))),
+        )
         .collect::<Vec<_>>();
 
     let crate_items = tcx.hir_crate_items(());
@@ -674,7 +749,7 @@ fn live_symbols_and_ignored_derived_traits(
     (symbol_visitor.live_symbols, symbol_visitor.ignored_derived_traits)
 }
 
-struct DeadVariant {
+struct DeadItem {
     def_id: LocalDefId,
     name: Symbol,
     level: lint::Level,
@@ -696,7 +771,7 @@ impl<'tcx> DeadVisitor<'tcx> {
         if self.live_symbols.contains(&field.did.expect_local()) {
             return ShouldWarnAboutField::No;
         }
-        let field_type = self.tcx.type_of(field.did).subst_identity();
+        let field_type = self.tcx.type_of(field.did).instantiate_identity();
         if field_type.is_phantom_data() {
             return ShouldWarnAboutField::No;
         }
@@ -712,7 +787,13 @@ impl<'tcx> DeadVisitor<'tcx> {
         ShouldWarnAboutField::Yes(is_positional)
     }
 
-    fn warn_multiple_dead_codes(
+    // # Panics
+    // All `dead_codes` must have the same lint level, otherwise we will intentionally ICE.
+    // This is because we emit a multi-spanned lint using the lint level of the `dead_codes`'s
+    // first local def id.
+    // Prefer calling `Self.warn_dead_code` or `Self.warn_dead_code_grouped_by_lint_level`
+    // since those methods group by lint level before calling this method.
+    fn lint_at_single_level(
         &self,
         dead_codes: &[LocalDefId],
         participle: &str,
@@ -723,6 +804,15 @@ impl<'tcx> DeadVisitor<'tcx> {
             return;
         };
         let tcx = self.tcx;
+
+        let first_hir_id = tcx.hir().local_def_id_to_hir_id(first_id);
+        let first_lint_level = tcx.lint_level_at_node(lint::builtin::DEAD_CODE, first_hir_id).0;
+        assert!(dead_codes.iter().skip(1).all(|id| {
+            let hir_id = tcx.hir().local_def_id_to_hir_id(*id);
+            let level = tcx.lint_level_at_node(lint::builtin::DEAD_CODE, hir_id).0;
+            level == first_lint_level
+        }));
+
         let names: Vec<_> =
             dead_codes.iter().map(|&def_id| tcx.item_name(def_id.to_def_id())).collect();
         let spans: Vec<_> = dead_codes
@@ -803,31 +893,26 @@ impl<'tcx> DeadVisitor<'tcx> {
             }
         };
 
-        self.tcx.emit_spanned_lint(
-            lint,
-            tcx.hir().local_def_id_to_hir_id(first_id),
-            MultiSpan::from_spans(spans),
-            diag,
-        );
+        self.tcx.emit_spanned_lint(lint, first_hir_id, MultiSpan::from_spans(spans), diag);
     }
 
-    fn warn_dead_fields_and_variants(
+    fn warn_multiple(
         &self,
         def_id: LocalDefId,
         participle: &str,
-        dead_codes: Vec<DeadVariant>,
+        dead_codes: Vec<DeadItem>,
         is_positional: bool,
     ) {
         let mut dead_codes = dead_codes
             .iter()
             .filter(|v| !v.name.as_str().starts_with('_'))
-            .collect::<Vec<&DeadVariant>>();
+            .collect::<Vec<&DeadItem>>();
         if dead_codes.is_empty() {
             return;
         }
         dead_codes.sort_by_key(|v| v.level);
         for (_, group) in &dead_codes.into_iter().group_by(|v| v.level) {
-            self.warn_multiple_dead_codes(
+            self.lint_at_single_level(
                 &group.map(|v| v.def_id).collect::<Vec<_>>(),
                 participle,
                 Some(def_id),
@@ -837,7 +922,7 @@ impl<'tcx> DeadVisitor<'tcx> {
     }
 
     fn warn_dead_code(&mut self, id: LocalDefId, participle: &str) {
-        self.warn_multiple_dead_codes(&[id], participle, None, false);
+        self.lint_at_single_level(&[id], participle, None, false);
     }
 
     fn check_definition(&mut self, def_id: LocalDefId) {
@@ -867,13 +952,11 @@ impl<'tcx> DeadVisitor<'tcx> {
             return true;
         };
 
-        self.live_symbols.contains(&def_id)
-            || has_allow_dead_code_or_lang_attr(self.tcx, def_id)
-            || name.as_str().starts_with('_')
+        self.live_symbols.contains(&def_id) || name.as_str().starts_with('_')
     }
 }
 
-fn check_mod_deathness(tcx: TyCtxt<'_>, module: LocalDefId) {
+fn check_mod_deathness(tcx: TyCtxt<'_>, module: LocalModDefId) {
     let (live_symbols, ignored_derived_traits) = tcx.live_symbols_and_ignored_derived_traits(());
     let mut visitor = DeadVisitor { tcx, live_symbols, ignored_derived_traits };
 
@@ -883,22 +966,21 @@ fn check_mod_deathness(tcx: TyCtxt<'_>, module: LocalDefId) {
         if let hir::ItemKind::Impl(impl_item) = tcx.hir().item(item).kind {
             let mut dead_items = Vec::new();
             for item in impl_item.items {
-                let did = item.id.owner_id.def_id;
-                if !visitor.is_live_code(did) {
-                    dead_items.push(did)
+                let def_id = item.id.owner_id.def_id;
+                if !visitor.is_live_code(def_id) {
+                    let name = tcx.item_name(def_id.to_def_id());
+                    let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
+                    let level = tcx.lint_level_at_node(lint::builtin::DEAD_CODE, hir_id).0;
+
+                    dead_items.push(DeadItem { def_id, name, level })
                 }
             }
-            visitor.warn_multiple_dead_codes(
-                &dead_items,
-                "used",
-                Some(item.owner_id.def_id),
-                false,
-            );
+            visitor.warn_multiple(item.owner_id.def_id, "used", dead_items, false);
         }
 
         if !live_symbols.contains(&item.owner_id.def_id) {
             let parent = tcx.local_parent(item.owner_id.def_id);
-            if parent != module && !live_symbols.contains(&parent) {
+            if parent != module.to_local_def_id() && !live_symbols.contains(&parent) {
                 // We already have diagnosed something.
                 continue;
             }
@@ -917,7 +999,7 @@ fn check_mod_deathness(tcx: TyCtxt<'_>, module: LocalDefId) {
                     // Record to group diagnostics.
                     let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
                     let level = tcx.lint_level_at_node(lint::builtin::DEAD_CODE, hir_id).0;
-                    dead_variants.push(DeadVariant { def_id, name: variant.name, level });
+                    dead_variants.push(DeadItem { def_id, name: variant.name, level });
                     continue;
                 }
 
@@ -942,21 +1024,16 @@ fn check_mod_deathness(tcx: TyCtxt<'_>, module: LocalDefId) {
                                     hir_id,
                                 )
                                 .0;
-                            Some(DeadVariant { def_id, name: field.name, level })
+                            Some(DeadItem { def_id, name: field.name, level })
                         } else {
                             None
                         }
                     })
                     .collect();
-                visitor.warn_dead_fields_and_variants(def_id, "read", dead_fields, is_positional)
+                visitor.warn_multiple(def_id, "read", dead_fields, is_positional);
             }
 
-            visitor.warn_dead_fields_and_variants(
-                item.owner_id.def_id,
-                "constructed",
-                dead_variants,
-                false,
-            );
+            visitor.warn_multiple(item.owner_id.def_id, "constructed", dead_variants, false);
         }
     }
 

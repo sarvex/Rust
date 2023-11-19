@@ -11,7 +11,7 @@ use rustc_target::abi::{FieldIdx, VariantIdx};
 #[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable)]
 pub struct PlaceTy<'tcx> {
     pub ty: Ty<'tcx>,
-    /// Downcast to a particular variant of an enum or a generator, if included.
+    /// Downcast to a particular variant of an enum or a coroutine, if included.
     pub variant_index: Option<VariantIdx>,
 }
 
@@ -35,7 +35,7 @@ impl<'tcx> PlaceTy<'tcx> {
     #[instrument(level = "debug", skip(tcx), ret)]
     pub fn field_ty(self, tcx: TyCtxt<'tcx>, f: FieldIdx) -> Ty<'tcx> {
         match self.ty.kind() {
-            ty::Adt(adt_def, substs) => {
+            ty::Adt(adt_def, args) => {
                 let variant_def = match self.variant_index {
                     None => adt_def.non_enum_variant(),
                     Some(variant_index) => {
@@ -44,7 +44,7 @@ impl<'tcx> PlaceTy<'tcx> {
                     }
                 };
                 let field_def = &variant_def.fields[f];
-                field_def.ty(tcx, substs)
+                field_def.ty(tcx, args)
             }
             ty::Tuple(tys) => tys[f.index()],
             _ => bug!("extracting field of non-tuple non-adt: {:?}", self),
@@ -69,7 +69,7 @@ impl<'tcx> PlaceTy<'tcx> {
         param_env: ty::ParamEnv<'tcx>,
         elem: &ProjectionElem<V, T>,
         mut handle_field: impl FnMut(&Self, FieldIdx, T) -> Ty<'tcx>,
-        mut handle_opaque_cast: impl FnMut(&Self, T) -> Ty<'tcx>,
+        mut handle_opaque_cast_and_subtype: impl FnMut(&Self, T) -> Ty<'tcx>,
     ) -> PlaceTy<'tcx>
     where
         V: ::std::fmt::Debug,
@@ -95,11 +95,13 @@ impl<'tcx> PlaceTy<'tcx> {
             ProjectionElem::Subslice { from, to, from_end } => {
                 PlaceTy::from_ty(match self.ty.kind() {
                     ty::Slice(..) => self.ty,
-                    ty::Array(inner, _) if !from_end => tcx.mk_array(*inner, (to - from) as u64),
+                    ty::Array(inner, _) if !from_end => {
+                        Ty::new_array(tcx, *inner, (to - from) as u64)
+                    }
                     ty::Array(inner, size) if from_end => {
                         let size = size.eval_target_usize(tcx, param_env);
                         let len = size - from - to;
-                        tcx.mk_array(*inner, len)
+                        Ty::new_array(tcx, *inner, len)
                     }
                     _ => bug!("cannot subslice non-array type: `{:?}`", self),
                 })
@@ -108,7 +110,12 @@ impl<'tcx> PlaceTy<'tcx> {
                 PlaceTy { ty: self.ty, variant_index: Some(index) }
             }
             ProjectionElem::Field(f, fty) => PlaceTy::from_ty(handle_field(&self, f, fty)),
-            ProjectionElem::OpaqueCast(ty) => PlaceTy::from_ty(handle_opaque_cast(&self, ty)),
+            ProjectionElem::OpaqueCast(ty) => {
+                PlaceTy::from_ty(handle_opaque_cast_and_subtype(&self, ty))
+            }
+            ProjectionElem::Subtype(ty) => {
+                PlaceTy::from_ty(handle_opaque_cast_and_subtype(&self, ty))
+            }
         };
         debug!("projection_ty self: {:?} elem: {:?} yields: {:?}", self, elem, answer);
         answer
@@ -162,16 +169,16 @@ impl<'tcx> Rvalue<'tcx> {
         match *self {
             Rvalue::Use(ref operand) => operand.ty(local_decls, tcx),
             Rvalue::Repeat(ref operand, count) => {
-                tcx.mk_array_with_const_len(operand.ty(local_decls, tcx), count)
+                Ty::new_array_with_const_len(tcx, operand.ty(local_decls, tcx), count)
             }
             Rvalue::ThreadLocalRef(did) => tcx.thread_local_ptr_ty(did),
             Rvalue::Ref(reg, bk, ref place) => {
                 let place_ty = place.ty(local_decls, tcx).ty;
-                tcx.mk_ref(reg, ty::TypeAndMut { ty: place_ty, mutbl: bk.to_mutbl_lossy() })
+                Ty::new_ref(tcx, reg, ty::TypeAndMut { ty: place_ty, mutbl: bk.to_mutbl_lossy() })
             }
             Rvalue::AddressOf(mutability, ref place) => {
                 let place_ty = place.ty(local_decls, tcx).ty;
-                tcx.mk_ptr(ty::TypeAndMut { ty: place_ty, mutbl: mutability })
+                Ty::new_ptr(tcx, ty::TypeAndMut { ty: place_ty, mutbl: mutability })
             }
             Rvalue::Len(..) => tcx.types.usize,
             Rvalue::Cast(.., ty) => ty,
@@ -184,7 +191,7 @@ impl<'tcx> Rvalue<'tcx> {
                 let lhs_ty = lhs.ty(local_decls, tcx);
                 let rhs_ty = rhs.ty(local_decls, tcx);
                 let ty = op.ty(tcx, lhs_ty, rhs_ty);
-                tcx.mk_tup(&[ty, tcx.types.bool])
+                Ty::new_tup(tcx, &[ty, tcx.types.bool])
             }
             Rvalue::UnaryOp(UnOp::Not | UnOp::Neg, ref operand) => operand.ty(local_decls, tcx),
             Rvalue::Discriminant(ref place) => place.ty(local_decls, tcx).ty.discriminant_ty(tcx),
@@ -192,17 +199,17 @@ impl<'tcx> Rvalue<'tcx> {
                 tcx.types.usize
             }
             Rvalue::Aggregate(ref ak, ref ops) => match **ak {
-                AggregateKind::Array(ty) => tcx.mk_array(ty, ops.len() as u64),
+                AggregateKind::Array(ty) => Ty::new_array(tcx, ty, ops.len() as u64),
                 AggregateKind::Tuple => {
-                    tcx.mk_tup_from_iter(ops.iter().map(|op| op.ty(local_decls, tcx)))
+                    Ty::new_tup_from_iter(tcx, ops.iter().map(|op| op.ty(local_decls, tcx)))
                 }
-                AggregateKind::Adt(did, _, substs, _, _) => tcx.type_of(did).subst(tcx, substs),
-                AggregateKind::Closure(did, substs) => tcx.mk_closure(did, substs),
-                AggregateKind::Generator(did, substs, movability) => {
-                    tcx.mk_generator(did, substs, movability)
+                AggregateKind::Adt(did, _, args, _, _) => tcx.type_of(did).instantiate(tcx, args),
+                AggregateKind::Closure(did, args) => Ty::new_closure(tcx, did, args),
+                AggregateKind::Coroutine(did, args, movability) => {
+                    Ty::new_coroutine(tcx, did, args, movability)
                 }
             },
-            Rvalue::ShallowInitBox(_, ty) => tcx.mk_box(ty),
+            Rvalue::ShallowInitBox(_, ty) => Ty::new_box(tcx, ty),
             Rvalue::CopyForDeref(ref place) => place.ty(local_decls, tcx).ty,
         }
     }
@@ -225,7 +232,7 @@ impl<'tcx> Operand<'tcx> {
     {
         match self {
             &Operand::Copy(ref l) | &Operand::Move(ref l) => l.ty(local_decls, tcx).ty,
-            Operand::Constant(c) => c.literal.ty(),
+            Operand::Constant(c) => c.const_.ty(),
         }
     }
 }
@@ -235,8 +242,11 @@ impl<'tcx> BinOp {
         // FIXME: handle SIMD correctly
         match self {
             &BinOp::Add
+            | &BinOp::AddUnchecked
             | &BinOp::Sub
+            | &BinOp::SubUnchecked
             | &BinOp::Mul
+            | &BinOp::MulUnchecked
             | &BinOp::Div
             | &BinOp::Rem
             | &BinOp::BitXor
@@ -246,7 +256,11 @@ impl<'tcx> BinOp {
                 assert_eq!(lhs_ty, rhs_ty);
                 lhs_ty
             }
-            &BinOp::Shl | &BinOp::Shr | &BinOp::Offset => {
+            &BinOp::Shl
+            | &BinOp::ShlUnchecked
+            | &BinOp::Shr
+            | &BinOp::ShrUnchecked
+            | &BinOp::Offset => {
                 lhs_ty // lhs_ty can be != rhs_ty
             }
             &BinOp::Eq | &BinOp::Lt | &BinOp::Le | &BinOp::Ne | &BinOp::Ge | &BinOp::Gt => {
@@ -262,14 +276,9 @@ impl BorrowKind {
             BorrowKind::Mut { .. } => hir::Mutability::Mut,
             BorrowKind::Shared => hir::Mutability::Not,
 
-            // We have no type corresponding to a unique imm borrow, so
-            // use `&mut`. It gives all the capabilities of a `&uniq`
-            // and hence is a safe "over approximation".
-            BorrowKind::Unique => hir::Mutability::Mut,
-
             // We have no type corresponding to a shallow borrow, so use
             // `&` as an approximation.
-            BorrowKind::Shallow => hir::Mutability::Not,
+            BorrowKind::Fake => hir::Mutability::Not,
         }
     }
 }
@@ -293,7 +302,14 @@ impl BinOp {
             BinOp::Gt => hir::BinOpKind::Gt,
             BinOp::Le => hir::BinOpKind::Le,
             BinOp::Ge => hir::BinOpKind::Ge,
-            BinOp::Offset => unreachable!(),
+            BinOp::AddUnchecked
+            | BinOp::SubUnchecked
+            | BinOp::MulUnchecked
+            | BinOp::ShlUnchecked
+            | BinOp::ShrUnchecked
+            | BinOp::Offset => {
+                unreachable!()
+            }
         }
     }
 }

@@ -30,7 +30,7 @@ pub trait QueryNormalizeExt<'tcx> {
     ///
     /// After codegen, when lifetimes do not matter, it is preferable to instead
     /// use [`TyCtxt::normalize_erasing_regions`], which wraps this procedure.
-    fn query_normalize<T>(&self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
+    fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
     where
         T: TypeFoldable<TyCtxt<'tcx>>;
 }
@@ -49,7 +49,7 @@ impl<'cx, 'tcx> QueryNormalizeExt<'tcx> for At<'cx, 'tcx> {
     /// normalizing, but for now should be used only when we actually
     /// know that normalization will succeed, since error reporting
     /// and other details are still "under development".
-    fn query_normalize<T>(&self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
+    fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
@@ -60,19 +60,6 @@ impl<'cx, 'tcx> QueryNormalizeExt<'tcx> for At<'cx, 'tcx> {
             self.param_env,
             self.cause,
         );
-        if !needs_normalization(&value, self.param_env.reveal()) {
-            return Ok(Normalized { value, obligations: vec![] });
-        }
-
-        let mut normalizer = QueryNormalizer {
-            infcx: self.infcx,
-            cause: self.cause,
-            param_env: self.param_env,
-            obligations: vec![],
-            cache: SsoHashMap::new(),
-            anon_depth: 0,
-            universes: vec![],
-        };
 
         // This is actually a consequence by the way `normalize_erasing_regions` works currently.
         // Because it needs to call the `normalize_generic_arg_after_erasing_regions`, it folds
@@ -84,14 +71,38 @@ impl<'cx, 'tcx> QueryNormalizeExt<'tcx> for At<'cx, 'tcx> {
         // We *could* replace escaping bound vars eagerly here, but it doesn't seem really necessary.
         // The rest of the code is already set up to be lazy about replacing bound vars,
         // and only when we actually have to normalize.
-        if value.has_escaping_bound_vars() {
+        let universes = if value.has_escaping_bound_vars() {
             let mut max_visitor =
                 MaxEscapingBoundVarVisitor { outer_index: ty::INNERMOST, escaping: 0 };
             value.visit_with(&mut max_visitor);
-            if max_visitor.escaping > 0 {
-                normalizer.universes.extend((0..max_visitor.escaping).map(|_| None));
+            vec![None; max_visitor.escaping]
+        } else {
+            vec![]
+        };
+
+        if self.infcx.next_trait_solver() {
+            match crate::solve::deeply_normalize_with_skipped_universes(self, value, universes) {
+                Ok(value) => return Ok(Normalized { value, obligations: vec![] }),
+                Err(_errors) => {
+                    return Err(NoSolution);
+                }
             }
         }
+
+        if !needs_normalization(&value, self.param_env.reveal()) {
+            return Ok(Normalized { value, obligations: vec![] });
+        }
+
+        let mut normalizer = QueryNormalizer {
+            infcx: self.infcx,
+            cause: self.cause,
+            param_env: self.param_env,
+            obligations: vec![],
+            cache: SsoHashMap::new(),
+            anon_depth: 0,
+            universes,
+        };
+
         let result = value.try_fold_with(&mut normalizer);
         info!(
             "normalize::<{}>: result={:?} with {} obligations",
@@ -139,7 +150,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for MaxEscapingBoundVarVisitor {
     #[inline]
     fn visit_region(&mut self, r: ty::Region<'tcx>) -> ControlFlow<Self::BreakTy> {
         match *r {
-            ty::ReLateBound(debruijn, _) if debruijn > self.outer_index => {
+            ty::ReBound(debruijn, _) if debruijn > self.outer_index => {
                 self.escaping =
                     self.escaping.max(debruijn.as_usize() - self.outer_index.as_usize());
             }
@@ -207,43 +218,37 @@ impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> 
         };
 
         // See note in `rustc_trait_selection::traits::project` about why we
-        // wait to fold the substs.
+        // wait to fold the args.
 
         // Wrap this in a closure so we don't accidentally return from the outer function
         let res = match kind {
-            // This is really important. While we *can* handle this, this has
-            // severe performance implications for large opaque types with
-            // late-bound regions. See `issue-88862` benchmark.
-            ty::Opaque if !data.substs.has_escaping_bound_vars() => {
+            ty::Opaque => {
                 // Only normalize `impl Trait` outside of type inference, usually in codegen.
                 match self.param_env.reveal() {
                     Reveal::UserFacing => ty.try_super_fold_with(self)?,
 
                     Reveal::All => {
-                        let substs = data.substs.try_fold_with(self)?;
+                        let args = data.args.try_fold_with(self)?;
                         let recursion_limit = self.interner().recursion_limit();
+
                         if !recursion_limit.value_within_limit(self.anon_depth) {
-                            // A closure or generator may have itself as in its upvars.
-                            // This should be checked handled by the recursion check for opaque
-                            // types, but we may end up here before that check can happen.
-                            // In that case, we delay a bug to mark the trip, and continue without
-                            // revealing the opaque.
-                            self.infcx
+                            let guar = self
+                                .infcx
                                 .err_ctxt()
                                 .build_overflow_error(&ty, self.cause.span, true)
                                 .delay_as_bug();
-                            return ty.try_super_fold_with(self);
+                            return Ok(Ty::new_error(self.interner(), guar));
                         }
 
                         let generic_ty = self.interner().type_of(data.def_id);
-                        let concrete_ty = generic_ty.subst(self.interner(), substs);
+                        let concrete_ty = generic_ty.instantiate(self.interner(), args);
                         self.anon_depth += 1;
                         if concrete_ty == ty {
                             bug!(
-                                "infinite recursion generic_ty: {:#?}, substs: {:#?}, \
+                                "infinite recursion generic_ty: {:#?}, args: {:#?}, \
                                  concrete_ty: {:#?}, ty: {:#?}",
                                 generic_ty,
-                                substs,
+                                args,
                                 concrete_ty,
                                 ty
                             );
@@ -255,13 +260,11 @@ impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> 
                 }
             }
 
-            ty::Opaque => ty.try_super_fold_with(self)?,
-
-            ty::Projection => {
+            ty::Projection | ty::Inherent | ty::Weak => {
                 // See note in `rustc_trait_selection::traits::project`
 
-                let tcx = self.infcx.tcx;
                 let infcx = self.infcx;
+                let tcx = infcx.tcx;
                 // Just an optimization: When we don't have escaping bound vars,
                 // we don't need to replace them with placeholders.
                 let (data, maps) = if data.has_escaping_bound_vars() {
@@ -276,26 +279,30 @@ impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> 
                 let mut orig_values = OriginalQueryValues::default();
                 // HACK(matthewjasper) `'static` is special-cased in selection,
                 // so we cannot canonicalize it.
-                let c_data = self
-                    .infcx
+                let c_data = infcx
                     .canonicalize_query_keep_static(self.param_env.and(data), &mut orig_values);
                 debug!("QueryNormalizer: c_data = {:#?}", c_data);
                 debug!("QueryNormalizer: orig_values = {:#?}", orig_values);
-                let result = tcx.normalize_projection_ty(c_data)?;
+                let result = match kind {
+                    ty::Projection => tcx.normalize_projection_ty(c_data),
+                    ty::Weak => tcx.normalize_weak_ty(c_data),
+                    ty::Inherent => tcx.normalize_inherent_projection_ty(c_data),
+                    _ => unreachable!(),
+                }?;
                 // We don't expect ambiguity.
-                if result.is_ambiguous() {
+                if !result.value.is_proven() {
                     // Rustdoc normalizes possibly not well-formed types, so only
                     // treat this as a bug if we're not in rustdoc.
                     if !tcx.sess.opts.actually_rustdoc {
                         tcx.sess.delay_span_bug(
                             DUMMY_SP,
-                            format!("unexpected ambiguity: {:?} {:?}", c_data, result),
+                            format!("unexpected ambiguity: {c_data:?} {result:?}"),
                         );
                     }
                     return Err(NoSolution);
                 }
-                let InferOk { value: result, obligations } =
-                    self.infcx.instantiate_query_response_and_region_obligations(
+                let InferOk { value: result, obligations } = infcx
+                    .instantiate_query_response_and_region_obligations(
                         self.cause,
                         self.param_env,
                         &orig_values,
@@ -318,8 +325,12 @@ impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> 
                 };
                 // `tcx.normalize_projection_ty` may normalize to a type that still has
                 // unevaluated consts, so keep normalizing here if that's the case.
-                if res != ty && res.has_type_flags(ty::TypeFlags::HAS_CT_PROJECTION) {
-                    res.try_super_fold_with(self)?
+                // Similarly, `tcx.normalize_weak_ty` will only unwrap one layer of type
+                // and we need to continue folding it to reveal the TAIT behind it.
+                if res != ty
+                    && (res.has_type_flags(ty::TypeFlags::HAS_CT_PROJECTION) || kind == ty::Weak)
+                {
+                    res.try_fold_with(self)?
                 } else {
                     res
                 }
@@ -344,7 +355,7 @@ impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> 
             self.infcx,
             &mut self.universes,
             constant,
-            |constant| constant.eval(self.infcx.tcx, self.param_env),
+            |constant| constant.normalize(self.infcx.tcx, self.param_env),
         ))
     }
 

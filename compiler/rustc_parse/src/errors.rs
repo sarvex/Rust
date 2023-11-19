@@ -10,7 +10,7 @@ use rustc_span::symbol::Ident;
 use rustc_span::{Span, Symbol};
 
 use crate::fluent_generated as fluent;
-use crate::parser::TokenDescription;
+use crate::parser::{ForbiddenLetReason, TokenDescription};
 
 #[derive(Diagnostic)]
 #[diag(parse_maybe_report_ambiguous_plus)]
@@ -59,9 +59,18 @@ pub(crate) enum BadTypePlusSub {
 #[diag(parse_maybe_recover_from_bad_qpath_stage_2)]
 pub(crate) struct BadQPathStage2 {
     #[primary_span]
-    #[suggestion(code = "", applicability = "maybe-incorrect")]
     pub span: Span,
-    pub ty: String,
+    #[subdiagnostic]
+    pub wrap: WrapType,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(parse_suggestion, applicability = "machine-applicable")]
+pub(crate) struct WrapType {
+    #[suggestion_part(code = "<")]
+    pub lo: Span,
+    #[suggestion_part(code = ">")]
+    pub hi: Span,
 }
 
 #[derive(Diagnostic)]
@@ -333,6 +342,17 @@ pub(crate) struct InvalidBlockMacroSegment {
     pub span: Span,
     #[label]
     pub context: Span,
+    #[subdiagnostic]
+    pub wrap: WrapInExplicitBlock,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(parse_suggestion, applicability = "machine-applicable")]
+pub(crate) struct WrapInExplicitBlock {
+    #[suggestion_part(code = "{{ ")]
+    pub lo: Span,
+    #[suggestion_part(code = " }}")]
+    pub hi: Span,
 }
 
 #[derive(Diagnostic)]
@@ -354,6 +374,14 @@ pub(crate) enum IfExpressionMissingThenBlockSub {
     AddThenBlock(#[primary_span] Span),
 }
 
+#[derive(Diagnostic)]
+#[diag(parse_ternary_operator)]
+#[help]
+pub struct TernaryOperator {
+    #[primary_span]
+    pub span: Span,
+}
+
 #[derive(Subdiagnostic)]
 #[suggestion(parse_extra_if_in_let_else, applicability = "maybe-incorrect", code = "")]
 pub(crate) struct IfExpressionLetSomeSub {
@@ -373,9 +401,12 @@ pub(crate) struct IfExpressionMissingCondition {
 
 #[derive(Diagnostic)]
 #[diag(parse_expected_expression_found_let)]
+#[note]
 pub(crate) struct ExpectedExpressionFoundLet {
     #[primary_span]
     pub span: Span,
+    #[subdiagnostic]
+    pub reason: ForbiddenLetReason,
 }
 
 #[derive(Diagnostic)]
@@ -397,6 +428,17 @@ pub(crate) struct ExpectedElseBlock {
     pub else_span: Span,
     #[suggestion(applicability = "maybe-incorrect", code = "if ")]
     pub condition_start: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_expected_struct_field)]
+pub(crate) struct ExpectedStructField {
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    pub token: Token,
+    #[label(parse_ident_label)]
+    pub ident_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -474,6 +516,14 @@ pub(crate) struct MissingCommaAfterMatchArm {
 #[diag(parse_catch_after_try)]
 #[help]
 pub(crate) struct CatchAfterTry {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_gen_fn)]
+#[help]
+pub(crate) struct GenFn {
     #[primary_span]
     pub span: Span,
 }
@@ -907,6 +957,18 @@ pub(crate) struct SuggRemoveComma {
 }
 
 #[derive(Subdiagnostic)]
+#[suggestion(
+    parse_sugg_add_let_for_stmt,
+    style = "verbose",
+    applicability = "maybe-incorrect",
+    code = "let "
+)]
+pub(crate) struct SuggAddMissingLetStmt {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Subdiagnostic)]
 pub(crate) enum ExpectedIdentifierFound {
     #[label(parse_expected_identifier_found_reserved_identifier)]
     ReservedIdentifier(#[primary_span] Span),
@@ -1316,6 +1378,34 @@ pub(crate) struct FnPtrWithGenericsSugg {
     pub for_param_list_exists: bool,
 }
 
+pub(crate) struct FnTraitMissingParen {
+    pub span: Span,
+    pub machine_applicable: bool,
+}
+
+impl AddToDiagnostic for FnTraitMissingParen {
+    fn add_to_diagnostic_with<F>(self, diag: &mut rustc_errors::Diagnostic, _: F)
+    where
+        F: Fn(
+            &mut rustc_errors::Diagnostic,
+            rustc_errors::SubdiagnosticMessage,
+        ) -> rustc_errors::SubdiagnosticMessage,
+    {
+        diag.span_label(self.span, crate::fluent_generated::parse_fn_trait_missing_paren);
+        let applicability = if self.machine_applicable {
+            Applicability::MachineApplicable
+        } else {
+            Applicability::MaybeIncorrect
+        };
+        diag.span_suggestion_short(
+            self.span.shrink_to_hi(),
+            crate::fluent_generated::parse_add_paren,
+            "()",
+            applicability,
+        );
+    }
+}
+
 #[derive(Diagnostic)]
 #[diag(parse_unexpected_if_with_if)]
 pub(crate) struct UnexpectedIfWithIf(
@@ -1404,6 +1494,13 @@ pub(crate) struct AsyncBlockIn2015 {
 }
 
 #[derive(Diagnostic)]
+#[diag(parse_async_move_block_in_2015)]
+pub(crate) struct AsyncMoveBlockIn2015 {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag(parse_self_argument_pointer)]
 pub(crate) struct SelfArgumentPointer {
     #[primary_span]
@@ -1483,6 +1580,14 @@ pub(crate) enum AmbiguousMissingKwForItemSub {
 }
 
 #[derive(Diagnostic)]
+#[diag(parse_missing_fn_params)]
+pub(crate) struct MissingFnParams {
+    #[primary_span]
+    #[suggestion(code = "()", applicability = "machine-applicable", style = "short")]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag(parse_missing_trait_in_trait_impl)]
 pub(crate) struct MissingTraitInTraitImpl {
     #[primary_span]
@@ -1505,6 +1610,16 @@ pub(crate) struct MissingForInTraitImpl {
 pub(crate) struct ExpectedTraitInTraitImplFoundType {
     #[primary_span]
     pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_extra_impl_keyword_in_trait_impl)]
+pub(crate) struct ExtraImplKeywordInTraitImpl {
+    #[primary_span]
+    #[suggestion(code = "", applicability = "maybe-incorrect")]
+    pub extra_impl_kw: Span,
+    #[note]
+    pub impl_trait_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -1765,6 +1880,12 @@ pub struct UnknownPrefix<'a> {
     pub prefix: &'a str,
     #[subdiagnostic]
     pub sugg: Option<UnknownPrefixSugg>,
+}
+
+#[derive(Subdiagnostic)]
+#[note(parse_macro_expands_to_adt_field)]
+pub struct MacroExpandsToAdtField<'a> {
+    pub adt_ty: &'a str,
 }
 
 #[derive(Subdiagnostic)]
@@ -2157,9 +2278,8 @@ pub(crate) enum InvalidMutInPattern {
     #[note(parse_note_mut_pattern_usage)]
     NonIdent {
         #[primary_span]
-        #[suggestion(code = "{pat}", applicability = "machine-applicable")]
+        #[suggestion(code = "", applicability = "machine-applicable")]
         span: Span,
-        pat: String,
     },
 }
 
@@ -2582,21 +2702,24 @@ pub(crate) struct MissingPlusBounds {
 }
 
 #[derive(Diagnostic)]
-#[diag(parse_incorrect_braces_trait_bounds)]
-pub(crate) struct IncorrectBracesTraitBounds {
+#[diag(parse_incorrect_parens_trait_bounds)]
+pub(crate) struct IncorrectParensTraitBounds {
     #[primary_span]
     pub span: Vec<Span>,
     #[subdiagnostic]
-    pub sugg: IncorrectBracesTraitBoundsSugg,
+    pub sugg: IncorrectParensTraitBoundsSugg,
 }
 
 #[derive(Subdiagnostic)]
-#[multipart_suggestion(parse_suggestion, applicability = "machine-applicable")]
-pub(crate) struct IncorrectBracesTraitBoundsSugg {
+#[multipart_suggestion(
+    parse_incorrect_parens_trait_bounds_sugg,
+    applicability = "machine-applicable"
+)]
+pub(crate) struct IncorrectParensTraitBoundsSugg {
     #[suggestion_part(code = " ")]
-    pub l: Span,
-    #[suggestion_part(code = "")]
-    pub r: Span,
+    pub wrong_span: Span,
+    #[suggestion_part(code = "(")]
+    pub new_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -2643,4 +2766,64 @@ pub(crate) struct MalformedCfgAttr {
     #[suggestion(code = "{sugg}")]
     pub span: Span,
     pub sugg: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_unknown_builtin_construct)]
+pub(crate) struct UnknownBuiltinConstruct {
+    #[primary_span]
+    pub span: Span,
+    pub name: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_expected_builtin_ident)]
+pub(crate) struct ExpectedBuiltinIdent {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_static_with_generics)]
+pub(crate) struct StaticWithGenerics {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_where_clause_before_const_body)]
+pub(crate) struct WhereClauseBeforeConstBody {
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    #[label(parse_name_label)]
+    pub name: Span,
+    #[label(parse_body_label)]
+    pub body: Span,
+    #[subdiagnostic]
+    pub sugg: Option<WhereClauseBeforeConstBodySugg>,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(parse_suggestion, applicability = "machine-applicable")]
+pub(crate) struct WhereClauseBeforeConstBodySugg {
+    #[suggestion_part(code = "= {snippet} ")]
+    pub left: Span,
+    pub snippet: String,
+    #[suggestion_part(code = "")]
+    pub right: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_generic_args_in_pat_require_turbofish_syntax)]
+pub(crate) struct GenericArgsInPatRequireTurbofishSyntax {
+    #[primary_span]
+    pub span: Span,
+    #[suggestion(
+        parse_sugg_turbofish_syntax,
+        style = "verbose",
+        code = "::",
+        applicability = "maybe-incorrect"
+    )]
+    pub suggest_turbofish: Span,
 }

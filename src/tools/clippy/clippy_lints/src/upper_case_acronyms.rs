@@ -26,11 +26,11 @@ declare_clippy_lint! {
     /// the letters in the second acronym.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// struct HTTPResponse;
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// struct HttpResponse;
     /// ```
     #[clippy::version = "1.51.0"]
@@ -65,7 +65,7 @@ fn correct_ident(ident: &str) -> String {
 
     let mut ident = fragments.clone().next().unwrap();
     for (ref prev, ref curr) in fragments.tuple_windows() {
-        if [prev, curr]
+        if <[&String; 2]>::from((prev, curr))
             .iter()
             .all(|s| s.len() == 1 && s.chars().next().unwrap().is_ascii_uppercase())
         {

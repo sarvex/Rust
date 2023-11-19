@@ -17,7 +17,7 @@ use ide_db::{
 };
 use syntax::{
     ast::{self, AttrKind, NameOrNameRef},
-    AstNode,
+    AstNode, SmolStr,
     SyntaxKind::{self, *},
     SyntaxToken, TextRange, TextSize, T,
 };
@@ -155,11 +155,61 @@ pub(crate) struct ExprCtx {
 pub(crate) enum TypeLocation {
     TupleField,
     TypeAscription(TypeAscriptionTarget),
-    GenericArgList(Option<ast::GenericArgList>),
+    /// Generic argument position e.g. `Foo<$0>`
+    GenericArg {
+        /// The generic argument list containing the generic arg
+        args: Option<ast::GenericArgList>,
+        /// `Some(trait_)` if `trait_` is being instantiated with `args`
+        of_trait: Option<hir::Trait>,
+        /// The generic parameter being filled in by the generic arg
+        corresponding_param: Option<ast::GenericParam>,
+    },
+    /// Associated type equality constraint e.g. `Foo<Bar = $0>`
+    AssocTypeEq,
+    /// Associated constant equality constraint e.g. `Foo<X = $0>`
+    AssocConstEq,
     TypeBound,
     ImplTarget,
     ImplTrait,
     Other,
+}
+
+impl TypeLocation {
+    pub(crate) fn complete_lifetimes(&self) -> bool {
+        matches!(
+            self,
+            TypeLocation::GenericArg {
+                corresponding_param: Some(ast::GenericParam::LifetimeParam(_)),
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn complete_consts(&self) -> bool {
+        match self {
+            TypeLocation::GenericArg {
+                corresponding_param: Some(ast::GenericParam::ConstParam(_)),
+                ..
+            } => true,
+            TypeLocation::AssocConstEq => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn complete_types(&self) -> bool {
+        match self {
+            TypeLocation::GenericArg { corresponding_param: Some(param), .. } => {
+                matches!(param, ast::GenericParam::TypeParam(_))
+            }
+            TypeLocation::AssocConstEq => false,
+            TypeLocation::AssocTypeEq => true,
+            _ => true,
+        }
+    }
+
+    pub(crate) fn complete_self_type(&self) -> bool {
+        self.complete_types() && !matches!(self, TypeLocation::ImplTarget | TypeLocation::ImplTrait)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,6 +351,7 @@ pub(super) enum NameRefKind {
         expr: ast::RecordExpr,
     },
     Pattern(PatternContext),
+    ExternCrate,
 }
 
 /// The identifier we are currently completing.
@@ -367,6 +418,8 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) krate: hir::Crate,
     /// The module of the `scope`.
     pub(super) module: hir::Module,
+    /// Whether nightly toolchain is used. Cached since this is looked up a lot.
+    is_nightly: bool,
 
     /// The expected name of what we are completing.
     /// This is usually the parameter name of the function argument we are completing.
@@ -386,7 +439,7 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) depth_from_crate_root: usize,
 }
 
-impl<'a> CompletionContext<'a> {
+impl CompletionContext<'_> {
     /// The range of the identifier that is being completed.
     pub(crate) fn source_range(&self) -> TextRange {
         let kind = self.original_token.kind();
@@ -441,6 +494,14 @@ impl<'a> CompletionContext<'a> {
         self.is_visible_impl(&vis, &attrs, item.krate(self.db))
     }
 
+    pub(crate) fn doc_aliases<I>(&self, item: &I) -> Vec<SmolStr>
+    where
+        I: hir::HasAttrs + Copy,
+    {
+        let attrs = item.attrs(self.db);
+        attrs.doc_aliases().collect()
+    }
+
     /// Check if an item is `#[doc(hidden)]`.
     pub(crate) fn is_item_hidden(&self, item: &hir::ItemInNs) -> bool {
         let attrs = item.attrs(self.db);
@@ -449,6 +510,14 @@ impl<'a> CompletionContext<'a> {
             (Some(attrs), Some(krate)) => self.is_doc_hidden(&attrs, krate),
             _ => false,
         }
+    }
+
+    /// Checks whether this item should be listed in regards to stability. Returns `true` if we should.
+    pub(crate) fn check_stability(&self, attrs: Option<&hir::Attrs>) -> bool {
+        let Some(attrs) = attrs else {
+            return true;
+        };
+        !attrs.is_unstable() || self.is_nightly
     }
 
     /// Whether the given trait is an operator trait or not.
@@ -491,21 +560,22 @@ impl<'a> CompletionContext<'a> {
         );
     }
 
-    /// A version of [`SemanticsScope::process_all_names`] that filters out `#[doc(hidden)]` items.
-    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
+    /// A version of [`SemanticsScope::process_all_names`] that filters out `#[doc(hidden)]` items and
+    /// passes all doc-aliases along, to funnel it into [`Completions::add_path_resolution`].
+    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef, Vec<SmolStr>)) {
         let _p = profile::span("CompletionContext::process_all_names");
         self.scope.process_all_names(&mut |name, def| {
             if self.is_scope_def_hidden(def) {
                 return;
             }
-
-            f(name, def);
+            let doc_aliases = self.doc_aliases_in_scope(def);
+            f(name, def, doc_aliases);
         });
     }
 
     pub(crate) fn process_all_names_raw(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
         let _p = profile::span("CompletionContext::process_all_names_raw");
-        self.scope.process_all_names(&mut |name, def| f(name, def));
+        self.scope.process_all_names(f);
     }
 
     fn is_scope_def_hidden(&self, scope_def: ScopeDef) -> bool {
@@ -544,6 +614,14 @@ impl<'a> CompletionContext<'a> {
     fn is_doc_hidden(&self, attrs: &hir::Attrs, defining_crate: hir::Crate) -> bool {
         // `doc(hidden)` items are only completed within the defining crate.
         self.krate != defining_crate && attrs.has_doc_hidden()
+    }
+
+    pub(crate) fn doc_aliases_in_scope(&self, scope_def: ScopeDef) -> Vec<SmolStr> {
+        if let Some(attrs) = scope_def.attrs(self.db) {
+            attrs.doc_aliases().collect()
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -615,6 +693,11 @@ impl<'a> CompletionContext<'a> {
         let krate = scope.krate();
         let module = scope.module();
 
+        let toolchain = db.crate_graph()[krate.into()].channel;
+        // `toolchain == None` means we're in some detached files. Since we have no information on
+        // the toolchain being used, let's just allow unstable items to be listed.
+        let is_nightly = matches!(toolchain, Some(base_db::ReleaseChannel::Nightly) | None);
+
         let mut locals = FxHashMap::default();
         scope.process_all_names(&mut |name, scope| {
             if let ScopeDef::Local(local) = scope {
@@ -634,6 +717,7 @@ impl<'a> CompletionContext<'a> {
             token,
             krate,
             module,
+            is_nightly,
             expected_name,
             expected_type,
             qualifier_ctx,

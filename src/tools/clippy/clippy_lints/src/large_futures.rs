@@ -1,5 +1,6 @@
+use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet;
-use clippy_utils::{diagnostics::span_lint_and_sugg, ty::implements_trait};
+use clippy_utils::ty::implements_trait;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, LangItem, MatchSource, QPath};
 use rustc_lint::{LateContext, LateLintPass};
@@ -11,34 +12,28 @@ declare_clippy_lint! {
     /// It checks for the size of a `Future` created by `async fn` or `async {}`.
     ///
     /// ### Why is this bad?
-    /// Due to the current [unideal implementation](https://github.com/rust-lang/rust/issues/69826) of `Generator`,
+    /// Due to the current [unideal implementation](https://github.com/rust-lang/rust/issues/69826) of `Coroutine`,
     /// large size of a `Future` may cause stack overflows.
     ///
     /// ### Example
-    /// ```rust
-    /// async fn wait(f: impl std::future::Future<Output = ()>) {}
+    /// ```no_run
+    /// async fn large_future(_x: [u8; 16 * 1024]) {}
     ///
-    /// async fn big_fut(arg: [u8; 1024]) {}
-    ///
-    /// pub async fn test() {
-    ///     let fut = big_fut([0u8; 1024]);
-    ///     wait(fut).await;
+    /// pub async fn trigger() {
+    ///     large_future([0u8; 16 * 1024]).await;
     /// }
     /// ```
     ///
     /// `Box::pin` the big future instead.
     ///
-    /// ```rust
-    /// async fn wait(f: impl std::future::Future<Output = ()>) {}
+    /// ```no_run
+    /// async fn large_future(_x: [u8; 16 * 1024]) {}
     ///
-    /// async fn big_fut(arg: [u8; 1024]) {}
-    ///
-    /// pub async fn test() {
-    ///     let fut = Box::pin(big_fut([0u8; 1024]));
-    ///     wait(fut).await;
+    /// pub async fn trigger() {
+    ///     Box::pin(large_future([0u8; 16 * 1024])).await;
     /// }
     /// ```
-    #[clippy::version = "1.68.0"]
+    #[clippy::version = "1.70.0"]
     pub LARGE_FUTURES,
     pedantic,
     "large future may lead to unexpected stack overflows"

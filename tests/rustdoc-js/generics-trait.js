@@ -1,22 +1,9 @@
 // exact-check
 
-const QUERY = [
-    'Result<SomeTrait>',
-    'Result<SomeTraiz>',
-    'OtherThingxxxxxxxx',
-    'OtherThingxxxxxxxy',
-];
-
-const CORRECTIONS = [
-    null,
-    null,
-    null,
-    'OtherThingxxxxxxxx',
-];
-
 const EXPECTED = [
-    // Result<SomeTrait>
     {
+        'query': 'Result<SomeTrait>',
+        'correction': null,
         'in_args': [
             { 'path': 'generics_trait', 'name': 'beta' },
         ],
@@ -24,13 +11,19 @@ const EXPECTED = [
             { 'path': 'generics_trait', 'name': 'bet' },
         ],
     },
-    // Result<SomeTraiz>
     {
+        'query': 'Resulx<SomeTrait>',
         'in_args': [],
         'returned': [],
     },
-    // OtherThingxxxxxxxx
     {
+        'query': 'Result<SomeTraiz>',
+        'proposeCorrectionFrom': 'SomeTraiz',
+        'proposeCorrectionTo': 'SomeTrait',
+    },
+    {
+        'query': 'OtherThingxxxxxxxx',
+        'correction': null,
         'in_args': [
             { 'path': 'generics_trait', 'name': 'alpha' },
         ],
@@ -38,8 +31,9 @@ const EXPECTED = [
             { 'path': 'generics_trait', 'name': 'alef' },
         ],
     },
-    // OtherThingxxxxxxxy
     {
+        'query': 'OtherThingxxxxxxxy',
+        'correction': 'OtherThingxxxxxxxx',
         'in_args': [
             { 'path': 'generics_trait', 'name': 'alpha' },
         ],

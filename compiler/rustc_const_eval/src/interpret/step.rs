@@ -8,28 +8,8 @@ use rustc_middle::mir;
 use rustc_middle::mir::interpret::{InterpResult, Scalar};
 use rustc_middle::ty::layout::LayoutOf;
 
-use super::{ImmTy, InterpCx, Machine};
-
-/// Classify whether an operator is "left-homogeneous", i.e., the LHS has the
-/// same type as the result.
-#[inline]
-fn binop_left_homogeneous(op: mir::BinOp) -> bool {
-    use rustc_middle::mir::BinOp::*;
-    match op {
-        Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Offset | Shl | Shr => true,
-        Eq | Ne | Lt | Le | Gt | Ge => false,
-    }
-}
-/// Classify whether an operator is "right-homogeneous", i.e., the RHS has the
-/// same type as the LHS.
-#[inline]
-fn binop_right_homogeneous(op: mir::BinOp) -> bool {
-    use rustc_middle::mir::BinOp::*;
-    match op {
-        Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Eq | Ne | Lt | Le | Gt | Ge => true,
-        Offset | Shl | Shr => false,
-    }
-}
+use super::{ImmTy, InterpCx, Machine, Projectable};
+use crate::util;
 
 impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// Returns `true` as long as there are more things to do.
@@ -179,9 +159,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             }
 
             BinaryOp(bin_op, box (ref left, ref right)) => {
-                let layout = binop_left_homogeneous(bin_op).then_some(dest.layout);
+                let layout = util::binop_left_homogeneous(bin_op).then_some(dest.layout);
                 let left = self.read_immediate(&self.eval_operand(left, layout)?)?;
-                let layout = binop_right_homogeneous(bin_op).then_some(left.layout);
+                let layout = util::binop_right_homogeneous(bin_op).then_some(left.layout);
                 let right = self.read_immediate(&self.eval_operand(right, layout)?)?;
                 self.binop_ignore_overflow(bin_op, &left, &right, &dest)?;
             }
@@ -189,7 +169,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             CheckedBinaryOp(bin_op, box (ref left, ref right)) => {
                 // Due to the extra boolean in the result, we can never reuse the `dest.layout`.
                 let left = self.read_immediate(&self.eval_operand(left, None)?)?;
-                let layout = binop_right_homogeneous(bin_op).then_some(left.layout);
+                let layout = util::binop_right_homogeneous(bin_op).then_some(left.layout);
                 let right = self.read_immediate(&self.eval_operand(right, layout)?)?;
                 self.binop_with_overflow(bin_op, &left, &right, &dest)?;
             }
@@ -197,8 +177,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             UnaryOp(un_op, ref operand) => {
                 // The operand always has the same type as the result.
                 let val = self.read_immediate(&self.eval_operand(operand, Some(dest.layout))?)?;
-                let val = self.unary_op(un_op, &val)?;
-                assert_eq!(val.layout, dest.layout, "layout mismatch for result of {:?}", un_op);
+                let val = self.wrapping_unary_op(un_op, &val)?;
+                assert_eq!(val.layout, dest.layout, "layout mismatch for result of {un_op:?}");
                 self.write_immediate(*val, &dest)?;
             }
 
@@ -217,24 +197,19 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     self.get_place_alloc_mut(&dest)?;
                 } else {
                     // Write the src to the first element.
-                    let first = self.mplace_field(&dest, 0)?;
-                    self.copy_op(&src, &first.into(), /*allow_transmute*/ false)?;
+                    let first = self.project_index(&dest, 0)?;
+                    self.copy_op(&src, &first, /*allow_transmute*/ false)?;
 
                     // This is performance-sensitive code for big static/const arrays! So we
                     // avoid writing each operand individually and instead just make many copies
                     // of the first element.
                     let elem_size = first.layout.size;
-                    let first_ptr = first.ptr;
+                    let first_ptr = first.ptr();
                     let rest_ptr = first_ptr.offset(elem_size, self)?;
-                    // For the alignment of `rest_ptr`, we crucially do *not* use `first.align` as
-                    // that place might be more aligned than its type mandates (a `u8` array could
-                    // be 4-aligned if it sits at the right spot in a struct). Instead we use
-                    // `first.layout.align`, i.e., the alignment given by the type.
+                    // No alignment requirement since `copy_op` above already checked it.
                     self.mem_copy_repeatedly(
                         first_ptr,
-                        first.align,
                         rest_ptr,
-                        first.layout.align.abi,
                         elem_size,
                         length - 1,
                         /*nonoverlapping:*/ true,
@@ -244,8 +219,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
             Len(place) => {
                 let src = self.eval_place(place)?;
-                let op = self.place_to_op(&src)?;
-                let len = op.len(self)?;
+                let len = src.len(self)?;
                 self.write_scalar(Scalar::from_target_usize(len, self), &dest)?;
             }
 
@@ -268,7 +242,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
             AddressOf(_, place) => {
                 // Figure out whether this is an addr_of of an already raw place.
-                let place_base_raw = if place.has_deref() {
+                let place_base_raw = if place.is_indirect_first_projection() {
                     let ty = self.frame().body.local_decls[place.local].ty;
                     ty.is_unsafe_ptr()
                 } else {
@@ -289,19 +263,19 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             NullaryOp(ref null_op, ty) => {
                 let ty = self.subst_from_current_frame_and_normalize_erasing_regions(ty)?;
                 let layout = self.layout_of(ty)?;
-                if let mir::NullOp::SizeOf | mir::NullOp::AlignOf = null_op && layout.is_unsized() {
-                    // FIXME: This should be a span_bug (#80742)
-                    self.tcx.sess.delay_span_bug(
+                if let mir::NullOp::SizeOf | mir::NullOp::AlignOf = null_op
+                    && layout.is_unsized()
+                {
+                    span_bug!(
                         self.frame().current_span(),
-                        format!("{null_op:?} MIR operator called for unsized type {ty}"),
+                        "{null_op:?} MIR operator called for unsized type {ty}",
                     );
-                    throw_inval!(SizeOfUnsizedType(ty));
                 }
                 let val = match null_op {
                     mir::NullOp::SizeOf => layout.size.bytes(),
                     mir::NullOp::AlignOf => layout.align.abi.bytes(),
                     mir::NullOp::OffsetOf(fields) => {
-                        layout.offset_of_subfield(self, fields.iter().map(|f| f.index())).bytes()
+                        layout.offset_of_subfield(self, fields.iter()).bytes()
                     }
                 };
                 self.write_scalar(Scalar::from_target_usize(val, self), &dest)?;
@@ -322,12 +296,13 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
             Discriminant(place) => {
                 let op = self.eval_place_to_op(place, None)?;
-                let discr_val = self.read_discriminant(&op)?.0;
-                self.write_scalar(discr_val, &dest)?;
+                let variant = self.read_discriminant(&op)?;
+                let discr = self.discriminant_for_variant(op.layout.ty, variant)?;
+                self.write_immediate(*discr, &dest)?;
             }
         }
 
-        trace!("{:?}", self.dump_place(*dest));
+        trace!("{:?}", self.dump_place(&dest));
 
         Ok(())
     }

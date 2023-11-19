@@ -127,6 +127,7 @@ pub enum SelectionCandidate<'tcx> {
     /// an applicable bound in the trait definition. The `usize` is an index
     /// into the list returned by `tcx.item_bounds`. The constness is the
     /// constness of the bound in the trait.
+    // FIXME(effects) do we need this constness
     ProjectionCandidate(usize, ty::BoundConstness),
 
     /// Implementation of a `Fn`-family trait by one of the anonymous types
@@ -135,13 +136,17 @@ pub enum SelectionCandidate<'tcx> {
         is_const: bool,
     },
 
-    /// Implementation of a `Generator` trait by one of the anonymous types
-    /// generated for a generator.
-    GeneratorCandidate,
+    /// Implementation of a `Coroutine` trait by one of the anonymous types
+    /// generated for a coroutine.
+    CoroutineCandidate,
 
-    /// Implementation of a `Future` trait by one of the generator types
+    /// Implementation of a `Future` trait by one of the coroutine types
     /// generated for an async construct.
     FutureCandidate,
+
+    /// Implementation of an `Iterator` trait by one of the generator types
+    /// generated for a gen construct.
+    IteratorCandidate,
 
     /// Implementation of a `Fn`-family trait by one of the anonymous
     /// types generated for a fn pointer type (e.g., `fn(int) -> int`)
@@ -304,9 +309,7 @@ impl From<ErrorGuaranteed> for OverflowError {
     }
 }
 
-TrivialTypeTraversalAndLiftImpls! {
-    OverflowError,
-}
+TrivialTypeTraversalImpls! { OverflowError }
 
 impl<'tcx> From<OverflowError> for SelectionError<'tcx> {
     fn from(overflow_error: OverflowError) -> SelectionError<'tcx> {

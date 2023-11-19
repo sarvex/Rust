@@ -1,6 +1,5 @@
-use crate::common::{Config, Debugger};
+use crate::common::{Config, Debugger, Sanitizer};
 use crate::header::IgnoreDecision;
-use crate::util;
 
 pub(super) fn handle_needs(
     cache: &CachedNeedsConditions,
@@ -71,6 +70,11 @@ pub(super) fn handle_needs(
             ignore_reason: "ignored on targets without shadow call stacks",
         },
         Need {
+            name: "needs-sanitizer-safestack",
+            condition: cache.sanitizer_safestack,
+            ignore_reason: "ignored on targets without SafeStack support",
+        },
+        Need {
             name: "needs-run-enabled",
             condition: config.run_enabled(),
             ignore_reason: "ignored when running the resulting test binaries is disabled",
@@ -82,7 +86,7 @@ pub(super) fn handle_needs(
         },
         Need {
             name: "needs-profiler-support",
-            condition: std::env::var_os("RUSTC_PROFILER_SUPPORT").is_some(),
+            condition: cache.profiler_support,
             ignore_reason: "ignored when profiler support is disabled",
         },
         Need {
@@ -124,6 +128,16 @@ pub(super) fn handle_needs(
             name: "needs-git-hash",
             condition: config.git_hash,
             ignore_reason: "ignored when git hashes have been omitted for building",
+        },
+        Need {
+            name: "needs-dynamic-linking",
+            condition: config.target_cfg().dynamic_linking,
+            ignore_reason: "ignored on targets without dynamic linking",
+        },
+        Need {
+            name: "needs-relocation-model-pic",
+            condition: config.target_cfg().relocation_model == "pic",
+            ignore_reason: "ignored on targets without PIC relocation model",
         },
     ];
 
@@ -184,6 +198,8 @@ pub(super) struct CachedNeedsConditions {
     sanitizer_hwaddress: bool,
     sanitizer_memtag: bool,
     sanitizer_shadow_call_stack: bool,
+    sanitizer_safestack: bool,
+    profiler_support: bool,
     xray: bool,
     rust_lld: bool,
     i686_dlltool: bool,
@@ -208,22 +224,25 @@ impl CachedNeedsConditions {
             path.iter().any(|dir| dir.join("x86_64-w64-mingw32-dlltool").is_file());
 
         let target = &&*config.target;
+        let sanitizers = &config.target_cfg().sanitizers;
         Self {
             sanitizer_support: std::env::var_os("RUSTC_SANITIZER_SUPPORT").is_some(),
-            sanitizer_address: util::ASAN_SUPPORTED_TARGETS.contains(target),
-            sanitizer_cfi: util::CFI_SUPPORTED_TARGETS.contains(target),
-            sanitizer_kcfi: util::KCFI_SUPPORTED_TARGETS.contains(target),
-            sanitizer_kasan: util::KASAN_SUPPORTED_TARGETS.contains(target),
-            sanitizer_leak: util::LSAN_SUPPORTED_TARGETS.contains(target),
-            sanitizer_memory: util::MSAN_SUPPORTED_TARGETS.contains(target),
-            sanitizer_thread: util::TSAN_SUPPORTED_TARGETS.contains(target),
-            sanitizer_hwaddress: util::HWASAN_SUPPORTED_TARGETS.contains(target),
-            sanitizer_memtag: util::MEMTAG_SUPPORTED_TARGETS.contains(target),
-            sanitizer_shadow_call_stack: util::SHADOWCALLSTACK_SUPPORTED_TARGETS.contains(target),
-            xray: util::XRAY_SUPPORTED_TARGETS.contains(target),
+            sanitizer_address: sanitizers.contains(&Sanitizer::Address),
+            sanitizer_cfi: sanitizers.contains(&Sanitizer::Cfi),
+            sanitizer_kcfi: sanitizers.contains(&Sanitizer::Kcfi),
+            sanitizer_kasan: sanitizers.contains(&Sanitizer::KernelAddress),
+            sanitizer_leak: sanitizers.contains(&Sanitizer::Leak),
+            sanitizer_memory: sanitizers.contains(&Sanitizer::Memory),
+            sanitizer_thread: sanitizers.contains(&Sanitizer::Thread),
+            sanitizer_hwaddress: sanitizers.contains(&Sanitizer::Hwaddress),
+            sanitizer_memtag: sanitizers.contains(&Sanitizer::Memtag),
+            sanitizer_shadow_call_stack: sanitizers.contains(&Sanitizer::ShadowCallStack),
+            sanitizer_safestack: sanitizers.contains(&Sanitizer::Safestack),
+            profiler_support: std::env::var_os("RUSTC_PROFILER_SUPPORT").is_some(),
+            xray: config.target_cfg().xray,
 
-            // For tests using the `needs-rust-lld` directive (e.g. for `-Zgcc-ld=lld`), we need to find
-            // whether `rust-lld` is present in the compiler under test.
+            // For tests using the `needs-rust-lld` directive (e.g. for `-Clink-self-contained=+linker`),
+            // we need to find whether `rust-lld` is present in the compiler under test.
             //
             // The --compile-lib-path is the path to host shared libraries, but depends on the OS. For
             // example:

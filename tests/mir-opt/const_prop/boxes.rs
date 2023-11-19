@@ -1,8 +1,7 @@
+// skip-filecheck
 // unit-test: ConstProp
 // compile-flags: -O
-// ignore-emscripten compiled with panic=abort by default
-// ignore-wasm32
-// ignore-wasm64
+// EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 
 #![feature(rustc_attrs, stmt_expr_attributes)]
 

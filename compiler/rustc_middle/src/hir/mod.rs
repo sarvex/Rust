@@ -6,14 +6,15 @@ pub mod map;
 pub mod nested_filter;
 pub mod place;
 
-use crate::ty::query::Providers;
+use crate::query::Providers;
 use crate::ty::{EarlyBinder, ImplSubject, TyCtxt};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_data_structures::sync::{par_for_each_in, Send, Sync};
-use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_data_structures::sync::{try_par_for_each_in, DynSend, DynSync};
+use rustc_hir::def::DefKind;
+use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId};
 use rustc_hir::*;
 use rustc_query_system::ich::StableHashingContext;
-use rustc_span::{ExpnId, DUMMY_SP};
+use rustc_span::{ErrorGuaranteed, ExpnId, DUMMY_SP};
 
 /// Top-level HIR node for current owner. This only contains the node for which
 /// `HirId::local_id == 0`, and excludes bodies.
@@ -77,20 +78,32 @@ impl ModuleItems {
         self.owners().map(|id| id.def_id)
     }
 
-    pub fn par_items(&self, f: impl Fn(ItemId) + Send + Sync) {
-        par_for_each_in(&self.items[..], |&id| f(id))
+    pub fn par_items(
+        &self,
+        f: impl Fn(ItemId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
+    ) -> Result<(), ErrorGuaranteed> {
+        try_par_for_each_in(&self.items[..], |&id| f(id))
     }
 
-    pub fn par_trait_items(&self, f: impl Fn(TraitItemId) + Send + Sync) {
-        par_for_each_in(&self.trait_items[..], |&id| f(id))
+    pub fn par_trait_items(
+        &self,
+        f: impl Fn(TraitItemId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
+    ) -> Result<(), ErrorGuaranteed> {
+        try_par_for_each_in(&self.trait_items[..], |&id| f(id))
     }
 
-    pub fn par_impl_items(&self, f: impl Fn(ImplItemId) + Send + Sync) {
-        par_for_each_in(&self.impl_items[..], |&id| f(id))
+    pub fn par_impl_items(
+        &self,
+        f: impl Fn(ImplItemId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
+    ) -> Result<(), ErrorGuaranteed> {
+        try_par_for_each_in(&self.impl_items[..], |&id| f(id))
     }
 
-    pub fn par_foreign_items(&self, f: impl Fn(ForeignItemId) + Send + Sync) {
-        par_for_each_in(&self.foreign_items[..], |&id| f(id))
+    pub fn par_foreign_items(
+        &self,
+        f: impl Fn(ForeignItemId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
+    ) -> Result<(), ErrorGuaranteed> {
+        try_par_for_each_in(&self.foreign_items[..], |&id| f(id))
     }
 }
 
@@ -100,8 +113,22 @@ impl<'tcx> TyCtxt<'tcx> {
         map::Map { tcx: self }
     }
 
-    pub fn parent_module(self, id: HirId) -> LocalDefId {
-        self.parent_module_from_def_id(id.owner.def_id)
+    pub fn parent_module(self, id: HirId) -> LocalModDefId {
+        if !id.is_owner() && self.def_kind(id.owner) == DefKind::Mod {
+            LocalModDefId::new_unchecked(id.owner.def_id)
+        } else {
+            self.parent_module_from_def_id(id.owner.def_id)
+        }
+    }
+
+    pub fn parent_module_from_def_id(self, mut id: LocalDefId) -> LocalModDefId {
+        while let Some(parent) = self.opt_local_parent(id) {
+            id = parent;
+            if self.def_kind(id) == DefKind::Mod {
+                break;
+            }
+        }
+        LocalModDefId::new_unchecked(id)
     }
 
     pub fn impl_subject(self, def_id: DefId) -> EarlyBinder<ImplSubject<'tcx>> {
@@ -110,13 +137,15 @@ impl<'tcx> TyCtxt<'tcx> {
             None => self.type_of(def_id).map_bound(ImplSubject::Inherent),
         }
     }
+
+    /// Returns `true` if this is a foreign item (i.e., linked via `extern { ... }`).
+    pub fn is_foreign_item(self, def_id: impl Into<DefId>) -> bool {
+        self.opt_parent(def_id.into())
+            .is_some_and(|parent| matches!(self.def_kind(parent), DefKind::ForeignMod))
+    }
 }
 
 pub fn provide(providers: &mut Providers) {
-    providers.parent_module_from_def_id = |tcx, id| {
-        let hir = tcx.hir();
-        hir.get_module_parent_node(hir.local_def_id_to_hir_id(id)).def_id
-    };
     providers.hir_crate_items = map::hir_crate_items;
     providers.crate_hash = map::crate_hash;
     providers.hir_module_items = map::hir_module_items;
@@ -147,18 +176,15 @@ pub fn provide(providers: &mut Providers) {
         tcx.hir_crate(()).owners[id.def_id].as_owner().map_or(AttributeMap::EMPTY, |o| &o.attrs)
     };
     providers.def_span = |tcx, def_id| {
-        let def_id = def_id;
         let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
         tcx.hir().opt_span(hir_id).unwrap_or(DUMMY_SP)
     };
     providers.def_ident_span = |tcx, def_id| {
-        let def_id = def_id;
         let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
         tcx.hir().opt_ident_span(hir_id)
     };
-    providers.fn_arg_names = |tcx, id| {
+    providers.fn_arg_names = |tcx, def_id| {
         let hir = tcx.hir();
-        let def_id = id;
         let hir_id = hir.local_def_id_to_hir_id(def_id);
         if let Some(body_id) = hir.maybe_body_owned_by(def_id) {
             tcx.arena.alloc_from_iter(hir.body_param_names(body_id))
@@ -173,7 +199,7 @@ pub fn provide(providers: &mut Providers) {
         {
             idents
         } else {
-            span_bug!(hir.span(hir_id), "fn_arg_names: unexpected item {:?}", id);
+            span_bug!(hir.span(hir_id), "fn_arg_names: unexpected item {:?}", def_id);
         }
     };
     providers.opt_def_kind = |tcx, def_id| tcx.hir().opt_def_kind(def_id);

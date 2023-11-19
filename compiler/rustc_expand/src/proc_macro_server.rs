@@ -2,7 +2,7 @@ use crate::base::ExtCtxt;
 use pm::bridge::{
     server, DelimSpan, Diagnostic, ExpnGlobals, Group, Ident, LitKind, Literal, Punct, TokenTree,
 };
-use pm::{Delimiter, Level, LineColumn};
+use pm::{Delimiter, Level};
 use rustc_ast as ast;
 use rustc_ast::token;
 use rustc_ast::tokenstream::{self, Spacing::*, TokenStream};
@@ -94,10 +94,10 @@ impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStre
         // Estimate the capacity as `stream.len()` rounded up to the next power
         // of two to limit the number of required reallocations.
         let mut trees = Vec::with_capacity(stream.len().next_power_of_two());
-        let mut cursor = stream.into_trees();
+        let mut cursor = stream.trees();
 
         while let Some(tree) = cursor.next() {
-            let (Token { kind, span }, joint) = match tree {
+            let (Token { kind, span }, joint) = match tree.clone() {
                 tokenstream::TokenTree::Delimited(span, delim, tts) => {
                     let delimiter = pm::Delimiter::from_internal(delim);
                     trees.push(TokenTree::Group(Group {
@@ -226,19 +226,23 @@ impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStre
                     }));
                 }
 
-                Interpolated(nt) if let NtIdent(ident, is_raw) = *nt => {
-                    trees.push(TokenTree::Ident(Ident { sym: ident.name, is_raw, span: ident.span }))
+                Interpolated(ref nt) if let NtIdent(ident, is_raw) = &nt.0 => {
+                    trees.push(TokenTree::Ident(Ident {
+                        sym: ident.name,
+                        is_raw: *is_raw,
+                        span: ident.span,
+                    }))
                 }
 
                 Interpolated(nt) => {
-                    let stream = TokenStream::from_nonterminal_ast(&nt);
+                    let stream = TokenStream::from_nonterminal_ast(&nt.0);
                     // A hack used to pass AST fragments to attribute and derive
                     // macros as a single nonterminal token instead of a token
                     // stream. Such token needs to be "unwrapped" and not
                     // represented as a delimited group.
                     // FIXME: It needs to be removed, but there are some
                     // compatibility issues (see #73345).
-                    if crate::base::nt_pretty_printing_compatibility_hack(&nt, rustc.sess()) {
+                    if crate::base::nt_pretty_printing_compatibility_hack(&nt.0, rustc.sess()) {
                         trees.extend(Self::from_internal((stream, rustc)));
                     } else {
                         trees.push(TokenTree::Group(Group {
@@ -622,7 +626,7 @@ impl server::SourceFile for Rustc<'_, '_> {
 impl server::Span for Rustc<'_, '_> {
     fn debug(&mut self, span: Self::Span) -> String {
         if self.ecx.ecfg.span_debug {
-            format!("{:?}", span)
+            format!("{span:?}")
         } else {
             format!("{:?} bytes({}..{})", span.ctxt(), span.lo().0, span.hi().0)
         }
@@ -648,23 +652,22 @@ impl server::Span for Rustc<'_, '_> {
 
         Range { start: relative_start_pos.0 as usize, end: relative_end_pos.0 as usize }
     }
-
-    fn start(&mut self, span: Self::Span) -> LineColumn {
-        let loc = self.sess().source_map().lookup_char_pos(span.lo());
-        LineColumn { line: loc.line, column: loc.col.to_usize() }
-    }
-
-    fn end(&mut self, span: Self::Span) -> LineColumn {
-        let loc = self.sess().source_map().lookup_char_pos(span.hi());
-        LineColumn { line: loc.line, column: loc.col.to_usize() }
-    }
-
-    fn before(&mut self, span: Self::Span) -> Self::Span {
+    fn start(&mut self, span: Self::Span) -> Self::Span {
         span.shrink_to_lo()
     }
 
-    fn after(&mut self, span: Self::Span) -> Self::Span {
+    fn end(&mut self, span: Self::Span) -> Self::Span {
         span.shrink_to_hi()
+    }
+
+    fn line(&mut self, span: Self::Span) -> usize {
+        let loc = self.sess().source_map().lookup_char_pos(span.lo());
+        loc.line
+    }
+
+    fn column(&mut self, span: Self::Span) -> usize {
+        let loc = self.sess().source_map().lookup_char_pos(span.lo());
+        loc.col.to_usize() + 1
     }
 
     fn join(&mut self, first: Self::Span, second: Self::Span) -> Option<Self::Span> {

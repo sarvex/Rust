@@ -43,27 +43,17 @@ use crate::hash::Hasher;
 /// ```
 #[unstable(feature = "internal_impls_macro", issue = "none")]
 macro marker_impls {
-    ( $(#[$($meta:tt)*])* $Trait:ident for $( $({$($bounds:tt)*})? $T:ty ),+ $(,)?) => {
-        // This inner macro is needed because... idk macros are weird.
-        // It allows repeating `meta` on all impls.
-        #[unstable(feature = "internal_impls_macro", issue = "none")]
-        macro _impl {
-            ( $$({$$($$bounds_:tt)*})? $$T_:ty ) => {
-                $(#[$($meta)*])* impl<$$($$($$bounds_)*)?> $Trait for $$T_ {}
-            }
-        }
-        $( _impl! { $({$($bounds)*})? $T } )+
+    ( $(#[$($meta:tt)*])* $Trait:ident for $({$($bounds:tt)*})? $T:ty $(, $($rest:tt)*)? ) => {
+        $(#[$($meta)*])* impl< $($($bounds)*)? > $Trait for $T {}
+        marker_impls! { $(#[$($meta)*])* $Trait for $($($rest)*)? }
     },
-    ( $(#[$($meta:tt)*])* unsafe $Trait:ident for $( $({$($bounds:tt)*})? $T:ty ),+ $(,)?) => {
-        #[unstable(feature = "internal_impls_macro", issue = "none")]
-        macro _impl {
-            ( $$({$$($$bounds_:tt)*})? $$T_:ty ) => {
-                $(#[$($meta)*])* unsafe impl<$$($$($$bounds_)*)?> $Trait for $$T_ {}
-            }
-        }
+    ( $(#[$($meta:tt)*])* $Trait:ident for ) => {},
 
-        $( _impl! { $({$($bounds)*})? $T } )+
+    ( $(#[$($meta:tt)*])* unsafe $Trait:ident for $({$($bounds:tt)*})? $T:ty $(, $($rest:tt)*)? ) => {
+        $(#[$($meta)*])* unsafe impl< $($($bounds)*)? > $Trait for $T {}
+        marker_impls! { $(#[$($meta)*])* unsafe $Trait for $($($rest)*)? }
     },
+    ( $(#[$($meta:tt)*])* unsafe $Trait:ident for ) => {},
 }
 
 /// Types that can be transferred across thread boundaries.
@@ -150,7 +140,7 @@ unsafe impl<T: Sync + ?Sized> Send for &T {}
 )]
 #[fundamental] // for Default, for example, which requires that `[T]: !Default` be evaluatable
 #[rustc_specialization_trait]
-#[rustc_deny_explicit_impl]
+#[rustc_deny_explicit_impl(implement_via_object = false)]
 #[rustc_coinductive]
 pub trait Sized {
     // Empty.
@@ -165,12 +155,18 @@ pub trait Sized {
 /// Those implementations are:
 ///
 /// - Arrays `[T; N]` implement `Unsize<[T]>`.
-/// - Types implementing a trait `Trait` also implement `Unsize<dyn Trait>`.
-/// - Structs `Foo<..., T, ...>` implement `Unsize<Foo<..., U, ...>>` if all of these conditions
-///   are met:
-///   - `T: Unsize<U>`.
-///   - Only the last field of `Foo` has a type involving `T`.
-///   - `Bar<T>: Unsize<Bar<U>>`, where `Bar<T>` stands for the actual type of that last field.
+/// - A type implements `Unsize<dyn Trait + 'a>` if all of these conditions are met:
+///   - The type implements `Trait`.
+///   - `Trait` is object safe.
+///   - The type is sized.
+///   - The type outlives `'a`.
+/// - Structs `Foo<..., T1, ..., Tn, ...>` implement `Unsize<Foo<..., U1, ..., Un, ...>>`
+/// where any number of (type and const) parameters may be changed if all of these conditions
+/// are met:
+///   - Only the last field of `Foo` has a type involving the parameters `T1`, ..., `Tn`.
+///   - All other parameters of the struct are equal.
+///   - `Field<T1, ..., Tn>: Unsize<Field<U1, ..., Un>>`, where `Field<...>` stands for the actual
+///     type of the struct's last field.
 ///
 /// `Unsize` is used along with [`ops::CoerceUnsized`] to allow
 /// "user-defined" containers such as [`Rc`] to contain dynamically-sized
@@ -183,7 +179,7 @@ pub trait Sized {
 /// [nomicon-coerce]: ../../nomicon/coercions.html
 #[unstable(feature = "unsize", issue = "18598")]
 #[lang = "unsize"]
-#[rustc_deny_explicit_impl]
+#[rustc_deny_explicit_impl(implement_via_object = false)]
 pub trait Unsize<T: ?Sized> {
     // Empty.
 }
@@ -215,6 +211,20 @@ pub trait StructuralPartialEq {
     // Empty.
 }
 
+marker_impls! {
+    #[unstable(feature = "structural_match", issue = "31434")]
+    StructuralPartialEq for
+        usize, u8, u16, u32, u64, u128,
+        isize, i8, i16, i32, i64, i128,
+        bool,
+        char,
+        str /* Technically requires `[u8]: StructuralEq` */,
+        (),
+        {T, const N: usize} [T; N],
+        {T} [T],
+        {T: ?Sized} &T,
+}
+
 /// Required trait for constants used in pattern matches.
 ///
 /// Any type that derives `Eq` automatically implements this trait, *regardless*
@@ -243,6 +253,7 @@ pub trait StructuralPartialEq {
 ///
 /// const CFN: Wrap<fn(&())> = Wrap(higher_order);
 ///
+/// #[allow(pointer_structural_match)]
 /// fn main() {
 ///     match CFN {
 ///         CFN => {}
@@ -277,6 +288,7 @@ marker_impls! {
         bool,
         char,
         str /* Technically requires `[u8]: StructuralEq` */,
+        (),
         {T, const N: usize} [T; N],
         {T} [T],
         {T: ?Sized} &T,
@@ -568,59 +580,72 @@ impl<T: ?Sized> Copy for &T {}
 #[lang = "sync"]
 #[rustc_on_unimplemented(
     on(
-        _Self = "std::cell::OnceCell<T>",
+        _Self = "core::cell::once::OnceCell<T>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::OnceLock` instead"
     ),
     on(
-        _Self = "std::cell::Cell<u8>",
+        _Self = "core::cell::Cell<u8>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU8` instead",
     ),
     on(
-        _Self = "std::cell::Cell<u16>",
+        _Self = "core::cell::Cell<u16>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU16` instead",
     ),
     on(
-        _Self = "std::cell::Cell<u32>",
+        _Self = "core::cell::Cell<u32>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU32` instead",
     ),
     on(
-        _Self = "std::cell::Cell<u64>",
+        _Self = "core::cell::Cell<u64>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU64` instead",
     ),
     on(
-        _Self = "std::cell::Cell<usize>",
+        _Self = "core::cell::Cell<usize>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicUsize` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i8>",
+        _Self = "core::cell::Cell<i8>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI8` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i16>",
+        _Self = "core::cell::Cell<i16>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI16` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i32>",
+        _Self = "core::cell::Cell<i32>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI32` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i64>",
+        _Self = "core::cell::Cell<i64>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI64` instead",
     ),
     on(
-        _Self = "std::cell::Cell<isize>",
+        _Self = "core::cell::Cell<isize>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicIsize` instead",
     ),
     on(
-        _Self = "std::cell::Cell<bool>",
+        _Self = "core::cell::Cell<bool>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicBool` instead",
     ),
     on(
-        _Self = "std::cell::Cell<T>",
+        all(
+            _Self = "core::cell::Cell<T>",
+            not(_Self = "core::cell::Cell<u8>"),
+            not(_Self = "core::cell::Cell<u16>"),
+            not(_Self = "core::cell::Cell<u32>"),
+            not(_Self = "core::cell::Cell<u64>"),
+            not(_Self = "core::cell::Cell<usize>"),
+            not(_Self = "core::cell::Cell<i8>"),
+            not(_Self = "core::cell::Cell<i16>"),
+            not(_Self = "core::cell::Cell<i32>"),
+            not(_Self = "core::cell::Cell<i64>"),
+            not(_Self = "core::cell::Cell<isize>"),
+            not(_Self = "core::cell::Cell<bool>")
+        ),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`",
     ),
     on(
-        _Self = "std::cell::RefCell<T>",
+        _Self = "core::cell::RefCell<T>",
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead",
     ),
     message = "`{Self}` cannot be shared between threads safely",
@@ -688,14 +713,14 @@ impl<T: ?Sized> !Sync for *mut T {}
 /// use std::marker::PhantomData;
 ///
 /// # #[allow(dead_code)]
-/// struct Slice<'a, T: 'a> {
+/// struct Slice<'a, T> {
 ///     start: *const T,
 ///     end: *const T,
 ///     phantom: PhantomData<&'a T>,
 /// }
 /// ```
 ///
-/// This also in turn requires the annotation `T: 'a`, indicating
+/// This also in turn infers the lifetime bound `T: 'a`, indicating
 /// that any references in `T` are valid over the lifetime `'a`.
 ///
 /// When initializing a `Slice` you simply provide the value
@@ -704,7 +729,7 @@ impl<T: ?Sized> !Sync for *mut T {}
 /// ```
 /// # #![allow(dead_code)]
 /// # use std::marker::PhantomData;
-/// # struct Slice<'a, T: 'a> {
+/// # struct Slice<'a, T> {
 /// #     start: *const T,
 /// #     end: *const T,
 /// #     phantom: PhantomData<&'a T>,
@@ -766,16 +791,11 @@ impl<T: ?Sized> !Sync for *mut T {}
 ///
 /// ## Ownership and the drop check
 ///
-/// Adding a field of type `PhantomData<T>` indicates that your
-/// type owns data of type `T`. This in turn implies that when your
-/// type is dropped, it may drop one or more instances of the type
-/// `T`. This has bearing on the Rust compiler's [drop check]
-/// analysis.
+/// The exact interaction of `PhantomData` with drop check **may change in the future**.
 ///
-/// If your struct does not in fact *own* the data of type `T`, it is
-/// better to use a reference type, like `PhantomData<&'a T>`
-/// (ideally) or `PhantomData<*const T>` (if no lifetime applies), so
-/// as not to indicate ownership.
+/// Currently, adding a field of type `PhantomData<T>` indicates that your type *owns* data of type
+/// `T` in very rare circumstances. This in turn has effects on the Rust compiler's [drop check]
+/// analysis. For the exact rules, see the [drop check] documentation.
 ///
 /// ## Layout
 ///
@@ -783,7 +803,7 @@ impl<T: ?Sized> !Sync for *mut T {}
 /// * `size_of::<PhantomData<T>>() == 0`
 /// * `align_of::<PhantomData<T>>() == 1`
 ///
-/// [drop check]: ../../nomicon/dropck.html
+/// [drop check]: Drop#drop-check
 #[lang = "phantom_data"]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct PhantomData<T: ?Sized>;
@@ -854,7 +874,7 @@ impl<T: ?Sized> StructuralEq for PhantomData<T> {}
     reason = "this trait is unlikely to ever be stabilized, use `mem::discriminant` instead"
 )]
 #[lang = "discriminant_kind"]
-#[rustc_deny_explicit_impl]
+#[rustc_deny_explicit_impl(implement_via_object = false)]
 pub trait DiscriminantKind {
     /// The type of the discriminant, which must satisfy the trait
     /// bounds required by `mem::Discriminant`.
@@ -959,7 +979,7 @@ marker_impls! {
 #[unstable(feature = "const_trait_impl", issue = "67792")]
 #[lang = "destruct"]
 #[rustc_on_unimplemented(message = "can't drop `{Self}`", append_const_msg)]
-#[rustc_deny_explicit_impl]
+#[rustc_deny_explicit_impl(implement_via_object = false)]
 #[const_trait]
 pub trait Destruct {}
 
@@ -970,7 +990,7 @@ pub trait Destruct {}
 #[unstable(feature = "tuple_trait", issue = "none")]
 #[lang = "tuple_trait"]
 #[rustc_on_unimplemented(message = "`{Self}` is not a tuple")]
-#[rustc_deny_explicit_impl]
+#[rustc_deny_explicit_impl(implement_via_object = false)]
 pub trait Tuple {}
 
 /// A marker for pointer-like types.
@@ -986,13 +1006,25 @@ pub trait Tuple {}
 pub trait PointerLike {}
 
 /// A marker for types which can be used as types of `const` generic parameters.
-#[cfg_attr(not(bootstrap), lang = "const_param_ty")]
+///
+/// These types must have a proper equivalence relation (`Eq`) and it must be automatically
+/// derived (`StructuralPartialEq`). There's a hard-coded check in the compiler ensuring
+/// that all fields are also `ConstParamTy`, which implies that recursively, all fields
+/// are `StructuralPartialEq`.
+#[lang = "const_param_ty"]
 #[unstable(feature = "adt_const_params", issue = "95174")]
 #[rustc_on_unimplemented(message = "`{Self}` can't be used as a const parameter type")]
-pub trait ConstParamTy: StructuralEq {}
+#[allow(multiple_supertrait_upcastable)]
+pub trait ConstParamTy: StructuralEq + StructuralPartialEq + Eq {}
 
-// FIXME(generic_const_parameter_types): handle `ty::FnDef`/`ty::Closure`
-// FIXME(generic_const_parameter_types): handle `ty::Tuple`
+/// Derive macro generating an impl of the trait `ConstParamTy`.
+#[rustc_builtin_macro]
+#[unstable(feature = "adt_const_params", issue = "95174")]
+pub macro ConstParamTy($item:item) {
+    /* compiler built-in */
+}
+
+// FIXME(adt_const_params): handle `ty::FnDef`/`ty::Closure`
 marker_impls! {
     #[unstable(feature = "adt_const_params", issue = "95174")]
     ConstParamTy for
@@ -1006,6 +1038,10 @@ marker_impls! {
         {T: ?Sized + ConstParamTy} &T,
 }
 
+// FIXME(adt_const_params): Add to marker_impls call above once not in bootstrap
+#[unstable(feature = "adt_const_params", issue = "95174")]
+impl ConstParamTy for () {}
+
 /// A common trait implemented by all function pointers.
 #[unstable(
     feature = "fn_ptr_trait",
@@ -1013,7 +1049,7 @@ marker_impls! {
     reason = "internal trait for implementing various traits for all function pointers"
 )]
 #[lang = "fn_ptr_trait"]
-#[rustc_deny_explicit_impl]
+#[rustc_deny_explicit_impl(implement_via_object = false)]
 pub trait FnPtr: Copy + Clone {
     /// Returns the address of the function pointer.
     #[lang = "fn_ptr_addr"]

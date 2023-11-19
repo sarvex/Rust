@@ -21,13 +21,13 @@ declare_clippy_lint! {
     /// lint to `Warn`.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// let x = &x;
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// let y = &x; // use different variable name
     /// ```
@@ -49,12 +49,12 @@ declare_clippy_lint! {
     /// the code.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let x = 2;
     /// let x = x + 1;
     /// ```
     /// use different variable name:
-    /// ```rust
+    /// ```no_run
     /// let x = 2;
     /// let y = x + 1;
     /// ```
@@ -77,7 +77,7 @@ declare_clippy_lint! {
     /// names to bindings or introducing more scopes to contain the bindings.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let y = 1;
     /// # let z = 2;
     /// let x = y;
@@ -85,7 +85,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # let y = 1;
     /// # let z = 2;
     /// let x = y;
@@ -106,7 +106,9 @@ impl_lint_pass!(Shadow => [SHADOW_SAME, SHADOW_REUSE, SHADOW_UNRELATED]);
 
 impl<'tcx> LateLintPass<'tcx> for Shadow {
     fn check_pat(&mut self, cx: &LateContext<'tcx>, pat: &'tcx Pat<'_>) {
-        let PatKind::Binding(_, id, ident, _) = pat.kind else { return };
+        let PatKind::Binding(_, id, ident, _) = pat.kind else {
+            return;
+        };
 
         if pat.span.desugaring_kind().is_some() || pat.span.from_expansion() {
             return;

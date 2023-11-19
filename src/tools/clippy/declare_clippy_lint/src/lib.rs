@@ -85,8 +85,8 @@ impl Parse for ClippyLint {
 /// 2. The `LINT_NAME`. See [lint naming][lint_naming] on lint naming conventions.
 /// 3. The `lint_level`, which is a mapping from *one* of our lint groups to `Allow`, `Warn` or
 ///    `Deny`. The lint level here has nothing to do with what lint groups the lint is a part of.
-/// 4. The `description` that contains a short explanation on what's wrong with code where the
-///    lint is triggered.
+/// 4. The `description` that contains a short explanation on what's wrong with code where the lint
+///    is triggered.
 ///
 /// Currently the categories `style`, `correctness`, `suspicious`, `complexity` and `perf` are
 /// enabled by default. As said in the README.md of this repository, if the lint level mapping
@@ -94,7 +94,7 @@ impl Parse for ClippyLint {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use rustc_session::declare_tool_lint;
 ///
 /// declare_clippy_lint! {
@@ -136,28 +136,16 @@ pub fn declare_clippy_lint(input: TokenStream) -> TokenStream {
         "{}",
         match category.as_str() {
             "correctness" => "Deny",
-            "style" | "suspicious" | "complexity" | "perf" | "internal_warn" => "Warn",
+            "style" | "suspicious" | "complexity" | "perf" => "Warn",
             "pedantic" | "restriction" | "cargo" | "nursery" | "internal" => "Allow",
             _ => panic!("unknown category {category}"),
         },
     );
 
-    let info = if category == "internal_warn" {
-        None
-    } else {
-        let info_name = format_ident!("{name}_INFO");
+    let info_name = format_ident!("{name}_INFO");
 
-        (&mut category[0..1]).make_ascii_uppercase();
-        let category_variant = format_ident!("{category}");
-
-        Some(quote! {
-            pub(crate) static #info_name: &'static crate::LintInfo = &crate::LintInfo {
-                lint: &#name,
-                category: crate::LintCategory::#category_variant,
-                explanation: #explanation,
-            };
-        })
-    };
+    (&mut category[0..1]).make_ascii_uppercase();
+    let category_variant = format_ident!("{category}");
 
     let output = quote! {
         declare_tool_lint! {
@@ -168,7 +156,11 @@ pub fn declare_clippy_lint(input: TokenStream) -> TokenStream {
             report_in_external_macro: true
         }
 
-        #info
+        pub(crate) static #info_name: &'static crate::LintInfo = &crate::LintInfo {
+            lint: &#name,
+            category: crate::LintCategory::#category_variant,
+            explanation: #explanation,
+        };
     };
 
     TokenStream::from(output)
