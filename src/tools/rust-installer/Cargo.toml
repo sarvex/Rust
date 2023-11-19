@@ -10,7 +10,7 @@ name = "rust-installer"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.19"
+anyhow = "1.0.75"
 flate2 = "1.0.1"
 rayon = "1.0"
 tar = "0.4.38"
