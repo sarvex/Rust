@@ -29,7 +29,7 @@ termize = "0.1"
 [dev-dependencies]
 compiletest_rs = { version = "0.10", features = ["tmp"] }
 tester = "0.9"
-regex = "1.5"
+regex = "1.9"
 toml = "0.5"
 walkdir = "2.3"
 # This is used by the `collect-metadata` alias.
