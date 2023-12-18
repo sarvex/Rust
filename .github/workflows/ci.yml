@@ -153,7 +153,7 @@ jobs:
         run: src/ci/scripts/create-doc-artifacts.sh
         if: success() && !env.SKIP_JOB
       - name: upload artifacts to github
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: "${{ env.DOC_ARTIFACT_NAME }}"
           path: obj/artifacts/doc
@@ -546,7 +546,7 @@ jobs:
         run: src/ci/scripts/create-doc-artifacts.sh
         if: success() && !env.SKIP_JOB
       - name: upload artifacts to github
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: "${{ env.DOC_ARTIFACT_NAME }}"
           path: obj/artifacts/doc
@@ -673,7 +673,7 @@ jobs:
         run: src/ci/scripts/create-doc-artifacts.sh
         if: success() && !env.SKIP_JOB
       - name: upload artifacts to github
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: "${{ env.DOC_ARTIFACT_NAME }}"
           path: obj/artifacts/doc
