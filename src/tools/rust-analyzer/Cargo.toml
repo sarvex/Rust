@@ -90,7 +90,7 @@ la-arena = { version = "0.3.1" }
 lsp-server = { version = "0.7.4" }
 
 # non-local crates
-anyhow = "1.0.75"
+anyhow = "1.0.82"
 bitflags = "2.4.1"
 cargo_metadata = "0.18.1"
 dissimilar = "1.0.7"

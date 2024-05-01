@@ -11,7 +11,7 @@ publish = false
 default-run = "lintcheck"
 
 [dependencies]
-anyhow = "1.0.69"
+anyhow = "1.0.82"
 cargo_metadata = "0.15.3"
 clap = { version = "4.1.8", features = ["derive", "env"] }
 crates_io_api = "0.8.1"
