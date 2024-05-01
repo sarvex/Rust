@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # tidy-alphabetical-start
-arrayvec = { version = "0.7", default-features = false }
+arrayvec = { version = "0.7.4", default-features = false }
 rustc_macros = { path = "../rustc_macros", optional = true }
 rustc_serialize = { path = "../rustc_serialize", optional = true }
 smallvec = "1.8.1"

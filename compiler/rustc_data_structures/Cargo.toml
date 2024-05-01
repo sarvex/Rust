@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # tidy-alphabetical-start
-arrayvec = { version = "0.7", default-features = false }
+arrayvec = { version = "0.7.4", default-features = false }
 bitflags = "1.2.1"
 elsa = "=1.7.1"
 ena = "0.14.2"
